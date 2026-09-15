@@ -1,0 +1,51 @@
+[package]
+name = "sapvault"
+version = "0.1.0"
+description = "Local-only password manager focused on SAP accounts"
+authors = ["SapVault"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "sapvault_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+# Desktop shell
+tauri = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto: AES-256-GCM for the vault, Argon2id for the master password.
+# Windows DPAPI is reached through a small hand-written FFI binding, and the
+# base64 used by the envelope lives in `src/b64.rs`, so neither needs a crate.
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = "1"
+
+# SAP GUI landscape parsing
+quick-xml = "0.39"
+
+# Scanning the user profile
+walkdir = "2"
+
+# Native integration
+arboard = "3"
+rfd = "0.17"
+dirs = "7"
+
+# Time stamps and errors
+chrono = "0.4"
+thiserror = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

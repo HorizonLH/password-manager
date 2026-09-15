@@ -1,0 +1,134 @@
+/*
+ * Design tokens for SapVault.
+ *
+ * Radii follow the concentric rule: an inner surface's radius is the outer
+ * radius minus the gap between them, so the `--r-*` steps are sized for the
+ * common pairings used in app.css.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --bg: oklch(0.982 0.0025 255);
+  --bg-elevated: oklch(0.995 0.0015 255);
+  --surface: oklch(1 0 0);
+  --surface-2: oklch(0.973 0.003 255);
+  --surface-3: oklch(0.955 0.004 255);
+  --surface-hover: oklch(0.966 0.006 255);
+  --surface-active: oklch(0.94 0.008 255);
+  --scrim: oklch(0.2 0.01 255 / 0.42);
+
+  /* Lines */
+  --border: oklch(0.905 0.005 255);
+  --border-strong: oklch(0.85 0.007 255);
+  --divider: oklch(0.925 0.004 255);
+
+  /* Text */
+  --text: oklch(0.245 0.013 258);
+  --text-muted: oklch(0.515 0.013 258);
+  --text-subtle: oklch(0.64 0.012 258);
+  --text-inverse: oklch(0.99 0 0);
+
+  /* Accent */
+  --accent: oklch(0.552 0.157 257);
+  --accent-hover: oklch(0.505 0.16 257);
+  --accent-press: oklch(0.47 0.155 257);
+  --accent-soft: oklch(0.955 0.028 257);
+  --accent-soft-hover: oklch(0.93 0.04 257);
+  --accent-ring: oklch(0.552 0.157 257 / 0.4);
+
+  /* Status */
+  --success: oklch(0.58 0.13 152);
+  --success-soft: oklch(0.955 0.04 152);
+  --warn: oklch(0.66 0.14 72);
+  --warn-soft: oklch(0.96 0.05 82);
+  --danger: oklch(0.56 0.19 25);
+  --danger-hover: oklch(0.51 0.19 25);
+  --danger-soft: oklch(0.96 0.035 25);
+
+  /* Radii */
+  --r-xs: 5px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+  --r-full: 999px;
+
+  /* Spacing */
+  --s-1: 4px;
+  --s-2: 6px;
+  --s-3: 8px;
+  --s-4: 12px;
+  --s-5: 16px;
+  --s-6: 20px;
+  --s-7: 28px;
+  --s-8: 36px;
+
+  /* Elevation */
+  --shadow-1: 0 1px 2px oklch(0 0 0 / 0.06), 0 0 0 1px oklch(0 0 0 / 0.03);
+  --shadow-2: 0 2px 4px oklch(0 0 0 / 0.05), 0 8px 18px -8px oklch(0 0 0 / 0.16);
+  --shadow-3: 0 4px 10px oklch(0 0 0 / 0.06), 0 20px 44px -14px oklch(0 0 0 / 0.28);
+
+  /* Image outline stays pure black/white so it never picks up a surface tint */
+  --image-outline: oklch(0 0 0 / 0.1);
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --dur-fast: 110ms;
+  --dur-base: 160ms;
+
+  /* Type */
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "PingFang SC",
+    system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;
+  --fs-lg: 15.5px;
+  --fs-xl: 19px;
+  --fs-2xl: 24px;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: oklch(0.183 0.008 258);
+  --bg-elevated: oklch(0.212 0.009 258);
+  --surface: oklch(0.228 0.009 258);
+  --surface-2: oklch(0.258 0.01 258);
+  --surface-3: oklch(0.292 0.011 258);
+  --surface-hover: oklch(0.272 0.013 258);
+  --surface-active: oklch(0.312 0.014 258);
+  --scrim: oklch(0.1 0.01 258 / 0.6);
+
+  --border: oklch(0.322 0.011 258);
+  --border-strong: oklch(0.41 0.013 258);
+  --divider: oklch(0.285 0.01 258);
+
+  --text: oklch(0.945 0.004 258);
+  --text-muted: oklch(0.735 0.011 258);
+  --text-subtle: oklch(0.6 0.011 258);
+  --text-inverse: oklch(0.16 0.015 258);
+
+  --accent: oklch(0.7 0.14 252);
+  --accent-hover: oklch(0.76 0.135 252);
+  --accent-press: oklch(0.65 0.14 252);
+  --accent-soft: oklch(0.3 0.05 252);
+  --accent-soft-hover: oklch(0.34 0.06 252);
+  --accent-ring: oklch(0.7 0.14 252 / 0.45);
+
+  --success: oklch(0.72 0.13 155);
+  --success-soft: oklch(0.3 0.05 155);
+  --warn: oklch(0.78 0.13 82);
+  --warn-soft: oklch(0.32 0.05 82);
+  --danger: oklch(0.68 0.16 25);
+  --danger-hover: oklch(0.74 0.15 25);
+  --danger-soft: oklch(0.31 0.06 25);
+
+  --shadow-1: 0 1px 2px oklch(0 0 0 / 0.4), 0 0 0 1px oklch(0 0 0 / 0.3);
+  --shadow-2: 0 2px 6px oklch(0 0 0 / 0.4), 0 10px 22px -10px oklch(0 0 0 / 0.6);
+  --shadow-3: 0 6px 16px oklch(0 0 0 / 0.45), 0 26px 60px -18px oklch(0 0 0 / 0.7);
+
+  --image-outline: oklch(1 0 0 / 0.1);
+}

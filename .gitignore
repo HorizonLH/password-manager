@@ -1,0 +1,21 @@
+# Rust / Tauri build output
+/src-tauri/target/
+/src-tauri/gen/
+
+# Frontend tooling (the UI is intentionally dependency-free)
+/node_modules/
+/dist/
+
+# Local runtime data / secrets — never commit a real vault
+*.vault
+*.sapvault
+dev-data/
+scratch/
+
+# Editors & OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
