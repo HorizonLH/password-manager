@@ -29,6 +29,8 @@ export const state = {
   assocMode: "cards",
   syncSelection: null,
   filePlans: {},
+  /** Which tree branches are open, per file id and key path. */
+  treeOpen: {},
   refreshing: false,
 };
 

@@ -696,6 +696,21 @@ svg {
   color: var(--accent);
 }
 
+/* File-type chip: the whole type name instead of a truncated one. */
+.row__badge--label {
+  width: auto;
+  min-width: 34px;
+  padding: 0 var(--s-2);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.row__badge--danger {
+  color: var(--danger);
+}
+
 .row__body {
   display: grid;
   flex: 1;

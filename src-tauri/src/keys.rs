@@ -200,7 +200,8 @@ fn extract(text: &str, format: &str) -> Vec<FlatValue> {
     match format {
         "json" => extract_json(text),
         "env" => extract_env(text),
-        "toml" | "ini" | "properties" | "hcl" => extract_toml(text),
+        "toml" => extract_toml(text, CommentRule::Hash),
+        "ini" | "properties" | "hcl" => extract_toml(text, CommentRule::Loose),
         "yaml" => extract_yaml(text),
         "xml" => extract_xml(text),
         _ => Vec::new(),
@@ -264,17 +265,55 @@ fn unquote(value: &str) -> String {
     trimmed.to_string()
 }
 
-/// Byte offset where a trailing `#` comment starts, respecting quotes.
-fn comment_start(line: &str) -> usize {
+/// Which marker starts a comment in a `key = value` dialect.
+#[derive(Clone, Copy)]
+enum CommentRule {
+    /// TOML / YAML: `#` starts a comment anywhere outside quotes.
+    Hash,
+    /// `.env` / INI / properties / HCL: `#`, `;`, `!` and `//` only at the line
+    /// start or after whitespace, so values such as `PASSWORD=ab#cd` or
+    /// `jdbc:sqlserver://host;databaseName=db` are never cut in half.
+    Loose,
+}
+
+/// Byte offset where a trailing comment starts, respecting quotes. Everything
+/// after it is treated as a comment and is never parsed nor overwritten.
+fn comment_start(line: &str, rule: CommentRule) -> usize {
     let mut in_single = false;
     let mut in_double = false;
+    let mut previous_space = true;
+    let bytes = line.as_bytes();
     for (index, ch) in line.char_indices() {
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '#' if !in_single && !in_double => return index,
-            _ => {}
+        if in_single || in_double {
+            match ch {
+                '\'' if !in_double => in_single = false,
+                '"' if !in_single => in_double = false,
+                _ => {}
+            }
+            previous_space = ch.is_whitespace();
+            continue;
         }
+        if ch == '\'' {
+            in_single = true;
+        } else if ch == '"' {
+            in_double = true;
+        } else {
+            let hash = match rule {
+                CommentRule::Hash => ch == '#',
+                CommentRule::Loose => ch == '#' && previous_space,
+            };
+            let loose_marker = matches!(rule, CommentRule::Loose)
+                && previous_space
+                && matches!(ch, ';' | '!');
+            let slash = matches!(rule, CommentRule::Loose)
+                && previous_space
+                && ch == '/'
+                && bytes.get(index + 1) == Some(&b'/');
+            if hash || loose_marker || slash {
+                return index;
+            }
+        }
+        previous_space = ch.is_whitespace();
     }
     line.len()
 }
@@ -294,7 +333,9 @@ fn extract_env(text: &str) -> Vec<FlatValue> {
         if key.is_empty() || key.len() > 64 {
             continue;
         }
+        // `KEY=value # note`: the note must never become part of the value.
         let raw_value = &line[equals + 1..];
+        let raw_value = &raw_value[..comment_start(raw_value, CommentRule::Loose)];
         let (start, end, quoted) = value_range(text, raw_value);
         out.push(FlatValue {
             key: key.to_string(),
@@ -311,13 +352,13 @@ fn extract_env(text: &str) -> Vec<FlatValue> {
     out
 }
 
-fn extract_toml(text: &str) -> Vec<FlatValue> {
+fn extract_toml(text: &str, rule: CommentRule) -> Vec<FlatValue> {
     let mut out = Vec::new();
     let lines = LineIndex::new(text);
     let mut section = String::new();
     for raw_line in text.split_inclusive('\n') {
         let full = raw_line.trim_end_matches(['\n', '\r']);
-        let cut = comment_start(full);
+        let cut = comment_start(full, rule);
         let line = full[..cut].trim();
         if line.is_empty() {
             continue;
@@ -365,10 +406,24 @@ fn extract_yaml(text: &str) -> Vec<FlatValue> {
     let mut out = Vec::new();
     let lines = LineIndex::new(text);
     let mut stack: Vec<(usize, String)> = Vec::new();
+    // Indentation of the `key: |` / `key: >` block we are currently inside.
+    let mut block: Option<usize> = None;
 
     for raw_line in text.split_inclusive('\n') {
         let full = raw_line.trim_end_matches(['\n', '\r']);
-        let cut = comment_start(full);
+        if let Some(level) = block {
+            if full.trim().is_empty() {
+                continue;
+            }
+            let indent = full.len() - full.trim_start().len();
+            if indent > level {
+                // Literal block content: `#` is data here, and a line that looks
+                // like `password: x` is text, never a key.
+                continue;
+            }
+            block = None;
+        }
+        let cut = comment_start(full, CommentRule::Hash);
         let content = full[..cut].trim_end();
         if content.trim().is_empty() || content.trim() == "---" {
             continue;
@@ -390,7 +445,15 @@ fn extract_yaml(text: &str) -> Vec<FlatValue> {
             }
         }
 
-        if raw_value.trim().is_empty() || raw_value.trim() == "|" || raw_value.trim() == ">" {
+        let plain = raw_value.trim();
+        // `key: |`, `key: |-`, `key: >2` … — everything indented below is literal
+        // text. A plain container key (`sap:`) is *not* a block scalar.
+        let is_block_header = (plain.starts_with('|') || plain.starts_with('>'))
+            && plain[1..].chars().all(|ch| matches!(ch, '-' | '+' | '0'..='9'));
+        if plain.is_empty() || is_block_header {
+            if is_block_header {
+                block = Some(indent);
+            }
             stack.push((indent, key.to_string()));
             continue;
         }
@@ -443,9 +506,36 @@ impl<'a> JsonScanner<'a> {
         self.bytes().get(self.pos).copied()
     }
 
+    /// Whitespace *and* JSONC comments are skipped, so a commented-out key never
+    /// shows up as a value and can therefore never be overwritten.
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
-            self.pos += 1;
+        loop {
+            while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+                self.pos += 1;
+            }
+            if self.peek() != Some(b'/') {
+                return;
+            }
+            match self.bytes().get(self.pos + 1).copied() {
+                Some(b'/') => {
+                    while matches!(self.peek(), Some(byte) if byte != b'\n') {
+                        self.pos += 1;
+                    }
+                }
+                Some(b'*') => {
+                    self.pos += 2;
+                    while self.pos < self.bytes().len() {
+                        if self.bytes()[self.pos] == b'*'
+                            && self.bytes().get(self.pos + 1) == Some(&b'/')
+                        {
+                            self.pos += 2;
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                }
+                _ => return,
+            }
         }
     }
 

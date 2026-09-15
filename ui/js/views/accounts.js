@@ -18,10 +18,10 @@ import {
 import { openModal } from "../modal.js";
 import { toast } from "../toast.js";
 import {
+  categoryIconName,
   formatBytes,
   formatLabel,
   formatTime,
-  initials,
   mask,
   ruleSummary,
 } from "../format.js";
@@ -68,7 +68,11 @@ function entryRow(entry) {
         }
       },
     },
-    h("span", { class: "row__badge" }, initials(entry.title)),
+    h(
+      "span",
+      { class: "row__badge", title: entry.categoryId === "sap" ? "SAP 账号" : "账号" },
+      icon(categoryIconName(entry.categoryId), { size: 16 }),
+    ),
     h(
       "span",
       { class: "row__body" },

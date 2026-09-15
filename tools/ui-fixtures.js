@@ -429,12 +429,49 @@
     generate_password: "Abcd1234XyZ",
   };
 
+  /** Models what the backend does on sync: the file now contains the account
+   *  password, so the re-analysis shows the new value and the plan says "same". */
+  const syncOnce = (fileId) => {
+    const file = fileId === envFile.id ? envFile : jsonFile;
+    const plan = fileId === envFile.id ? envPlan : jsonPlan;
+    let updates = 0;
+    for (const row of plan.rows) {
+      if (row.action !== "update") continue;
+      const value = file.analysis.values.find((item) => item.path === row.keyPath);
+      if (value && row.newPassword) value.value = row.newPassword;
+      row.action = "same";
+      row.fileValue = row.newPassword ?? row.fileValue;
+      row.newPassword = row.fileValue;
+      row.detail = "文件里的密码已是最新";
+      updates += 1;
+    }
+    plan.updates = 0;
+    plan.status = "已是最新";
+    file.analysis.analyzedAt = "2026-09-15T12:00:00+08:00";
+    file.lastSyncAt = "2026-09-15T12:00:00+08:00";
+    file.lastStatus = updates ? `已更新 ${updates} 处密码` : "已是最新";
+    return updates;
+  };
+
   window.__TAURI__ = {
     core: {
       invoke: async (command, args) => {
         if (command === "vault_unlock" || command === "vault_view") {
           return structuredClone(vaultView);
         }
+        if (command === "file_sync") {
+          const updates = syncOnce(args?.fileId ?? jsonFile.id);
+          return {
+            fileId: jsonFile.id,
+            path: jsonFile.path,
+            changed: updates > 0,
+            updates,
+            bytes: jsonFile.size,
+            backupPath: null,
+            status: updates ? `已更新 ${updates} 处密码` : "已是最新，未写入",
+          };
+        }
+        if (command === "file_sync_all") return [];
         if (command === "file_plan") {
           const wanted = args?.fileId;
           const plan = wanted === envFile.id ? envPlan : jsonPlan;

@@ -291,6 +291,13 @@ pub fn stamp(file: &mut SyncFile, outcome: &SyncOutcome) {
     } else {
         format!("无变化（{}）", outcome.status)
     });
+    reanalyze(file);
+}
+
+/// Re-reads the file from disk and replaces the cached parse, so the UI shows the
+/// values that are actually in the file after a sync instead of the old ones.
+pub fn reanalyze(file: &mut SyncFile) {
+    file.analysis = Some(keys::analyze_file(Path::new(&file.path), &file.keys));
     file.refresh_stat();
 }
 
@@ -495,6 +502,163 @@ mod tests {
         assert_eq!(analysis.values.len(), 4);
     }
 
+    /// A comment that looks like a password must never be parsed as a value
+    /// (otherwise syncing would overwrite the comment), and a trailing comment
+    /// must stay byte-identical after a sync.
+    #[test]
+    fn comments_are_never_parsed_or_overwritten() {
+        let cases: [(&str, &str, &str, &str); 7] = [
+            (
+                "toml",
+                "[sap]\n# password = \"COMMENTED\"\npassword = \"old\" # keep me\n",
+                "sap.password",
+                "\"old\"",
+            ),
+            (
+                "ini",
+                "[sap]\n; password = COMMENTED\npassword = old ; keep me\n",
+                "sap.password",
+                "old ;",
+            ),
+            (
+                "properties",
+                "# password=COMMENTED\npassword=old # keep me\n",
+                "password",
+                "old #",
+            ),
+            (
+                "hcl",
+                "// password = \"COMMENTED\"\npassword = \"old\" // keep me\n",
+                "password",
+                "\"old\"",
+            ),
+            (
+                "env",
+                "# PASSWORD=COMMENTED\nPASSWORD=old # keep me\n",
+                "PASSWORD",
+                "old #",
+            ),
+            (
+                "yaml",
+                "sap:\n  # password: COMMENTED\n  password: old # keep me\n",
+                "sap.password",
+                "old #",
+            ),
+            (
+                "json",
+                "{\n  // \"password\": \"COMMENTED\",\n  /* \"password\": \"COMMENTED\" */\n  \"password\": \"old\", // keep me\n  \"user\": \"JDOE\"\n}\n",
+                "password",
+                "\"old\"",
+            ),
+        ];
+
+        for (format, original, key, old_pair) in cases {
+            let dir = temp_dir();
+            let path = dir.join(format!("comments-{format}.{format}"));
+            let (vault, file) = setup(&path, original, format, &[(key, "e1")]);
+            let mut vault = vault;
+            vault.entries.push(account("e1", "PRD", "u", "new#value!1"));
+
+            let analysis = keys::analyze_text(original, format, &KeyMapping::default());
+            assert!(
+                !analysis
+                    .values
+                    .iter()
+                    .any(|value| value.value.contains("COMMENTED")),
+                "{format}: 注释被当成了值 {:?}",
+                analysis.values
+            );
+            assert_eq!(
+                analysis.value(key).map(|value| value.value.as_str()),
+                Some("old"),
+                "{format}: 真实值没解析出来"
+            );
+            assert_eq!(
+                analysis.value(key).map(|value| value.value.as_str()),
+                Some("old"),
+                "{format}: 值里混进了注释"
+            );
+
+            let outcome = sync_file(&vault, &file, false).unwrap();
+            assert!(outcome.changed, "{format}: 应当写入");
+            let updated = std::fs::read_to_string(&path).unwrap();
+            assert!(updated.contains("COMMENTED"), "{format}: 注释被删掉了\n{updated}");
+            assert!(updated.contains("keep me"), "{format}: 行尾注释被删掉了\n{updated}");
+            assert!(!updated.contains(old_pair), "{format}: 旧值没被替换\n{updated}");
+            assert!(
+                updated.contains("new") && updated.contains("value!1"),
+                "{format}: 新密码没写进去\n{updated}"
+            );
+        }
+    }
+
+    /// Values that merely contain a comment marker must survive untouched: only a
+    /// marker that actually starts a comment cuts the value.
+    #[test]
+    fn values_may_contain_comment_markers() {
+        let dir = temp_dir();
+        let path = dir.join("markers.env");
+        let original = "PASSWORD=ab#cd\nexport TOKEN=http://host;db=x\n";
+        let (vault, file) = setup(&path, original, "env", &[("PASSWORD", "e1"), ("TOKEN", "e2")]);
+        let mut vault = vault;
+        vault.entries.push(account("e1", "PRD", "u", "ab#cd"));
+        vault.entries.push(account("e2", "TOK", "u", "http://host;db=x"));
+
+        let analysis = keys::analyze_text(original, "env", &KeyMapping::default());
+        assert_eq!(
+            analysis.value("PASSWORD").map(|value| value.value.as_str()),
+            Some("ab#cd")
+        );
+        assert_eq!(
+            analysis.value("TOKEN").map(|value| value.value.as_str()),
+            Some("http://host;db=x")
+        );
+
+        // Both values already equal the stored passwords: nothing may be written.
+        let plan = plan_file(&vault, &file);
+        assert_eq!(plan.updates, 0, "{:?}", plan.rows);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // A real password containing `#` round-trips without touching the file
+        // structure: only the value's own range is replaced.
+        vault.entries[0].password = "xy#zw".to_string();
+        sync_file(&vault, &file, false).unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("export TOKEN=http://host;db=x"), "{updated}");
+        assert_eq!(updated.lines().count(), original.lines().count(), "{updated}");
+    }
+    /// The cached parse must describe the file as it is on disk right after a
+    /// sync, otherwise the view keeps showing the password that was replaced.
+    #[test]
+    fn syncing_refreshes_the_cached_analysis() {
+        let dir = temp_dir();
+        let path = dir.join("refresh.json");
+        let (vault, mut file) = setup(
+            &path,
+            "{\n  \"a\": { \"password\": \"old\" }\n}\n",
+            "json",
+            &[("a.password", "e1")],
+        );
+        let mut vault = vault;
+        vault.entries.push(account("e1", "PRD", "u", "new"));
+
+        let outcome = sync_file(&vault, &file, false).unwrap();
+        assert!(outcome.changed);
+        stamp(&mut file, &outcome);
+
+        let cached = file.analysis.as_ref().expect("analysis");
+        assert_eq!(
+            cached.value("a.password").map(|value| value.value.as_str()),
+            Some("new"),
+            "同步后缓存里还是旧密码"
+        );
+        assert!(file.analysis.as_ref().unwrap().analyzed_at >= cached.analyzed_at);
+
+        // And the plan agrees that there is nothing left to do.
+        let plan = plan_file(&vault, &file);
+        assert_eq!(plan.updates, 0, "{:?}", plan.rows);
+        assert_eq!(plan.status, "已是最新");
+    }
     #[test]
     fn unsupported_formats_are_rejected() {
         let analysis = keys::analyze_text("hello", "unsupported", &KeyMapping::default());

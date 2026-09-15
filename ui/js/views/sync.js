@@ -25,6 +25,42 @@ const ACTIONS = {
 
 const TREE_FORMATS = new Set(["json", "yaml", "xml"]);
 
+/** Short, complete names for the file-type chip in the file list. */
+const FILE_CHIPS = {
+  json: "JSON",
+  yaml: "YAML",
+  xml: "XML",
+  env: ".env",
+  toml: "TOML",
+  ini: "INI",
+  properties: ".properties",
+  hcl: "TFVARS",
+};
+
+function fileChip(file) {
+  const format = file.analysis?.format ?? "";
+  const label = FILE_CHIPS[format];
+  if (!label) {
+    return h(
+      "span",
+      { class: "row__badge row__badge--danger", title: "不支持的格式" },
+      icon("alert", { size: 15 }),
+    );
+  }
+  return h("span", { class: "row__badge row__badge--label", title: `文件类型 ${label}` }, label);
+}
+
+/** Branch state is remembered per file, so re-rendering the view (for example
+ *  right after binding a key) never collapses what the user had open. */
+function branchOpen(fileId, path, depth) {
+  return state.treeOpen?.[fileId]?.[path] ?? depth < 1;
+}
+
+function rememberBranch(fileId, path, open) {
+  state.treeOpen = state.treeOpen ?? {};
+  state.treeOpen[fileId] = { ...(state.treeOpen[fileId] ?? {}), [path]: open };
+}
+
 function planFor(fileId) {
   return state.filePlans?.[fileId];
 }
@@ -80,14 +116,19 @@ function valueRow(file, value, label, planRow) {
 }
 
 function buildTree(values) {
-  const root = { children: new Map(), values: [] };
+  const root = { name: "", path: "", children: new Map(), values: [] };
   for (const value of values) {
     const parts = value.path.split(".");
     let node = root;
     for (let index = 0; index < parts.length - 1; index += 1) {
       const key = parts[index];
       if (!node.children.has(key)) {
-        node.children.set(key, { name: key, children: new Map(), values: [] });
+        node.children.set(key, {
+          name: key,
+          path: node.path ? `${node.path}.${key}` : key,
+          children: new Map(),
+          values: [],
+        });
       }
       node = node.children.get(key);
     }
@@ -106,7 +147,11 @@ function treeNode(file, node, planRows, depth) {
     [...node.children.values()].map((child) =>
       h(
         "details",
-        { class: "tree__details", open: depth < 1 },
+        {
+          class: "tree__details",
+          open: branchOpen(file.id, child.path, depth),
+          onToggle: (event) => rememberBranch(file.id, child.path, event.target.open),
+        },
         h(
           "summary",
           { class: "tree__summary" },
@@ -195,7 +240,7 @@ function fileList(files) {
                   tabindex: "0",
                   onClick: () => selectFile(file.id),
                 },
-                h("span", { class: "row__badge" }, formatLabel(file.analysis?.format).slice(0, 3).toUpperCase()),
+                fileChip(file),
                 h(
                   "span",
                   { class: "row__body" },

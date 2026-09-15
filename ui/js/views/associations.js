@@ -2,7 +2,7 @@ import { h, guard, mount } from "../dom.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { state, setState, selectEntry, navigate, copyText } from "../state.js";
-import { formatLabel, initials, mask } from "../format.js";
+import { categoryIconName, formatLabel, mask } from "../format.js";
 import { openFileKeys } from "./filedialog.js";
 
 function bindingRow(binding) {
@@ -41,7 +41,7 @@ function accountCard(association) {
     h(
       "div",
       { class: "assoc__head" },
-      h("span", { class: "assoc__avatar" }, initials(association.entryTitle)),
+      h("span", { class: "assoc__avatar" }, icon(categoryIconName("sap"), { size: 16 })),
       h(
         "span",
         { class: "assoc__title" },

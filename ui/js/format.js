@@ -40,19 +40,12 @@ export function mask(value, visible) {
   return length ? "•".repeat(Math.min(length, 18)) : "";
 }
 
-/** Two-character badge for a list row: the first letters of the title. */
-export function initials(title) {
-  const value = (title || "").trim();
-  if (!value) return "··";
-  const words = value.split(/\s+/).filter(Boolean);
-  if (words.length > 1) {
-    return words
-      .slice(0, 2)
-      .map((word) => Array.from(word)[0] ?? "")
-      .join("")
-      .toUpperCase();
-  }
-  return Array.from(value).slice(0, 2).join("").toUpperCase();
+/** Which icon marks an account wherever it is listed. A category says more than
+ *  the first letters of the title, and it never has to be invented by the user. */
+export function categoryIconName(categoryId) {
+  if (categoryId === "sap") return "server";
+  if (categoryId === "general") return "key";
+  return "folder";
 }
 
 /** Human readable description of a password rule. */

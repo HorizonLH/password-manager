@@ -1035,6 +1035,8 @@ pub fn file_sync_all(app: AppHandle, state: State<'_, AppState>) -> AppResult<Ve
                     if let Some(file) = vault.files.iter_mut().find(|file| file.id == id) {
                         file.last_sync_at = Some(now_string());
                         file.last_status = Some(format!("失败：{err}"));
+                        // The file may have been changed by another program.
+                        sync::reanalyze(file);
                     }
                     Ok(())
                 })?;
