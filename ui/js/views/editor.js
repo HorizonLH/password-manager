@@ -504,6 +504,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     categoryId: entry?.categoryId ?? defaultCategory ?? "sap",
     username: entry?.username ?? "",
     useKnoxId: entry?.useKnoxId ?? false,
+    matchUrl: entry?.matchUrl ?? "",
     notes: entry?.notes ?? "",
     favorite: entry?.favorite ?? false,
     rule: entry?.rule ? { ...entry.rule } : null,
@@ -640,6 +641,19 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
           h("div", { class: "input-group" }, passwordInput, revealButton),
           editing ? "留空表示保留原密码" : null,
         ),
+        field(
+          "匹配用 URL",
+          h("input", {
+            id: "editor-match-url",
+            class: "input input--mono",
+            value: draft.matchUrl,
+            placeholder: "例如 prd.corp.example",
+            onInput: (event) => {
+              draft.matchUrl = event.target.value;
+            },
+          }),
+          "同步时用它在该文件里找到本账号对应的凭据块；文件里只有一个凭据块时可以留空。",
+        ),
       ),
       passwordMeter,
     ),
@@ -678,6 +692,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
       username: draft.username,
       useKnoxId: draft.useKnoxId,
       password: password.value,
+      matchUrl: draft.matchUrl,
       notes: draft.notes,
       favorite: draft.favorite,
       rule: draft.rule,

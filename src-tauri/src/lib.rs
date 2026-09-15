@@ -5,6 +5,7 @@ mod crypto;
 mod error;
 mod keys;
 mod model;
+mod patch;
 mod rules;
 mod state;
 mod store;
@@ -76,22 +77,19 @@ pub fn run() {
             commands::copy_sap_credentials,
             commands::copy_text,
             commands::clipboard_clear,
-            commands::link_inspect,
-            commands::link_add,
-            commands::link_update_keys,
-            commands::link_reanalyze,
-            commands::link_remove,
-            commands::link_preview,
+            commands::file_inspect,
+            commands::file_add,
+            commands::file_update_keys,
+            commands::file_reanalyze,
+            commands::file_bind,
+            commands::file_remove,
+            commands::file_preview,
             commands::open_in_explorer,
             commands::open_path,
-            commands::sync_presets,
-            commands::sync_target_default,
-            commands::sync_target_save,
-            commands::sync_target_delete,
-            commands::sync_preview,
-            commands::sync_preview_template,
-            commands::sync_run,
-            commands::sync_run_all,
+            commands::file_plan,
+            commands::file_plans,
+            commands::file_sync,
+            commands::file_sync_all,
             commands::generate_password,
             commands::check_password_strength,
             commands::rule_default,

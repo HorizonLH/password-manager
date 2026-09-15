@@ -1,44 +1,69 @@
 //! Content-file parsing.
 //!
-//! Instead of guessing which file on the disk belongs to an account, SapVault
-//! now lets the user attach the files explicitly and then pulls the credential
-//! fields out of them. Only the formats below are understood; anything else is
-//! read as plain text.
+//! Two things matter here:
+//!   1. the credential fields are located by key words, and
+//!   2. the *exact byte range* of every value is recorded, so syncing can
+//!      replace only the password and leave every other byte untouched.
 //!
-//! Supported: JSON, .env, TOML, YAML, XML, plain text.
+//! Supported formats: JSON, .env, TOML, YAML, XML and plain text.
 
 use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use serde_json::Value;
 
-use crate::model::{now_string, FieldHit, KeyMapping, LinkParse};
+use crate::model::{
+    now_string, FieldHit, FieldLocation, FileAnalysis, FileRecord, KeyMapping,
+};
+use crate::patch::{self, TextEncoding};
 
 pub const KIND_URL: &str = "url";
 pub const KIND_USERNAME: &str = "username";
 pub const KIND_PASSWORD: &str = "password";
+const KINDS: [&str; 3] = [KIND_URL, KIND_USERNAME, KIND_PASSWORD];
 
 /// Guards against pulling a whole database dump into memory.
 pub const MAX_ANALYZE_BYTES: u64 = 4 * 1024 * 1024;
 
 const FORMATS: [&str; 6] = ["json", "env", "toml", "yaml", "xml", "text"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlatValue {
-    pub key: String,
-    pub path: String,
-    pub value: String,
-    pub line: u32,
+/// Suffixes used to group `PREFIX_URL` / `PREFIX_USER` / `PREFIX_PASSWORD` keys.
+const ENV_SUFFIXES: [&str; 12] = [
+    "_url", "_uri", "_host", "_server", "_user", "_username", "_userid", "_login", "_password",
+    "_passwd", "_pwd", "_secret",
+];
+
+#[derive(Debug, Clone)]
+struct FlatValue {
+    key: String,
+    path: String,
+    parent: String,
+    value: String,
+    start: usize,
+    end: usize,
+    quoted: bool,
+    xml_attr: bool,
+    line: u32,
 }
 
-/// File-name based format detection. `.env` and friends have no extension, so
-/// the file name is checked as well.
+/// A file read together with its parse result. The text and the offsets always
+/// come from the same read, which is what makes in-place editing safe.
+pub struct LoadedFile {
+    pub text: String,
+    pub encoding: TextEncoding,
+    pub analysis: FileAnalysis,
+}
+
+// ---------------------------------------------------------------------------
+// Format detection & loading
+// ---------------------------------------------------------------------------
+
 pub fn detect_format(path: &Path) -> String {
     let name = path
         .file_name()
         .map(|value| value.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    // `.env` and friends have no extension, so the name is checked first.
     if name == ".env" || name.starts_with(".env.") || name.ends_with(".env") {
         return "env".to_string();
     }
@@ -49,7 +74,7 @@ pub fn detect_format(path: &Path) -> String {
     match extension.as_str() {
         "json" | "jsonc" => "json",
         "env" => "env",
-        "toml" | "ini" | "conf" | "cfg" | "properties" | "lock" => "toml",
+        "toml" | "ini" | "conf" | "cfg" | "properties" => "toml",
         "yaml" | "yml" => "yaml",
         "xml" | "plist" | "config" | "resx" => "xml",
         _ => "text",
@@ -61,114 +86,87 @@ pub fn is_supported(path: &Path) -> bool {
     FORMATS.contains(&detect_format(path).as_str())
 }
 
-/// Reads a file and returns its text, or an error description when the file is
-/// missing, too large or looks binary.
-pub fn read_text(path: &Path) -> Result<String, String> {
-    let metadata = std::fs::metadata(path).map_err(|err| format!("无法读取文件信息：{err}"))?;
+/// Reads and parses a file. Errors are reported inside `analysis.error` so the
+/// UI can show a per-file message.
+pub fn load(path: &Path, mapping: &KeyMapping) -> LoadedFile {
+    let format = detect_format(path);
+    let error_analysis = |error: String| FileAnalysis {
+        format: format.clone(),
+        records: Vec::new(),
+        missing: KINDS.iter().map(|kind| kind.to_string()).collect(),
+        analyzed_at: now_string(),
+        error: Some(error),
+    };
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return LoadedFile {
+                text: String::new(),
+                encoding: TextEncoding::Utf8,
+                analysis: error_analysis(format!("无法读取文件信息：{err}")),
+            }
+        }
+    };
     if metadata.len() > MAX_ANALYZE_BYTES {
-        return Err(format!(
-            "文件过大（{} MB），超过 {} MB 的分析上限",
-            metadata.len() / 1048576,
-            MAX_ANALYZE_BYTES / 1048576
-        ));
+        return LoadedFile {
+            text: String::new(),
+            encoding: TextEncoding::Utf8,
+            analysis: error_analysis(format!(
+                "文件过大（{} MB），超过 {} MB 的处理上限",
+                metadata.len() / 1048576,
+                MAX_ANALYZE_BYTES / 1048576
+            )),
+        };
     }
-    let bytes = std::fs::read(path).map_err(|err| format!("无法读取文件：{err}"))?;
-    decode_text(&bytes).ok_or_else(|| "文件看起来是二进制内容，无法解析".to_string())
+
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return LoadedFile {
+                text: String::new(),
+                encoding: TextEncoding::Utf8,
+                analysis: error_analysis(format!("无法读取文件：{err}")),
+            }
+        }
+    };
+
+    let Some((text, encoding)) = patch::decode(&bytes) else {
+        return LoadedFile {
+            text: String::new(),
+            encoding: TextEncoding::Utf8,
+            analysis: error_analysis("文件看起来是二进制内容，无法解析".to_string()),
+        };
+    };
+
+    let analysis = analyze_text(&text, &format, mapping);
+    LoadedFile {
+        text,
+        encoding,
+        analysis,
+    }
 }
 
-/// UTF-8 (with or without BOM) and UTF-16 are decoded; anything with a stray
-/// NUL byte is treated as binary.
-pub fn decode_text(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() {
-        return Some(String::new());
-    }
-    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-        return Some(decode_utf16(&bytes[2..], true));
-    }
-    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-        return Some(decode_utf16(&bytes[2..], false));
-    }
-    let sniff = bytes.len().min(8 * 1024);
-    if bytes[..sniff].contains(&0) {
-        return None;
-    }
-    let text = String::from_utf8_lossy(bytes);
-    Some(text.trim_start_matches('\u{feff}').to_string())
+pub fn analyze_file(path: &Path, mapping: &KeyMapping) -> FileAnalysis {
+    load(path, mapping).analysis
 }
 
-fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
-    let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        units.push(if little_endian {
-            u16::from_le_bytes([chunk[0], chunk[1]])
-        } else {
-            u16::from_be_bytes([chunk[0], chunk[1]])
-        });
-    }
-    String::from_utf16_lossy(&units)
-}
-
-/// Analyses an already-loaded document.
-pub fn analyze_text(text: &str, format: &str, mapping: &KeyMapping) -> LinkParse {
+pub fn analyze_text(text: &str, format: &str, mapping: &KeyMapping) -> FileAnalysis {
     let values = extract(text, format);
-    let mut fields: Vec<FieldHit> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
+    let records = group(&values, mapping, format);
 
-    for (kind, keys) in [
-        (KIND_URL, &mapping.url),
-        (KIND_USERNAME, &mapping.username),
-        (KIND_PASSWORD, &mapping.password),
-    ] {
-        match pick(&values, keys, mapping) {
-            Some(value) => fields.push(FieldHit {
-                kind: kind.to_string(),
-                key: value.key.clone(),
-                path: value.path.clone(),
-                value: value.value.clone(),
-                line: value.line,
-            }),
-            None => missing.push(kind.to_string()),
-        }
-    }
+    let missing: Vec<String> = KINDS
+        .iter()
+        .filter(|kind| !records.iter().any(|record| record.hit(kind).is_some()))
+        .map(|kind| kind.to_string())
+        .collect();
 
-    // A literal URL is unambiguous even when no key matches.
-    if missing.iter().any(|kind| kind == KIND_URL) {
-        if let Some(value) = values.iter().find(|value| looks_like_url(&value.value)) {
-            fields.push(FieldHit {
-                kind: KIND_URL.to_string(),
-                key: value.key.clone(),
-                path: value.path.clone(),
-                value: value.value.clone(),
-                line: value.line,
-            });
-            missing.retain(|kind| kind != KIND_URL);
-        }
-    }
-
-    LinkParse {
+    FileAnalysis {
         format: format.to_string(),
-        fields,
+        records,
         missing,
         analyzed_at: now_string(),
         error: None,
-    }
-}
-
-pub fn analyze_file(path: &Path, mapping: &KeyMapping) -> LinkParse {
-    let format = detect_format(path);
-    match read_text(path) {
-        Ok(text) => analyze_text(&text, &format, mapping),
-        Err(error) => LinkParse {
-            format,
-            fields: Vec::new(),
-            missing: vec![
-                KIND_URL.to_string(),
-                KIND_USERNAME.to_string(),
-                KIND_PASSWORD.to_string(),
-            ],
-            analyzed_at: now_string(),
-            error: Some(error),
-        },
     }
 }
 
@@ -176,7 +174,7 @@ pub fn analyze_file(path: &Path, mapping: &KeyMapping) -> LinkParse {
 // Extraction
 // ---------------------------------------------------------------------------
 
-pub fn extract(text: &str, format: &str) -> Vec<FlatValue> {
+fn extract(text: &str, format: &str) -> Vec<FlatValue> {
     match format {
         "json" => extract_json(text),
         "env" => extract_env(text),
@@ -187,103 +185,118 @@ pub fn extract(text: &str, format: &str) -> Vec<FlatValue> {
     }
 }
 
-fn push(into: &mut Vec<FlatValue>, key: &str, path: &str, value: &str, line: u32) {
-    let value = value.trim();
-    if value.is_empty() || key.trim().is_empty() {
-        return;
-    }
-    into.push(FlatValue {
-        key: key.to_string(),
-        path: path.to_string(),
-        value: value.to_string(),
-        line,
-    });
+/// Absolute byte offset of a sub-slice inside the document.
+fn offset_of(text: &str, sub: &str) -> usize {
+    sub.as_ptr() as usize - text.as_ptr() as usize
 }
 
-fn extract_json(text: &str) -> Vec<FlatValue> {
-    let Ok(root) = serde_json::from_str::<Value>(text) else {
-        // Not valid JSON: fall back to the text scanner so a slightly broken
-        // file can still yield something useful.
-        return extract_text(text);
-    };
-    let mut out: Vec<FlatValue> = Vec::new();
-    walk_json(&root, "", text, &mut out);
-    out
+/// Precomputed line starts so line numbers are a binary search.
+struct LineIndex {
+    starts: Vec<usize>,
 }
 
-fn walk_json(value: &Value, path: &str, text: &str, out: &mut Vec<FlatValue>) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                let child_path = if path.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{path}.{key}")
-                };
-                walk_json(child, &child_path, text, out);
+impl LineIndex {
+    fn new(text: &str) -> Self {
+        let mut starts = vec![0usize];
+        for (index, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                starts.push(index + 1);
             }
         }
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                walk_json(item, &format!("{path}[{index}]"), text, out);
-            }
+        Self { starts }
+    }
+
+    fn line_at(&self, offset: usize) -> u32 {
+        match self.starts.binary_search(&offset) {
+            Ok(index) => index as u32 + 1,
+            Err(index) => index as u32,
         }
-        Value::String(text_value) => {
-            let line = line_of(text, text_value);
-            push(
-                out,
-                last_segment(path),
-                path,
-                text_value,
-                line,
-            );
-        }
-        Value::Number(number) => {
-            let rendered = number.to_string();
-            let line = line_of(text, &rendered);
-            push(out, last_segment(path), path, &rendered, line);
-        }
-        Value::Bool(flag) => {
-            let rendered = flag.to_string();
-            let line = line_of(text, &rendered);
-            push(out, last_segment(path), path, &rendered, line);
-        }
-        Value::Null => {}
     }
 }
 
-fn last_segment(path: &str) -> &str {
-    let trimmed = path.trim_end_matches(']');
-    match trimmed.rfind(['.', '[']) {
-        Some(index) => &trimmed[index + 1..],
-        None => trimmed,
+/// Value range inside a `key=value` / `key: value` pair.
+fn value_range(text: &str, raw_value: &str) -> (usize, usize, bool) {
+    let trimmed = raw_value.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0];
+        let last = trimmed.as_bytes()[trimmed.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            let inner = &trimmed[1..trimmed.len() - 1];
+            let start = offset_of(text, inner);
+            return (start, start + inner.len(), true);
+        }
     }
+    let start = offset_of(text, trimmed);
+    (start, start + trimmed.len(), false)
+}
+
+fn unquote(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches(',').trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0];
+        let last = trimmed.as_bytes()[trimmed.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Byte offset where a trailing `#` comment starts, respecting quotes.
+fn comment_start(line: &str) -> usize {
+    let mut in_single = false;
+    let mut in_double = false;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return index,
+            _ => {}
+        }
+    }
+    line.len()
 }
 
 fn extract_env(text: &str) -> Vec<FlatValue> {
     let mut out = Vec::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_no = index as u32 + 1;
-        let line = raw_line.trim();
+    let lines = LineIndex::new(text);
+    for raw_line in text.split_inclusive('\n') {
+        let body = raw_line.trim_end_matches(['\n', '\r']);
+        let line = body.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line).trim();
-        if let Some((key, value)) = line.split_once('=') {
-            let unquoted = unquote(value.trim());
-            push(&mut out, key.trim(), key.trim(), &unquoted, line_no);
+        let Some(equals) = line.find('=') else { continue };
+        let key = line[..equals].trim();
+        if key.is_empty() || key.len() > 64 {
+            continue;
         }
+        let raw_value = &line[equals + 1..];
+        let (start, end, quoted) = value_range(text, raw_value);
+        out.push(FlatValue {
+            key: key.to_string(),
+            path: key.to_string(),
+            parent: String::new(),
+            value: unquote(raw_value),
+            start,
+            end,
+            quoted,
+            xml_attr: false,
+            line: lines.line_at(offset_of(text, key)),
+        });
     }
     out
 }
 
 fn extract_toml(text: &str) -> Vec<FlatValue> {
     let mut out = Vec::new();
+    let lines = LineIndex::new(text);
     let mut section = String::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_no = index as u32 + 1;
-        let cleaned = strip_comment(raw_line);
-        let line = cleaned.trim();
+    for raw_line in text.split_inclusive('\n') {
+        let full = raw_line.trim_end_matches(['\n', '\r']);
+        let cut = comment_start(full);
+        let line = full[..cut].trim();
         if line.is_empty() {
             continue;
         }
@@ -295,46 +308,57 @@ fn extract_toml(text: &str) -> Vec<FlatValue> {
                 .to_string();
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let path = if section.is_empty() {
-                key.to_string()
-            } else {
-                format!("{section}.{key}")
-            };
-            let value = unquote(value.trim());
-            if !value.starts_with('[') {
-                push(&mut out, key, &path, &value, line_no);
-            }
+        let Some(equals) = line.find('=') else { continue };
+        let key = line[..equals].trim();
+        if key.is_empty() || key.len() > 64 {
+            continue;
         }
+        let raw_value = &line[equals + 1..];
+        let trimmed = raw_value.trim();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            continue;
+        }
+        let (start, end, quoted) = value_range(text, raw_value);
+        let path = if section.is_empty() {
+            key.to_string()
+        } else {
+            format!("{section}.{key}")
+        };
+        out.push(FlatValue {
+            key: key.to_string(),
+            path,
+            parent: section.clone(),
+            value: unquote(raw_value),
+            start,
+            end,
+            quoted,
+            xml_attr: false,
+            line: lines.line_at(offset_of(text, key)),
+        });
     }
     out
 }
 
 fn extract_yaml(text: &str) -> Vec<FlatValue> {
     let mut out = Vec::new();
-    // (indent, key) stack so nested mappings produce dotted paths.
+    let lines = LineIndex::new(text);
     let mut stack: Vec<(usize, String)> = Vec::new();
 
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_no = index as u32 + 1;
-        let without_comment = strip_comment(raw_line);
-        if without_comment.trim().is_empty() {
+    for raw_line in text.split_inclusive('\n') {
+        let full = raw_line.trim_end_matches(['\n', '\r']);
+        let cut = comment_start(full);
+        let content = full[..cut].trim_end();
+        if content.trim().is_empty() || content.trim() == "---" {
             continue;
         }
-        let indent = without_comment.len() - without_comment.trim_start().len();
-        let content = without_comment.trim();
-        if content == "---" || content.starts_with('%') {
+        let indent = content.len() - content.trim_start().len();
+        let body = content.trim().strip_prefix("- ").unwrap_or(content.trim());
+        let Some(colon) = body.find(':') else { continue };
+        let key = body[..colon].trim().trim_matches('"').trim_matches('\'');
+        if key.is_empty() || key.len() > 64 {
             continue;
         }
-        let content = content.strip_prefix("- ").unwrap_or(content).trim();
-        let Some((key, value)) = content.split_once(':') else {
-            continue;
-        };
-        let key = key.trim().trim_matches('"').trim_matches('\'').trim();
-        if key.is_empty() {
-            continue;
-        }
+        let raw_value = &body[colon + 1..];
 
         while let Some((level, _)) = stack.last() {
             if *level >= indent {
@@ -344,75 +368,441 @@ fn extract_yaml(text: &str) -> Vec<FlatValue> {
             }
         }
 
-        let value = value.trim();
-        if value.is_empty() || value == "|" || value == ">" {
+        if raw_value.trim().is_empty() || raw_value.trim() == "|" || raw_value.trim() == ">" {
             stack.push((indent, key.to_string()));
             continue;
         }
 
-        let mut path: Vec<&str> = stack.iter().map(|(_, key)| key.as_str()).collect();
-        path.push(key);
-        let unquoted = unquote(value);
-        push(&mut out, key, &path.join("."), &unquoted, line_no);
+        let parent: Vec<&str> = stack.iter().map(|(_, name)| name.as_str()).collect();
+        let parent_path = parent.join(".");
+        let path = if parent_path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{parent_path}.{key}")
+        };
+        let (start, end, quoted) = value_range(text, raw_value);
+        out.push(FlatValue {
+            key: key.to_string(),
+            path,
+            parent: parent_path,
+            value: unquote(raw_value),
+            start,
+            end,
+            quoted,
+            xml_attr: false,
+            line: lines.line_at(offset_of(text, key)),
+        });
     }
     out
 }
 
+/// Plain text: `key=value` / `key: value` pairs and bare URLs, grouped into
+/// paragraphs so a file describing several systems still yields several records.
+fn extract_text(text: &str) -> Vec<FlatValue> {
+    let mut out = Vec::new();
+    let lines = LineIndex::new(text);
+    let mut block = 0usize;
+    let mut previous_blank = true;
+
+    for raw_line in text.split_inclusive('\n') {
+        let full = raw_line.trim_end_matches(['\n', '\r']);
+        if full.trim().is_empty() {
+            previous_blank = true;
+            continue;
+        }
+        if previous_blank {
+            block += 1;
+            previous_blank = false;
+        }
+        let parent = format!("段落 {block}");
+        let line = full.trim();
+        if line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+
+        let mut matched = false;
+        for separator in ['=', ':'] {
+            if let Some(index) = line.find(separator) {
+                let key = line[..index]
+                    .trim()
+                    .trim_start_matches('-')
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim();
+                if key.is_empty() || key.len() > 64 {
+                    continue;
+                }
+                let raw_value = &line[index + 1..];
+                if raw_value.trim().is_empty() {
+                    continue;
+                }
+                let (start, end, quoted) = value_range(text, raw_value);
+                out.push(FlatValue {
+                    key: key.to_string(),
+                    path: key.to_string(),
+                    parent: parent.clone(),
+                    value: unquote(raw_value),
+                    start,
+                    end,
+                    quoted,
+                    xml_attr: false,
+                    line: lines.line_at(offset_of(text, key)),
+                });
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+        // Bare URLs are useful even without a key.
+        for token in line.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',') {
+            if looks_like_url(token) {
+                let start = offset_of(text, token);
+                out.push(FlatValue {
+                    key: "url".to_string(),
+                    path: "url".to_string(),
+                    parent: parent.clone(),
+                    value: token.to_string(),
+                    start,
+                    end: start + token.len(),
+                    quoted: false,
+                    xml_attr: false,
+                    line: lines.line_at(start),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn looks_like_url(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+// --------------------------------------------------------------- JSON -------
+
+struct JsonScanner<'a> {
+    text: &'a str,
+    pos: usize,
+    out: Vec<FlatValue>,
+}
+
+impl<'a> JsonScanner<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            pos: 0,
+            out: Vec::new(),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.text.as_bytes()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes().get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn parse_document(&mut self) {
+        self.skip_ws();
+        self.parse_value("", "");
+    }
+
+    fn parse_value(&mut self, path: &str, parent: &str) {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'{') => self.parse_object(path),
+            Some(b'[') => self.parse_array(path),
+            Some(b'"') => {
+                if let Some((start, end, value)) = self.parse_string() {
+                    self.push(last_segment(path), path, parent, value, start, end, true);
+                }
+            }
+            Some(_) => {
+                let start = self.pos;
+                while matches!(self.peek(), Some(byte) if !matches!(byte, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'))
+                {
+                    self.pos += 1;
+                }
+                let raw = self.text[start..self.pos].trim().to_string();
+                if !raw.is_empty() {
+                    self.push(last_segment(path), path, parent, raw, start, self.pos, false);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn parse_object(&mut self, path: &str) {
+        self.pos += 1; // consume `{`
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'}') => {
+                    self.pos += 1;
+                    return;
+                }
+                Some(b',') => {
+                    self.pos += 1;
+                    continue;
+                }
+                Some(b'"') => {}
+                _ => return,
+            }
+            let Some((_, _, key)) = self.parse_string() else { return };
+            self.skip_ws();
+            if self.peek() == Some(b':') {
+                self.pos += 1;
+            }
+            let child = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            self.parse_value(&child, path);
+            self.skip_ws();
+        }
+    }
+
+    fn parse_array(&mut self, path: &str) {
+        self.pos += 1; // consume `[`
+        let mut index = 0usize;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(b']') => {
+                    self.pos += 1;
+                    return;
+                }
+                Some(b',') => {
+                    self.pos += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            let child = format!("{path}[{index}]");
+            self.parse_value(&child, path);
+            index += 1;
+            self.skip_ws();
+        }
+    }
+
+    /// Parses a string literal, returning the inner byte range and decoded value.
+    fn parse_string(&mut self) -> Option<(usize, usize, String)> {
+        if self.peek() != Some(b'"') {
+            return None;
+        }
+        self.pos += 1;
+        let start = self.pos;
+        let mut out = String::new();
+        while self.pos < self.bytes().len() {
+            match self.bytes()[self.pos] {
+                b'"' => {
+                    let end = self.pos;
+                    self.pos += 1;
+                    return Some((start, end, out));
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(b'n') => out.push('\n'),
+                        Some(b't') => out.push('\t'),
+                        Some(b'r') => out.push('\r'),
+                        Some(b'b') => out.push('\u{8}'),
+                        Some(b'f') => out.push('\u{c}'),
+                        Some(b'"') => out.push('"'),
+                        Some(b'\\') => out.push('\\'),
+                        Some(b'/') => out.push('/'),
+                        Some(b'u') => {
+                            let mut code = 0u32;
+                            for _ in 0..4 {
+                                self.pos += 1;
+                                if let Some(digit) = self.peek().and_then(|b| (b as char).to_digit(16))
+                                {
+                                    code = code * 16 + digit;
+                                }
+                            }
+                            if let Some(ch) = char::from_u32(code) {
+                                out.push(ch);
+                            }
+                        }
+                        Some(other) => out.push(other as char),
+                        None => break,
+                    }
+                    self.pos += 1;
+                }
+                _ => {
+                    let ch = self.text[self.pos..].chars().next()?;
+                    out.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        key: &str,
+        path: &str,
+        parent: &str,
+        value: String,
+        start: usize,
+        end: usize,
+        quoted: bool,
+    ) {
+        if value.trim().is_empty() || key.trim().is_empty() {
+            return;
+        }
+        self.out.push(FlatValue {
+            key: key.to_string(),
+            path: path.to_string(),
+            parent: parent.to_string(),
+            value,
+            start,
+            end,
+            quoted,
+            xml_attr: false,
+            line: 0,
+        });
+    }
+}
+
+fn last_segment(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(']');
+    match trimmed.rfind(['.', '[']) {
+        Some(index) => &trimmed[index + 1..],
+        None => trimmed,
+    }
+}
+
+fn extract_json(text: &str) -> Vec<FlatValue> {
+    let mut scanner = JsonScanner::new(text);
+    scanner.parse_document();
+    let mut values = scanner.out;
+    let lines = LineIndex::new(text);
+    for value in values.iter_mut() {
+        value.line = lines.line_at(value.start);
+    }
+    values
+}
+
+// --------------------------------------------------------------- XML --------
+
+/// Expands the predefined XML entities; the raw range is kept for writing.
+fn unescape_entities(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn xml_local_name(raw: &[u8]) -> String {
+    let name = match raw.iter().rposition(|byte| *byte == b':') {
+        Some(index) => &raw[index + 1..],
+        None => raw,
+    };
+    String::from_utf8_lossy(name).to_string()
+}
+
+/// Finds `name="value"` (or `name='value'`) inside a raw start tag and returns the
+/// byte range of the value's inner text.
+fn attribute_range(tag: &str, name: &str, value: &str) -> Option<(usize, usize)> {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}{value}{quote}");
+        if let Some(index) = tag.find(&needle) {
+            let quote_len = quote.len_utf8();
+            let value_start = index + name.len() + 1 + quote_len;
+            return Some((value_start, value_start + value.len()));
+        }
+        // The raw value may use entities, so fall back to a looser match.
+        let prefix = format!("{name}={quote}");
+        if let Some(index) = tag.find(&prefix) {
+            let value_start = index + prefix.len();
+            let rest = &tag[value_start..];
+            if let Some(end) = rest.find(quote) {
+                return Some((value_start, value_start + end));
+            }
+        }
+    }
+    None
+}
+
+fn stack_path(stack: &[(String, usize)]) -> String {
+    stack
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// XML text is collected per *element* (from the end of its start tag to the
+/// beginning of its end tag) because quick-xml splits entity references such as
+/// `&amp;` into separate events. The recorded range therefore covers the whole
+/// raw content, and the value is the unescaped text.
 fn extract_xml(text: &str) -> Vec<FlatValue> {
     let mut out: Vec<FlatValue> = Vec::new();
+    let lines = LineIndex::new(text);
     let mut reader = Reader::from_str(text);
-    reader.config_mut().trim_text(true);
-    let mut stack: Vec<String> = Vec::new();
+    reader.config_mut().trim_text(false);
+    // (element name, offset where its content starts)
+    let mut stack: Vec<(String, usize)> = Vec::new();
 
     loop {
+        let before = reader.buffer_position() as usize;
         match reader.read_event() {
             Ok(Event::Start(element)) => {
-                let name = String::from_utf8_lossy(element.local_name().as_ref()).to_string();
-                for attribute in element.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attribute.key.local_name().as_ref()).to_string();
-                    let value = attribute
-                        .unescape_value()
-                        .map(|value| value.into_owned())
-                        .unwrap_or_default();
-                    let path = if stack.is_empty() {
-                        format!("{name}@{key}")
-                    } else {
-                        format!("{}.{name}@{key}", stack.join("."))
-                    };
-                    let line = line_of(text, &value);
-                    push(&mut out, &key, &path, &value, line);
-                }
-                stack.push(name);
+                let after = reader.buffer_position() as usize;
+                let name = xml_local_name(element.local_name().as_ref());
+                collect_xml_attributes(text, before, after, &stack, &name, &element, &lines, &mut out);
+                stack.push((name, after));
             }
             Ok(Event::Empty(element)) => {
-                let name = String::from_utf8_lossy(element.local_name().as_ref()).to_string();
-                for attribute in element.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attribute.key.local_name().as_ref()).to_string();
-                    let value = attribute
-                        .unescape_value()
-                        .map(|value| value.into_owned())
-                        .unwrap_or_default();
-                    let path = if stack.is_empty() {
-                        format!("{name}@{key}")
-                    } else {
-                        format!("{}.{name}@{key}", stack.join("."))
-                    };
-                    let line = line_of(text, &value);
-                    push(&mut out, &key, &path, &value, line);
-                }
-            }
-            Ok(Event::Text(text_node)) => {
-                let value = text_node
-                    .decode()
-                    .map(|value| unescape_entities(&value))
-                    .unwrap_or_default();
-                if let Some(name) = stack.last() {
-                    let line = line_of(text, &value);
-                    push(&mut out, &name.clone(), &stack.join("."), &value, line);
-                }
+                let after = reader.buffer_position() as usize;
+                let name = xml_local_name(element.local_name().as_ref());
+                collect_xml_attributes(text, before, after, &stack, &name, &element, &lines, &mut out);
             }
             Ok(Event::End(_)) => {
-                stack.pop();
+                let Some((name, start)) = stack.pop() else {
+                    continue;
+                };
+                if start > before || before > text.len() {
+                    continue;
+                }
+                let raw = &text[start..before];
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                let parent = stack_path(&stack);
+                let path = if parent.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{parent}.{name}")
+                };
+                out.push(FlatValue {
+                    key: name,
+                    path,
+                    parent,
+                    value: unescape_entities(raw).trim().to_string(),
+                    start,
+                    end: before,
+                    quoted: false,
+                    xml_attr: false,
+                    line: lines.line_at(start),
+                });
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -425,312 +815,223 @@ fn extract_xml(text: &str) -> Vec<FlatValue> {
     out
 }
 
-/// Plain text: `key=value`, `key: value`, and bare URLs.
-fn extract_text(text: &str) -> Vec<FlatValue> {
-    let mut out = Vec::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_no = index as u32 + 1;
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+#[allow(clippy::too_many_arguments)]
+fn collect_xml_attributes(
+    text: &str,
+    before: usize,
+    after: usize,
+    stack: &[(String, usize)],
+    element_name: &str,
+    element: &quick_xml::events::BytesStart<'_>,
+    lines: &LineIndex,
+    out: &mut Vec<FlatValue>,
+) {
+    let tag = &text[before..after.max(before)];
+    let parent = stack_path(stack);
+    let element_path = if parent.is_empty() {
+        element_name.to_string()
+    } else {
+        format!("{parent}.{element_name}")
+    };
+    for attribute in element.attributes().flatten() {
+        let key = xml_local_name(attribute.key.local_name().as_ref());
+        let value = attribute
+            .unescape_value()
+            .map(|value| value.into_owned())
+            .unwrap_or_default();
+        if value.trim().is_empty() {
             continue;
         }
-        let mut matched = false;
-        for separator in ['=', ':'] {
-            if let Some((key, value)) = line.split_once(separator) {
-                let key = key
-                    .trim()
-                    .trim_start_matches('-')
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .trim();
-                let value = unquote(value.trim());
-                if !key.is_empty() && !value.is_empty() && key.len() < 64 {
-                    push(&mut out, key, key, &value, line_no);
-                    matched = true;
-                    break;
-                }
-            }
-        }
-        for token in line.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',') {
-            if looks_like_url(token) {
-                push(&mut out, "url", "url", token, line_no);
-                matched = true;
-            }
-        }
-        let _ = matched;
+        let Some((start, end)) = attribute_range(tag, &key, &value) else {
+            continue;
+        };
+        out.push(FlatValue {
+            key: key.clone(),
+            path: format!("{element_path}@{key}"),
+            parent: element_path.clone(),
+            value: value.trim().to_string(),
+            start: before + start,
+            end: before + end,
+            quoted: true,
+            xml_attr: true,
+            line: lines.line_at(before),
+        });
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
-// Matching
+// Record grouping
 // ---------------------------------------------------------------------------
 
-fn looks_like_url(value: &str) -> bool {
-    let lower = value.trim().to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
-}
-
-/// Picks the best match for one field kind. Exact key matches win over partial
-/// ones, and longer keys win over shorter ones (`username` beats `user`).
-fn pick<'a>(values: &'a [FlatValue], keys: &[String], mapping: &KeyMapping) -> Option<&'a FlatValue> {
-    let mut best: Option<(u8, usize, usize, &'a FlatValue)> = None;
-    for (index, value) in values.iter().enumerate() {
-        for key in keys {
-            let (matched, exact) = if mapping.exact {
-                (key_eq(&value.key, key, mapping.ignore_case), true)
-            } else if key_eq(&value.key, key, mapping.ignore_case) {
-                (true, true)
-            } else {
-                (key_contains(&value.key, key, mapping.ignore_case), false)
-            };
-            if !matched {
-                continue;
-            }
-            let score = if exact { 2u8 } else { 1u8 };
-            let specificity = key.chars().count();
-            let better = match best {
-                None => true,
-                Some((best_score, best_specificity, _, _)) => {
-                    (score, specificity) > (best_score, best_specificity)
-                }
-            };
-            if better {
-                best = Some((score, specificity, index, value));
-            }
+/// Key kind for a value, or `None` when the key is not a credential keyword.
+fn kind_of(key: &str, mapping: &KeyMapping) -> Option<&'static str> {
+    // Password first: `user_password` should be a password, not a user name.
+    for (kind, keys) in [
+        (KIND_PASSWORD, &mapping.password),
+        (KIND_USERNAME, &mapping.username),
+        (KIND_URL, &mapping.url),
+    ] {
+        if keys.iter().any(|candidate| key_matches(key, candidate, mapping)) {
+            return Some(kind);
         }
     }
-    best.map(|(_, _, _, value)| value)
+    None
 }
 
-fn key_eq(candidate: &str, key: &str, ignore_case: bool) -> bool {
-    if ignore_case {
-        candidate.eq_ignore_ascii_case(key)
-    } else {
-        candidate == key
+fn key_matches(candidate: &str, key: &str, mapping: &KeyMapping) -> bool {
+    let equals = |a: &str, b: &str| {
+        if mapping.ignore_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    if equals(candidate, key) {
+        return true;
     }
-}
-
-fn key_contains(candidate: &str, key: &str, ignore_case: bool) -> bool {
-    if key.is_empty() || key.chars().count() < 3 {
-        // Two-letter keys such as `pw` would match far too much.
-        return key_eq(candidate, key, ignore_case);
+    if mapping.exact || key.chars().count() < 3 {
+        return false;
     }
-    if ignore_case {
+    if mapping.ignore_case {
         candidate.to_ascii_lowercase().contains(&key.to_ascii_lowercase())
     } else {
         candidate.contains(key)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Small text helpers
-// ---------------------------------------------------------------------------
-
-fn unquote(value: &str) -> String {
-    let trimmed = value.trim().trim_end_matches(',');
-    let trimmed = trimmed.trim();
-    if trimmed.len() >= 2 {
-        let first = trimmed.chars().next().unwrap_or(' ');
-        let last = trimmed.chars().last().unwrap_or(' ');
-        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-            return trimmed[1..trimmed.len() - 1].to_string();
+/// Group key for a value: the containing block for structured formats, and a
+/// prefix for `PREFIX_URL` style env files.
+fn group_key(value: &FlatValue, format: &str) -> String {
+    match format {
+        "env" => {
+            let lower = value.key.to_ascii_lowercase();
+            for suffix in ENV_SUFFIXES {
+                if lower.ends_with(suffix) {
+                    let cut = value.key.len() - suffix.len();
+                    return value.key[..cut].to_string();
+                }
+            }
+            String::new()
         }
+        _ => value.parent.clone(),
     }
-    trimmed.to_string()
 }
 
-/// Removes a trailing `#` comment while respecting quoted strings.
-fn strip_comment(line: &str) -> String {
-    let mut in_single = false;
-    let mut in_double = false;
-    for (index, ch) in line.char_indices() {
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '#' if !in_single && !in_double => return line[..index].to_string(),
-            _ => {}
+fn group(values: &[FlatValue], mapping: &KeyMapping, format: &str) -> Vec<FileRecord> {
+    let mut order: Vec<String> = Vec::new();
+    let mut buckets: std::collections::HashMap<String, Vec<(FlatValue, &'static str)>> =
+        std::collections::HashMap::new();
+
+    for value in values {
+        let Some(kind) = kind_of(&value.key, mapping) else {
+            continue;
+        };
+        let key = group_key(value, format);
+        if !buckets.contains_key(&key) {
+            order.push(key.clone());
+        }
+        buckets.entry(key).or_default().push((value.clone(), kind));
+    }
+
+    // A block that is missing a field often shares it with a parent block
+    // (e.g. `[sap] url = ...` and `[sap.auth] password = ...`), so pull the
+    // missing kinds down from the nearest ancestor before giving up.
+    if matches!(format, "json" | "toml" | "yaml" | "xml") {
+        for key in order.clone() {
+            let ancestors = ancestor_paths(&key);
+            let mut present: std::collections::HashSet<&'static str> = buckets
+                .get(&key)
+                .map(|items| items.iter().map(|(_, kind)| *kind).collect())
+                .unwrap_or_default();
+            for ancestor in ancestors {
+                if ancestor == key {
+                    continue;
+                }
+                let Some(items) = buckets.get(&ancestor).cloned() else {
+                    continue;
+                };
+                for (value, kind) in items {
+                    if present.insert(kind) {
+                        buckets.entry(key.clone()).or_default().push((value, kind));
+                    }
+                }
+            }
         }
     }
-    line.to_string()
-}
 
-/// Expands the predefined XML entities that `BytesText::decode` leaves as
-/// written; credential values rarely contain anything else.
-fn unescape_entities(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&amp;", "&")
-}
-
-fn line_of(text: &str, needle: &str) -> u32 {
-    let needle = needle.trim();
-    if needle.chars().count() < 3 {
-        return 0;
-    }
-    for (index, line) in text.lines().enumerate() {
-        if line.contains(needle) {
-            return index as u32 + 1;
+    let mut records = Vec::new();
+    for key in order {
+        let Some(items) = buckets.get(&key) else { continue };
+        let mut fields: Vec<FieldHit> = Vec::new();
+        for kind in KINDS {
+            let candidate = items
+                .iter()
+                .filter(|(_, item_kind)| *item_kind == kind)
+                .min_by_key(|(value, _)| {
+                    let matchers = mapping.matchers(kind);
+                    let exact = matchers.iter().any(|needle| {
+                        if mapping.ignore_case {
+                            value.key.eq_ignore_ascii_case(needle)
+                        } else {
+                            value.key == *needle
+                        }
+                    });
+                    let specificity = matchers
+                        .iter()
+                        .filter(|needle| key_matches(&value.key, needle, mapping))
+                        .map(|needle| needle.chars().count())
+                        .max()
+                        .unwrap_or(0);
+                    (if exact { 0u8 } else { 1u8 }, usize::MAX - specificity)
+                });
+            let Some((value, _)) = candidate else { continue };
+            fields.push(FieldHit {
+                kind: kind.to_string(),
+                key: value.key.clone(),
+                path: value.path.clone(),
+                value: value.value.clone(),
+                line: value.line,
+                location: Some(FieldLocation {
+                    start: value.start,
+                    end: value.end,
+                    quoted: value.quoted,
+                    xml_attr: value.xml_attr,
+                    line: value.line,
+                }),
+            });
         }
+        if fields.is_empty() {
+            continue;
+        }
+        records.push(FileRecord {
+            id: crate::model::new_id(),
+            path: if key.is_empty() {
+                "（文件级）".to_string()
+            } else {
+                key
+            },
+            fields,
+        });
     }
-    0
+    records
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn mapping() -> KeyMapping {
-        KeyMapping::default()
+fn ancestor_paths(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = path.to_string();
+    while let Some(index) = current.rfind('.') {
+        current.truncate(index);
+        out.push(current.clone());
     }
+    out
+}
 
-    fn find<'a>(values: &'a [FlatValue], path: &str) -> Option<&'a FlatValue> {
-        values.iter().find(|value| value.path == path)
-    }
-
-    #[test]
-    fn detects_formats_from_name_and_extension() {
-        assert_eq!(detect_format(PathBuf::from("C:/x/.env").as_path()), "env");
-        assert_eq!(detect_format(PathBuf::from("C:/x/.env.local").as_path()), "env");
-        assert_eq!(detect_format(PathBuf::from("C:/x/a.json").as_path()), "json");
-        assert_eq!(detect_format(PathBuf::from("C:/x/a.toml").as_path()), "toml");
-        assert_eq!(detect_format(PathBuf::from("C:/x/a.yml").as_path()), "yaml");
-        assert_eq!(detect_format(PathBuf::from("C:/x/a.xml").as_path()), "xml");
-        assert_eq!(detect_format(PathBuf::from("C:/x/notes.md").as_path()), "text");
-    }
-
-    #[test]
-    fn json_is_flattened_with_paths() {
-        let text = "{\n  \"sap\": {\n    \"url\": \"https://prd.corp.example\",\n    \"username\": \"JDOE\",\n    \"password\": \"S3cret\"\n  }\n}";
-        let values = extract(text, "json");
-        assert_eq!(
-            find(&values, "sap.url").unwrap().value,
-            "https://prd.corp.example"
-        );
-        assert_eq!(find(&values, "sap.username").unwrap().value, "JDOE");
-        assert_eq!(find(&values, "sap.username").unwrap().line, 4);
-        assert_eq!(find(&values, "sap.password").unwrap().value, "S3cret");
-
-        let parse = analyze_text(text, "json", &mapping());
-        assert!(parse.is_complete());
-        assert_eq!(parse.value_of(KIND_USERNAME), "JDOE");
-    }
-
-    #[test]
-    fn env_files_are_parsed() {
-        let text = "# comment\nSAP_URL=https://dev.corp.example\nexport SAP_USER='JDOE'\nSAP_PASSWORD=\"p@ss=word\"\n";
-        let parse = analyze_text(text, "env", &mapping());
-        assert_eq!(parse.value_of(KIND_URL), "https://dev.corp.example");
-        assert_eq!(parse.value_of(KIND_USERNAME), "JDOE");
-        assert_eq!(parse.value_of(KIND_PASSWORD), "p@ss=word");
-        assert!(parse.is_complete());
-    }
-
-    #[test]
-    fn toml_sections_become_paths() {
-        let text = "[sap]\nurl = \"https://prd.corp.example\"\nuser = \"JDOE\"\n\n[sap.auth]\npassword = \"S3cret\" # inline\n";
-        let values = extract(text, "toml");
-        assert_eq!(find(&values, "sap.url").unwrap().value, "https://prd.corp.example");
-        assert_eq!(find(&values, "sap.auth.password").unwrap().value, "S3cret");
-        let parse = analyze_text(text, "toml", &mapping());
-        assert!(parse.is_complete());
-    }
-
-    #[test]
-    fn yaml_nesting_builds_paths() {
-        let text = "sap:\n  production:\n    url: https://prd.corp.example\n    username: JDOE\n    password: S3cret\nother: 1\n";
-        let values = extract(text, "yaml");
-        assert_eq!(
-            find(&values, "sap.production.url").unwrap().value,
-            "https://prd.corp.example"
-        );
-        assert!(find(&values, "other").is_some());
-        let parse = analyze_text(text, "yaml", &mapping());
-        assert!(parse.is_complete());
-    }
-
-    #[test]
-    fn xml_elements_and_attributes_are_read() {
-        let text = "<?xml version=\"1.0\"?>\n<config>\n  <connection host=\"prd.corp.example\">\n    <user>JDOE</user>\n    <password>S3cret</password>\n  </connection>\n</config>";
-        let parse = analyze_text(text, "xml", &mapping());
-        assert_eq!(parse.value_of(KIND_URL), "prd.corp.example");
-        assert_eq!(parse.value_of(KIND_USERNAME), "JDOE");
-        assert_eq!(parse.value_of(KIND_PASSWORD), "S3cret");
-        assert!(parse.is_complete());
-    }
-
-    #[test]
-    fn plain_text_finds_keys_and_bare_urls() {
-        let text = "登录信息\nURL: https://prd.corp.example/sap\nUser: JDOE\nPass: S3cret!\n";
-        let parse = analyze_text(text, "text", &mapping());
-        assert_eq!(parse.value_of(KIND_URL), "https://prd.corp.example/sap");
-        assert_eq!(parse.value_of(KIND_USERNAME), "JDOE");
-        assert_eq!(parse.value_of(KIND_PASSWORD), "S3cret!");
-    }
-
-    #[test]
-    fn missing_fields_are_reported() {
-        let text = "{\"note\":\"nothing useful here\"}";
-        let parse = analyze_text(text, "json", &mapping());
-        assert_eq!(
-            parse.missing,
-            vec![
-                KIND_URL.to_string(),
-                KIND_USERNAME.to_string(),
-                KIND_PASSWORD.to_string()
-            ]
-        );
-        assert!(!parse.is_complete());
-        assert!(parse.fields.is_empty());
-    }
-
-    #[test]
-    fn custom_keys_rescue_unusual_files() {
-        let text = "{\"verbindung\":\"https://prd.corp.example\",\"kennung\":\"JDOE\",\"geheim\":\"S3cret\"}";
-        let mut mapping = mapping();
-        mapping.username = vec!["kennung".into()];
-        mapping.password = vec!["geheim".into()];
-        mapping.url = vec!["verbindung".into()];
-        let parse = analyze_text(text, "json", &mapping);
-        assert!(parse.is_complete());
-        assert_eq!(parse.value_of(KIND_USERNAME), "JDOE");
-    }
-
-    #[test]
-    fn exact_matching_can_be_requested() {
-        let text = "{\"user_name\":\"A\",\"user\":\"B\"}";
-        let mut mapping = mapping();
-        mapping.exact = true;
-        mapping.username = vec!["user".into()];
-        let parse = analyze_text(text, "json", &mapping);
-        assert_eq!(parse.value_of(KIND_USERNAME), "B");
-    }
-
-    #[test]
-    fn more_specific_key_wins() {
-        let text = "{\"user\":\"short\",\"username\":\"exact\"}";
-        let parse = analyze_text(text, "json", &mapping());
-        assert_eq!(parse.value_of(KIND_USERNAME), "exact");
-    }
-
-    #[test]
-    fn binary_files_are_rejected() {
-        assert!(decode_text(&[0u8, 1, 2, 3]).is_none());
-        let parse = analyze_file(PathBuf::from("C:/definitely/not/here.json").as_path(), &mapping());
-        assert!(parse.error.is_some());
-        assert!(!parse.is_complete());
-    }
-
-    #[test]
-    fn utf16_files_are_decoded() {
-        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
-        for unit in "user=JDOE".encode_utf16() {
-            bytes.extend_from_slice(&unit.to_le_bytes());
+impl KeyMapping {
+    fn matchers(&self, kind: &str) -> &Vec<String> {
+        match kind {
+            KIND_URL => &self.url,
+            KIND_USERNAME => &self.username,
+            _ => &self.password,
         }
-        assert_eq!(decode_text(&bytes).unwrap(), "user=JDOE");
     }
 }

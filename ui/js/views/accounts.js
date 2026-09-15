@@ -3,15 +3,16 @@ import { icon } from "../icons.js";
 import { api } from "../api.js";
 import {
   state,
+  setState,
   selectEntry,
   copyPassword,
   copyUsername,
   copySap,
   copyText,
   toggleFavorite,
-  removeLink,
-  reanalyzeLink,
+  bindFile,
   removeHistory,
+  syncFile,
 } from "../state.js";
 import { openModal } from "../modal.js";
 import { toast } from "../toast.js";
@@ -27,7 +28,7 @@ import {
   urlHost,
 } from "../format.js";
 import { openEntryEditor } from "./editor.js";
-import { openKeyEditor, openLinkDialog } from "./linkkeys.js";
+import { openFileDialog, openFileKeys } from "./filedialog.js";
 
 /** The user name actually used: the Knox ID wins when the entry asks for it. */
 function effectiveUsername(entry) {
@@ -35,8 +36,8 @@ function effectiveUsername(entry) {
   return entry.username ?? "";
 }
 
-function isSap(entry) {
-  return entry.categoryId === "sap";
+function filesFor(entryId) {
+  return (state.vault?.files ?? []).filter((file) => (file.entryIds ?? []).includes(entryId));
 }
 
 function filterEntries() {
@@ -44,7 +45,7 @@ function filterEntries() {
   return (state.vault?.entries ?? []).filter((entry) => {
     if (state.categoryId !== "all" && entry.categoryId !== state.categoryId) return false;
     if (!term) return true;
-    return [entry.title, entry.username, entry.primaryUrl]
+    return [entry.title, entry.username, entry.matchUrl]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(term));
   });
@@ -52,7 +53,7 @@ function filterEntries() {
 
 function entryRow(entry) {
   const selected = state.selectedEntryId === entry.id;
-  const subtitle = entry.primaryUrl ? urlHost(entry.primaryUrl) : entry.username;
+  const subtitle = entry.matchUrl || entry.username;
   return h(
     "div",
     {
@@ -82,8 +83,8 @@ function entryRow(entry) {
         "span",
         { class: "row__meta" },
         h("span", { class: "mono" }, subtitle || "未设置用户名"),
-        entry.linkCount
-          ? h("span", { class: "tag" }, icon("link", { size: 11 }), `${entry.linkCount} 文件`)
+        entry.fileCount
+          ? h("span", { class: "tag" }, icon("link", { size: 11 }), `${entry.fileCount} 文件`)
           : null,
         entry.historyCycle
           ? h("span", { class: "tag tag--mono" }, `循环 ${entry.historyCycle}`)
@@ -107,7 +108,7 @@ function entryRow(entry) {
         },
         icon("copy", { size: 14 }),
       ),
-      isSap(entry)
+      entry.categoryId === "sap"
         ? h(
             "button",
             {
@@ -139,9 +140,60 @@ function entryRow(entry) {
   );
 }
 
-function linkCard(entry, link) {
-  const parse = link.parse ?? { format: "text", fields: [], missing: [...FIELD_ORDER] };
-  const missing = parse.missing ?? [];
+function recordRow(record, highlight) {
+  return h(
+    "div",
+    { class: `evidence${highlight ? "" : ""}` },
+    h(
+      "div",
+      { class: "token-list" },
+      h("span", { class: "tag tag--mono" }, record.path || "文件级"),
+      highlight ? h("span", { class: "tag tag--accent" }, "匹配到本账号") : null,
+    ),
+    ...FIELD_ORDER.map((kind) => {
+      const hit = (record.fields ?? []).find((field) => field.kind === kind);
+      return h(
+        "div",
+        { class: "evidence__row" },
+        h("span", { class: "field__label" }, FIELD_LABELS[kind]),
+        hit
+          ? h(
+              "span",
+              { class: "field__text", title: hit.value },
+              kind === "password" ? mask(hit.value, false) : hit.value,
+            )
+          : h("span", { class: "tag tag--warn" }, "未识别"),
+        hit ? h("span", { class: "tag tag--mono" }, `键 ${hit.key}`) : null,
+        hit
+          ? h(
+              "button",
+              {
+                class: "btn btn--icon btn--sm",
+                type: "button",
+                title: `复制${FIELD_LABELS[kind]}`,
+                onClick: guard(() => copyText(hit.value, FIELD_LABELS[kind])),
+              },
+              icon("copy", { size: 12 }),
+            )
+          : null,
+      );
+    }),
+  );
+}
+
+function fileCard(entry, file) {
+  const records = file.analysis?.records ?? [];
+  const bare = (value) => urlHost(value).toLowerCase().split(":")[0];
+  const match = bare(entry.matchUrl ?? "");
+  const matchedIndex = match
+    ? records.findIndex((record) => {
+        const url = (record.fields ?? []).find((field) => field.kind === "url")?.value ?? "";
+        const host = bare(url);
+        return host === match || host.endsWith(`.${match}`) || match.endsWith(`.${host}`);
+      })
+    : records.length === 1
+      ? 0
+      : -1;
 
   return h(
     "div",
@@ -149,22 +201,20 @@ function linkCard(entry, link) {
     h(
       "div",
       { class: "assoc__file" },
-      icon(link.exists ? "file" : "alert", { size: 14 }),
-      h("span", { class: "assoc__file-path", title: link.path }, link.path),
-      h("span", { class: "tag tag--accent" }, formatLabel(parse.format)),
-      link.exists
-        ? h("span", { class: "tag tag--mono" }, formatBytes(link.size))
+      icon(file.exists ? "file" : "alert", { size: 14 }),
+      h("span", { class: "assoc__file-path", title: file.path }, file.path),
+      h("span", { class: "tag tag--accent" }, formatLabel(file.analysis?.format)),
+      h("span", { class: "tag tag--mono" }, `${records.length} 个凭据块`),
+      file.exists
+        ? h("span", { class: "tag tag--mono" }, formatBytes(file.size))
         : h("span", { class: "tag tag--danger" }, "文件不存在"),
-      missing.length
-        ? h("span", { class: "tag tag--warn" }, `缺 ${missing.length} 项`)
-        : h("span", { class: "tag tag--success" }, "字段完整"),
       h(
         "button",
         {
           class: "btn btn--icon btn--sm",
           type: "button",
           title: "关键词 / 重新检测",
-          onClick: () => openKeyEditor({ entry, link }),
+          onClick: () => openFileKeys({ file }),
         },
         icon("sliders", { size: 13 }),
       ),
@@ -173,42 +223,10 @@ function linkCard(entry, link) {
         {
           class: "btn btn--icon btn--sm",
           type: "button",
-          title: "重新检测",
-          onClick: guard(async () => {
-            await reanalyzeLink(entry.id, link.id);
-            toast("已重新检测", "success");
-          }),
+          title: "同步此文件",
+          onClick: guard(() => syncFile(file.id)),
         },
-        icon("refresh", { size: 13 }),
-      ),
-      h(
-        "button",
-        {
-          class: "btn btn--icon btn--sm",
-          type: "button",
-          title: "预览内容",
-          onClick: guard(async () => {
-            const preview = await api.linkPreview(link.path, 4000);
-            openModal({
-              title: link.label,
-              size: "wide",
-              render: () =>
-                h(
-                  "div",
-                  { class: "stack" },
-                  h(
-                    "div",
-                    { class: "token-list" },
-                    h("span", { class: "tag tag--mono" }, link.path),
-                    h("span", { class: "tag" }, formatBytes(preview.size)),
-                    preview.truncated ? h("span", { class: "tag tag--warn" }, "已截断") : null,
-                  ),
-                  h("pre", { class: "preview" }, preview.content),
-                ),
-            });
-          }),
-        },
-        icon("eye", { size: 13 }),
+        icon("download", { size: 13 }),
       ),
       h(
         "button",
@@ -216,7 +234,7 @@ function linkCard(entry, link) {
           class: "btn btn--icon btn--sm",
           type: "button",
           title: "在资源管理器中显示",
-          onClick: guard(() => api.openInExplorer(link.path)),
+          onClick: guard(() => api.openInExplorer(file.path)),
         },
         icon("external", { size: 13 }),
       ),
@@ -225,51 +243,23 @@ function linkCard(entry, link) {
         {
           class: "btn btn--icon btn--sm",
           type: "button",
-          title: "解除关联",
+          title: "解除与该账号的绑定",
           onClick: guard(async () => {
-            await removeLink(entry.id, link.id);
-            toast("已解除关联", "success");
+            const next = (file.entryIds ?? []).filter((id) => id !== entry.id);
+            await bindFile(file.id, next);
+            toast("已解除绑定", "success");
           }),
         },
         icon("x", { size: 13 }),
       ),
     ),
-    h(
-      "div",
-      { class: "evidence" },
-      ...FIELD_ORDER.map((kind) => {
-        const hit = (parse.fields ?? []).find((field) => field.kind === kind);
-        if (!hit) {
-          return h(
-            "div",
-            { class: "evidence__row" },
-            h("span", { class: "field__label" }, FIELD_LABELS[kind]),
-            h("span", { class: "tag tag--warn" }, "未识别"),
-          );
-        }
-        return h(
+    records.length
+      ? h(
           "div",
-          { class: "evidence__row" },
-          h("span", { class: "field__label" }, FIELD_LABELS[kind]),
-          h(
-            "span",
-            { class: "field__text", title: hit.value },
-            kind === "password" ? mask(hit.value, false) : hit.value,
-          ),
-          h("span", { class: "tag tag--mono" }, `键 ${hit.key}`),
-          h(
-            "button",
-            {
-              class: "btn btn--icon btn--sm",
-              type: "button",
-              title: `复制${FIELD_LABELS[kind]}`,
-              onClick: guard(() => copyText(hit.value, FIELD_LABELS[kind])),
-            },
-            icon("copy", { size: 12 }),
-          ),
-        );
-      }),
-    ),
+          { class: "stack stack--tight" },
+          records.map((record, index) => recordRow(record, index === matchedIndex)),
+        )
+      : h("p", { class: "form__hint" }, "没有解析到凭据块，请调整关键词后重新检测。"),
   );
 }
 
@@ -360,14 +350,10 @@ function historyBlock(entry) {
   );
 }
 
-function ruleText(rule) {
-  if (!rule?.enabled) return "未设置规则，任何密码都会被接受。";
-  return ruleSummary(rule);
-}
-
 function detailPane(entry) {
   let revealed = false;
   const username = effectiveUsername(entry);
+  const files = filesFor(entry.id);
   const passwordValue = h("span", { class: "secret__value" }, mask(entry.password, revealed));
   const revealButton = h(
     "button",
@@ -383,14 +369,6 @@ function detailPane(entry) {
     },
     icon("eye", { size: 14 }),
   );
-
-  const parsed = FIELD_ORDER.map((kind) => {
-    for (const link of entry.links ?? []) {
-      const hit = (link.parse?.fields ?? []).find((field) => field.kind === kind);
-      if (hit?.value) return { kind, value: hit.value, key: hit.key };
-    }
-    return null;
-  }).filter(Boolean);
 
   return h(
     "div",
@@ -419,9 +397,7 @@ function detailPane(entry) {
         entry.categoryId === "sap" ? h("span", { class: "tag tag--accent" }, "SAP 账号") : null,
         entry.useKnoxId ? h("span", { class: "tag tag--accent" }, "Knox ID") : null,
         entry.favorite ? h("span", { class: "tag" }, "已收藏") : null,
-        entry.links.length
-          ? h("span", { class: "tag tag--mono" }, `${entry.links.length} 个关联文件`)
-          : null,
+        files.length ? h("span", { class: "tag tag--mono" }, `${files.length} 个同步文件`) : null,
       ),
     ),
     h(
@@ -517,55 +493,26 @@ function detailPane(entry) {
           ),
         ),
       ),
+      h(
+        "div",
+        { class: "field" },
+        h("span", { class: "field__label" }, "匹配用 URL（用于在同步文件中定位凭据块）"),
+        h(
+          "span",
+          { class: "field__value" },
+          h(
+            "span",
+            { class: "field__text", title: entry.matchUrl },
+            entry.matchUrl || "未设置",
+          ),
+        ),
+      ),
     ),
-    parsed.length
-      ? h(
-          "div",
-          { class: "detail__section" },
-          h(
-            "div",
-            { class: "section-title" },
-            icon("filter", { size: 12 }),
-            "关联文件中解析到的字段",
-          ),
-          h(
-            "div",
-            { class: "stack stack--tight" },
-            parsed.map((item) =>
-              h(
-                "div",
-                { class: "field" },
-                h("span", { class: "field__label" }, FIELD_LABELS[item.kind]),
-                h(
-                  "span",
-                  { class: "field__value" },
-                  h(
-                    "span",
-                    { class: "field__text", title: item.value },
-                    item.kind === "password" ? mask(item.value, false) : item.value,
-                  ),
-                  h("span", { class: "tag tag--mono" }, `键 ${item.key}`),
-                  h(
-                    "button",
-                    {
-                      class: "btn btn--icon btn--sm",
-                      type: "button",
-                      title: `复制${FIELD_LABELS[item.kind]}`,
-                      onClick: guard(() => copyText(item.value, FIELD_LABELS[item.kind])),
-                    },
-                    icon("copy", { size: 12 }),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        )
-      : null,
     h(
       "div",
       { class: "detail__section" },
       h("div", { class: "section-title" }, icon("sliders", { size: 12 }), "密码规则"),
-      h("p", { class: "form__hint" }, ruleText(entry.rule)),
+      h("p", { class: "form__hint" }, ruleSummary(entry.rule)),
     ),
     h(
       "div",
@@ -602,7 +549,7 @@ function detailPane(entry) {
           "div",
           { class: "section-title" },
           icon("link", { size: 12 }),
-          `同步内容（${entry.links.length}）`,
+          `同步文件（${files.length}）`,
         ),
         h(
           "button",
@@ -612,23 +559,23 @@ function detailPane(entry) {
             onClick: guard(async () => {
               const picked = await api.pickFiles();
               if (!picked.length) return;
-              openLinkDialog({ entryId: entry.id, paths: picked });
+              openFileDialog({ paths: picked, entryIds: [entry.id] });
             }),
           },
           icon("plus", { size: 13 }),
           "添加文件",
         ),
       ),
-      entry.links.length
+      files.length
         ? h(
             "div",
             { class: "stack stack--tight" },
-            entry.links.map((link) => linkCard(entry, link)),
+            files.map((file) => fileCard(entry, file)),
           )
         : h(
             "p",
             { class: "form__hint" },
-            "还没有关联文件。点击「添加文件」选择 JSON、.env、TOML、YAML、XML 或纯文本文件，SapVault 会按关键词找出 URL、用户名与密码。",
+            "还没有绑定文件。点击「添加文件」选择 JSON、.env、TOML、YAML、XML 或纯文本文件；同步时只会改写其中的密码。",
           ),
     ),
     h(
@@ -679,7 +626,7 @@ export function renderAccounts(listHost, detailHost) {
             { class: "empty__text" },
             state.search
               ? "试试其它关键字，或清空搜索框。"
-              : "点击右上角「新建条目」创建账号，然后在详情里添加需要同步的内容文件。",
+              : "点击右上角「新建条目」创建账号，然后在详情里绑定需要同步的配置文件。",
           ),
         ),
   );
@@ -697,7 +644,7 @@ export function renderAccounts(listHost, detailHost) {
         h(
           "p",
           { class: "empty__text" },
-          "详情面板提供复制密码、SAP 换行凭据、密码规则与循环历史，以及关联文件的解析结果。",
+          "详情面板提供复制密码、SAP 换行凭据、密码规则与循环历史，以及同步文件与绑定关系。",
         ),
       ),
     );

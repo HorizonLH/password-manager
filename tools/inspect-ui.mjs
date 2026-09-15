@@ -307,12 +307,12 @@ const VIEWS = [
   {
     nav: "关联关系",
     label: "关联关系",
-    needles: ["SAP 生产机", "KNOX01", "字段不完整", "SAP_URL", "同步文件"],
+    needles: ["SAP 生产机", "已绑定", "个凭据块", "匹配 prd.sap.corp.example", "查看账号"],
   },
   {
-    nav: "同步配置",
-    label: "同步配置",
-    needles: ["同步目标", "MCP / JSON", "模板", "写入文件", "claude_desktop_config.json"],
+    nav: "同步文件",
+    label: "同步文件",
+    needles: ["已上传文件", "sap-login.json", "绑定账号", "将写入的内容", "同步此文件"],
   },
   {
     nav: "设置",
@@ -356,17 +356,16 @@ async function audit(cdp, { includeModals = true } = {}) {
     "复制用户名 + 密码",
     "用户名（全局 Knox ID）",
     "KNOX01",
+    "匹配用 URL",
     "密码规则",
     "集团口令策略 2024",
     "密码循环",
     "禁止重复最近 5 个",
     "查看 2 个历史密码",
-    "同步内容（2）",
+    "同步文件（1）",
     "sap-login.json",
-    "https://prd.sap.corp.example:8443",
-    "键 url",
-    "缺 1 项",
-    "关联文件中解析到",
+    "键 password",
+    "匹配到本账号",
   ]);
 
   await cdp.eval(clickByText("编辑", ".detail__title button"));
@@ -381,6 +380,7 @@ async function audit(cdp, { includeModals = true } = {}) {
     "编辑条目",
     "基本信息",
     "凭据",
+    "匹配用 URL",
     "密码规则",
     "使用规则",
     "不使用规则",

@@ -58,6 +58,8 @@ pub struct Settings {
     pub sap_line_separator: String,
     pub mask_passwords: bool,
     pub confirm_delete: bool,
+    /// Write a `<file>.bak-<stamp>` copy before changing a synced file.
+    pub sync_backup: bool,
     /// Default key words used when a content file is attached. Each file keeps
     /// its own copy so an override never changes other files.
     pub key_mapping: KeyMapping,
@@ -78,6 +80,7 @@ impl Default for Settings {
             sap_line_separator: "\r\n".to_string(),
             mask_passwords: true,
             confirm_delete: true,
+            sync_backup: true,
             key_mapping: KeyMapping::default(),
             default_rule: None,
             last_category: SAP_CATEGORY_ID.to_string(),
@@ -278,12 +281,73 @@ pub fn normalize_vault(vault: &mut Vault) {
                 recorded.recorded_at = crate::model::now_string();
             }
         }
-        for link in entry.links.iter_mut() {
-            link.keys.normalize();
-            link.refresh_stat();
+    }
+
+    migrate_legacy_links(vault);
+
+    let known_entries: Vec<String> = vault.entries.iter().map(|entry| entry.id.clone()).collect();
+    for file in vault.files.iter_mut() {
+        file.keys.normalize();
+        // Drop bindings that point at deleted entries.
+        file.entry_ids.retain(|id| known_entries.contains(id));
+        file.entry_ids.dedup();
+        file.refresh_stat();
+        if let Some(analysis) = file.analysis.as_mut() {
+            for record in analysis.records.iter_mut() {
+                if record.id.is_empty() {
+                    record.id = crate::model::new_id();
+                }
+            }
         }
     }
+    // Two files must not point at the same path twice.
+    let mut seen_paths: Vec<String> = Vec::new();
+    vault.files.retain(|file| {
+        let key = file.path.to_ascii_lowercase();
+        if seen_paths.contains(&key) {
+            false
+        } else {
+            seen_paths.push(key);
+            true
+        }
+    });
+
     vault.categories.sort_by_key(|category| category.sort);
+}
+
+/// Schema 1 stored content files inside each entry (`entry.links`). Fold those
+/// into the shared file list so a file can be bound to several accounts.
+fn migrate_legacy_links(vault: &mut Vault) {
+    if vault.schema >= crate::model::VAULT_SCHEMA || vault.legacy_links.is_empty() {
+        vault.legacy_links.clear();
+        vault.schema = crate::model::VAULT_SCHEMA;
+        return;
+    }
+    let legacy = std::mem::take(&mut vault.legacy_links);
+    for group in legacy {
+        for link in group.links {
+            let existing = vault
+                .files
+                .iter_mut()
+                .find(|file| file.path.eq_ignore_ascii_case(&link.path));
+            match existing {
+                Some(file) => {
+                    if !file.entry_ids.contains(&group.entry_id) {
+                        file.entry_ids.push(group.entry_id.clone());
+                    }
+                }
+                None => {
+                    let mut keys = link.keys;
+                    keys.normalize();
+                    let analysis = crate::keys::analyze_file(std::path::Path::new(&link.path), &keys);
+                    let mut file = crate::model::SyncFile::from_path(&link.path, keys, Some(analysis));
+                    file.entry_ids = vec![group.entry_id.clone()];
+                    vault.files.push(file);
+                }
+            }
+        }
+    }
+    vault.schema = crate::model::VAULT_SCHEMA;
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +430,7 @@ pub fn decrypt_vault(envelope: &VaultEnvelope, key: &[u8; KEY_LEN]) -> AppResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ContentLink, Entry, HistoryEntry, KeyMapping};
+    use crate::model::{Entry, HistoryEntry, KeyMapping, SyncFile};
 
     fn blank_entry(id: &str, category: &str) -> Entry {
         Entry {
@@ -376,12 +440,12 @@ mod tests {
             username: String::new(),
             use_knox_id: false,
             password: String::new(),
+            match_url: String::new(),
             notes: String::new(),
             favorite: false,
             rule: None,
             history_cycle: 0,
             password_history: Vec::new(),
-            links: Vec::new(),
             created_at: String::new(),
             updated_at: String::new(),
             last_used_at: None,
@@ -396,7 +460,7 @@ mod tests {
         let key = unlock_key(&envelope, Some("correct horse")).unwrap();
         let restored = decrypt_vault(&envelope, &key).unwrap();
         assert_eq!(restored.categories.len(), 2);
-        assert_eq!(restored.schema, 1);
+        assert_eq!(restored.schema, crate::model::VAULT_SCHEMA);
         let wrong = unlock_key(&envelope, Some("wrong password")).unwrap();
         assert!(decrypt_vault(&envelope, &wrong).is_err());
     }
@@ -427,7 +491,7 @@ mod tests {
         let envelope = create_envelope(VaultMode::Windows, None, "", &vault).unwrap();
         let key = unlock_key(&envelope, None).unwrap();
         let restored = decrypt_vault(&envelope, &key).unwrap();
-        assert_eq!(restored.schema, 1);
+        assert_eq!(restored.schema, crate::model::VAULT_SCHEMA);
     }
 
     #[test]
@@ -463,16 +527,44 @@ mod tests {
     }
 
     #[test]
-    fn normalize_repairs_link_key_mappings() {
+    fn normalize_migrates_legacy_entry_links_into_shared_files() {
         let mut vault = Vault::default();
         let mut entry = blank_entry("sap", SAP_CATEGORY_ID);
-        let mut link = ContentLink::from_path("C:/demo/a.json", KeyMapping::default(), None);
-        link.keys.username = vec!["  ".to_string(), "  ".to_string()];
-        entry.links.push(link);
+        entry.id = "sap".to_string();
         vault.entries.push(entry);
+        vault.entries.push(blank_entry("second", SAP_CATEGORY_ID));
+        vault.schema = 1;
+        vault.legacy_links = vec![crate::model::LegacyEntryLinks {
+            entry_id: "sap".to_string(),
+            links: vec![crate::model::LegacyLink {
+                path: "C:/demo/not-there.json".to_string(),
+                keys: KeyMapping::default(),
+            }],
+        }];
+
         normalize_vault(&mut vault);
+        assert_eq!(vault.schema, crate::model::VAULT_SCHEMA);
+        assert_eq!(vault.files.len(), 1);
+        assert_eq!(vault.files[0].entry_ids, vec!["sap".to_string()]);
+        assert!(vault.legacy_links.is_empty());
+    }
+
+    #[test]
+    fn normalize_prunes_bindings_and_normalizes_file_keys() {
+        let mut vault = Vault::default();
+        vault.entries.push(blank_entry("sap", SAP_CATEGORY_ID));
+        let mut keys = KeyMapping::default();
+        keys.username = vec!["  ".to_string(), "  ".to_string()];
+        let mut file = SyncFile::from_path("C:/demo/a.json", keys, None);
+        file.entry_ids = vec!["sap".to_string(), "deleted".to_string()];
+        vault.files.push(file);
+        vault.files.push(SyncFile::from_path("C:/demo/a.json", KeyMapping::default(), None));
+
+        normalize_vault(&mut vault);
+        assert_eq!(vault.files.len(), 1, "duplicate paths are merged");
+        assert_eq!(vault.files[0].entry_ids, vec!["sap".to_string()]);
         assert_eq!(
-            vault.entries[0].links[0].keys.username,
+            vault.files[0].keys.username,
             KeyMapping::default().username
         );
     }

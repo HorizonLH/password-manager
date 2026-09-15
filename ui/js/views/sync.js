@@ -1,200 +1,256 @@
 import { h, guard, mount } from "../dom.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
-import { state, setState, selectSyncTarget, refreshVault } from "../state.js";
-import { confirmModal } from "../modal.js";
+import {
+  state,
+  setState,
+  bindFile,
+  removeFile,
+  reanalyzeFile,
+  syncFile,
+  syncAllFiles,
+  loadFilePlans,
+} from "../state.js";
+import { confirmModal, openModal } from "../modal.js";
 import { toast } from "../toast.js";
-import { formatTime } from "../format.js";
+import { formatBytes, formatLabel, formatTime, mask } from "../format.js";
+import { openFileDialog, openFileKeys } from "./filedialog.js";
 
-const TOKENS = [
-  "generatedAt",
-  "knoxId",
-  "accountCount",
-  "fileCount",
-  "accountsJson",
-  "filesJson",
-  "systemId",
-  "client",
-  "language",
-  "username",
-  "password",
-  "usernamePassword",
-  "hosts",
-  "title",
-  "linkCount",
-];
+const ACTION_LABELS = {
+  update: ["将更新", "tag--accent"],
+  same: ["已最新", "tag--success"],
+  unbound: ["未绑定", "tag"],
+  "no-password": ["无密码", "tag--warn"],
+  unreachable: ["无法定位", "tag--danger"],
+};
 
-async function createTarget(format) {
-  const target = await api.syncTargetDefault(format);
-  const saved = await api.syncTargetSave(target);
-  setState({ vault: saved });
-  await selectSyncTarget(target.id);
-  toast(`已创建「${target.name}」同步目标`, "success");
+function accountName(vault, id) {
+  return (vault?.entries ?? []).find((entry) => entry.id === id)?.title ?? "";
 }
 
-function targetList() {
-  const targets = state.vault?.syncTargets ?? [];
+function selectFile(id) {
+  setState({ syncSelection: id });
+  guard(async () => {
+    const plan = await api.filePlan(id);
+    setState({ filePlans: { ...state.filePlans, [plan.fileId]: plan } });
+  })();
+}
+
+function fileList(files) {
   return h(
     "div",
     { class: "pane" },
     h(
       "div",
       { class: "pane__toolbar" },
-      h("span", { class: "section-title" }, icon("refresh", { size: 13 }), "同步目标"),
+      h("span", { class: "section-title" }, icon("file", { size: 13 }), "已上传文件"),
       h("div", { class: "modal__footer-spacer" }),
       h(
         "button",
         {
           class: "btn btn--ghost btn--sm",
           type: "button",
-          title: "全部写入",
-          onClick: guard(async () => {
-            const outcomes = await api.syncRunAll();
-            await refreshVault();
-            toast(
-              outcomes.length
-                ? `已同步 ${outcomes.length} 个目标`
-                : "没有可写入的同步目标（请先设置路径）",
-              outcomes.length ? "success" : "info",
-            );
-          }),
+          onClick: guard(() => loadFilePlans()),
         },
-        icon("save", { size: 13 }),
-        "全部写入",
+        icon("refresh", { size: 13 }),
+        "检测",
       ),
     ),
     h(
       "div",
       { class: "pane__scroll pane__scroll--tight" },
-      h(
-        "div",
-        { class: "list" },
-        targets.map((target) =>
-          h(
+      files.length
+        ? h(
             "div",
-            {
-              class: `row${state.syncSelectedId === target.id ? " is-selected" : ""}`,
-              role: "button",
-              tabindex: "0",
-              onClick: guard(() => selectSyncTarget(target.id)),
-            },
-            h(
-              "span",
-              { class: "row__badge" },
-              target.kind === "mcp" ? "MCP" : "CFG",
-            ),
-            h(
-              "span",
-              { class: "row__body" },
-              h(
-                "span",
-                { class: "row__title" },
-                target.name,
-                target.enabled ? null : h("span", { class: "tag" }, "已停用"),
-              ),
-              h(
-                "span",
-                { class: "row__meta" },
-                h("span", { class: "nowrap" }, target.path || "未设置路径"),
-              ),
-              h(
-                "span",
-                { class: "row__meta" },
+            { class: "list" },
+            files.map((file) => {
+              const plan = state.filePlans?.[file.id];
+              const selected = state.syncSelection === file.id;
+              return h(
+                "div",
+                {
+                  class: `row${selected ? " is-selected" : ""}`,
+                  role: "button",
+                  tabindex: "0",
+                  onClick: () => selectFile(file.id),
+                },
                 h(
                   "span",
-                  { class: "subtle" },
-                  target.lastSyncAt ? `上次同步 ${formatTime(target.lastSyncAt)}` : "尚未同步",
+                  { class: "row__badge" },
+                  formatLabel(file.analysis?.format).slice(0, 3).toUpperCase(),
                 ),
-              ),
-            ),
+                h(
+                  "span",
+                  { class: "row__body" },
+                  h(
+                    "span",
+                    { class: "row__title" },
+                    file.label,
+                    file.exists ? null : h("span", { class: "tag tag--danger" }, "已删除"),
+                  ),
+                  h(
+                    "span",
+                    { class: "row__meta" },
+                    h("span", { class: "mono" }, file.path),
+                  ),
+                  h(
+                    "span",
+                    { class: "row__meta" },
+                    h(
+                      "span",
+                      { class: "tag tag--mono" },
+                      `${file.analysis?.records?.length ?? 0} 块`,
+                    ),
+                    h(
+                      "span",
+                      { class: "tag" },
+                      `${file.entryIds?.length ?? file.entry_ids?.length ?? 0} 账号`,
+                    ),
+                    plan?.updates
+                      ? h("span", { class: "tag tag--accent" }, `${plan.updates} 处待更新`)
+                      : h("span", { class: "tag tag--success" }, "无待更新"),
+                  ),
+                ),
+              );
+            }),
+          )
+        : h(
+            "p",
+            { class: "form__hint", style: { padding: "var(--s-3)" } },
+            "还没有上传任何文件。点击右上角「上传文件」选择要同步的配置文件。",
           ),
-        ),
-        targets.length
-          ? null
-          : h(
-              "p",
-              { class: "form__hint", style: { padding: "8px 12px" } },
-              "还没有同步目标。下面选择一种格式即可创建，例如把 SAP 账号写入 MCP 配置。",
-            ),
-      ),
-      h(
-        "div",
-        { class: "stack stack--tight", style: { padding: "12px 4px 0" } },
-        h("span", { class: "section-title" }, "新建目标"),
-        h(
-          "div",
-          { class: "token-list" },
-          (state.presets ?? []).map((preset) =>
-            h(
-              "button",
-              {
-                class: "token",
-                type: "button",
-                title: preset.description,
-                onClick: guard(() => createTarget(preset.format)),
-              },
-              `+ ${preset.label}`,
-            ),
-          ),
-        ),
-      ),
     ),
   );
 }
 
-function editorPane() {
-  const target = state.syncDraft;
-  if (!target) {
-    return h(
+function bindCard(file) {
+  const bound = new Set(file.entryIds ?? []);
+  const entries = (state.vault?.entries ?? []).filter((entry) => entry.categoryId === "sap");
+  const save = guard(async (next) => {
+    await bindFile(file.id, next);
+    selectFile(file.id);
+  });
+  return h(
+    "section",
+    { class: "card card--flat" },
+    h(
       "div",
-      { class: "pane" },
+      { class: "card__head" },
       h(
         "div",
-        { class: "pane__scroll" },
+        null,
+        h("h3", { class: "card__title" }, icon("user", { size: 15 }), "绑定账号"),
         h(
-          "div",
-          { class: "empty" },
-          h("div", { class: "empty__icon" }, icon("refresh", { size: 20 })),
-          h("h3", { class: "empty__title" }, "选择或新建一个同步目标"),
-          h(
-            "p",
-            { class: "empty__text" },
-            "同步会把 SAP 分类下的账号（含 Knox ID、系统 ID、客户端、用户名密码）以及关联文件清单，按模板写入到你指定的文件，例如 MCP 的配置文件。",
-          ),
+          "p",
+          { class: "card__hint" },
+          "一个文件可以绑定多个账号；文件里有多个凭据块时，用账号的「匹配用 URL」区分。",
         ),
       ),
+    ),
+    entries.length
+      ? h(
+          "div",
+          { class: "stack stack--tight" },
+          entries.map((entry) =>
+            h(
+              "label",
+              { class: "checkbox" },
+              h("input", {
+                type: "checkbox",
+                checked: bound.has(entry.id),
+                onChange: (event) => {
+                  if (event.target.checked) bound.add(entry.id);
+                  else bound.delete(entry.id);
+                  save([...bound]);
+                },
+              }),
+              h(
+                "span",
+                null,
+                entry.title,
+                entry.username ? ` · ${entry.username}` : "",
+                entry.matchUrl ? ` · ${entry.matchUrl}` : " · 未填写匹配 URL",
+              ),
+            ),
+          ),
+        )
+      : h("p", { class: "form__hint" }, "还没有 SAP 账号，请先在「账号」页创建。"),
+  );
+}
+
+function recordsTable(file, plan) {
+  const rows = plan?.records ?? [];
+  if (!rows.length) {
+    return h(
+      "p",
+      { class: "form__hint" },
+      plan?.error ?? "没有解析到凭据块。调整关键词后重新检测。",
     );
   }
+  return h(
+    "div",
+    { class: "table" },
+    h(
+      "div",
+      {
+        class: "table__row table__head",
+        style: { "--table-cols": "1fr 1.4fr 1fr 1.1fr 1fr 0.9fr" },
+      },
+      h("span", { class: "table__cell" }, "凭据块"),
+      h("span", { class: "table__cell" }, "URL"),
+      h("span", { class: "table__cell" }, "用户名"),
+      h("span", { class: "table__cell" }, "文件中的密码"),
+      h("span", { class: "table__cell" }, "账号"),
+      h("span", { class: "table__cell" }, "状态"),
+    ),
+    rows.map((row) => {
+      const [label, cls] = ACTION_LABELS[row.action] ?? [row.action, "tag"];
+      return h(
+        "div",
+        { class: "table__row", style: { "--table-cols": "1fr 1.4fr 1fr 1.1fr 1fr 0.9fr" } },
+        h("span", { class: "table__cell", title: row.path }, row.path),
+        h(
+          "span",
+          { class: "table__cell table__cell--mono", title: row.url },
+          row.url || "—",
+        ),
+        h("span", { class: "table__cell table__cell--mono" }, row.username || "—"),
+        h(
+          "span",
+          { class: "table__cell table__cell--mono" },
+          row.password ? mask(row.password, false) : "—",
+        ),
+        h(
+          "span",
+          { class: "table__cell" },
+          row.accountTitle ?? h("span", { class: "subtle" }, "未绑定"),
+        ),
+        h(
+          "span",
+          { class: "table__cell" },
+          h("span", { class: `tag ${cls}` }, label),
+          row.detail ? h("span", { class: "form__hint" }, row.detail) : null,
+        ),
+      );
+    }),
+  );
+}
 
-  const patch = (values) => setState({ syncDraft: { ...state.syncDraft, ...values } });
-
-  const templateArea = h("textarea", {
-    id: "sync-template",
-    class: "textarea textarea--mono textarea--code",
-    spellcheck: "false",
-    value: target.template,
-    onInput: (event) => patch({ template: event.target.value }),
-  });
-
-  const insertToken = (token) => {
-    const start = templateArea.selectionStart ?? templateArea.value.length;
-    const end = templateArea.selectionEnd ?? start;
-    const snippet = `{{${token}}}`;
-    templateArea.value =
-      templateArea.value.slice(0, start) + snippet + templateArea.value.slice(end);
-    const caret = start + snippet.length;
-    templateArea.focus();
-    templateArea.setSelectionRange(caret, caret);
-    patch({ template: templateArea.value });
-  };
-
+function detailPane(file) {
+  const plan = state.filePlans?.[file.id];
+  const unmatched = plan?.unmatched ?? [];
   return h(
     "div",
     { class: "pane" },
     h(
       "div",
       { class: "pane__toolbar" },
-      h("span", { class: "section-title" }, icon("save", { size: 13 }), target.name),
+      h(
+        "span",
+        { class: "section-title" },
+        icon("file", { size: 13 }),
+        file.label,
+      ),
       h("div", { class: "modal__footer-spacer" }),
       h(
         "button",
@@ -202,22 +258,13 @@ function editorPane() {
           class: "btn btn--ghost btn--sm",
           type: "button",
           onClick: guard(async () => {
-            const saved = await api.syncTargetSave(state.syncDraft);
-            setState({ vault: saved });
-            toast("同步目标已保存", "success");
-          }),
-        },
-        icon("check", { size: 13 }),
-        "保存",
-      ),
-      h(
-        "button",
-        {
-          class: "btn btn--soft btn--sm",
-          type: "button",
-          onClick: guard(async () => {
-            const preview = await api.syncPreviewTemplate(state.syncDraft);
-            setState({ syncPreview: preview });
+            const preview = await api.filePreview(file.path, 4000);
+            openModal({
+              title: file.label,
+              size: "wide",
+              render: () =>
+                h("pre", { class: "preview" }, preview.content),
+            });
           }),
         },
         icon("eye", { size: 13 }),
@@ -226,42 +273,44 @@ function editorPane() {
       h(
         "button",
         {
-          class: "btn btn--primary btn--sm",
+          class: "btn btn--ghost btn--sm",
+          type: "button",
+          onClick: () => openFileKeys({ file }),
+        },
+        icon("sliders", { size: 13 }),
+        "关键词",
+      ),
+      h(
+        "button",
+        {
+          class: "btn btn--ghost btn--sm",
           type: "button",
           onClick: guard(async () => {
-            await api.syncTargetSave(state.syncDraft);
-            const outcome = await api.syncRun(state.syncDraft.id);
-            await refreshVault();
-            toast(
-              outcome.changed
-                ? `已写入 ${outcome.path}`
-                : "内容没有变化，未重写文件",
-              "success",
-            );
+            await reanalyzeFile(file.id);
+            selectFile(file.id);
           }),
         },
-        icon("download", { size: 13 }),
-        "写入文件",
+        icon("refresh", { size: 13 }),
+        "重新检测",
       ),
       h(
         "button",
         {
           class: "btn btn--icon btn--sm",
           type: "button",
-          title: "删除目标",
-          onClick: () => {
+          title: "移除文件",
+          onClick: () =>
             confirmModal({
-              title: "删除同步目标",
-              message: `确定删除「${state.syncDraft.name}」吗？`,
-              detail: "已经写入的内容不会被删除。",
-              confirmLabel: "删除",
+              title: "移除文件",
+              message: `确定不再同步「${file.label}」吗？`,
+              detail: "只会解除绑定，不会删除或修改磁盘上的文件。",
+              confirmLabel: "移除",
               danger: true,
               onConfirm: guard(async () => {
-                const vault = await api.syncTargetDelete(state.syncDraft.id);
-                setState({ vault, syncDraft: null, syncSelectedId: null, syncPreview: null });
+                await removeFile(file.id);
+                setState({ syncSelection: null });
               }),
-            });
-          },
+            }),
         },
         icon("trash", { size: 14 }),
       ),
@@ -274,164 +323,170 @@ function editorPane() {
         { class: "stack" },
         h(
           "div",
-          { class: "form__grid" },
+          { class: "token-list" },
+          h("span", { class: "tag tag--accent" }, formatLabel(file.analysis?.format)),
+          h("span", { class: "tag tag--mono" }, formatBytes(file.size)),
+          file.exists ? null : h("span", { class: "tag tag--danger" }, "文件不存在"),
           h(
-            "div",
-            { class: "form__row" },
-            h("label", { class: "form__label" }, "名称"),
-            h("input", {
-              class: "input",
-              value: target.name,
-              onInput: (event) => patch({ name: event.target.value }),
-            }),
+            "span",
+            { class: "tag tag--mono" },
+            file.lastSyncAt ? `上次同步 ${formatTime(file.lastSyncAt)}` : "尚未同步",
           ),
-          h(
-            "div",
-            { class: "form__row" },
-            h("label", { class: "form__label" }, "类型"),
-            h(
-              "select",
-              { class: "select", onChange: (event) => patch({ kind: event.target.value }) },
-              h("option", { value: "mcp", selected: target.kind === "mcp" }, "MCP 配置"),
-              h("option", { value: "custom", selected: target.kind !== "mcp" }, "自定义文件"),
-            ),
-          ),
+          file.lastStatus ? h("span", { class: "tag" }, file.lastStatus) : null,
         ),
         h(
-          "div",
-          { class: "form__row" },
-          h("label", { class: "form__label" }, "输出文件"),
-          h(
-            "div",
-            { class: "input-group" },
-            h("input", {
-              class: "input input--mono",
-              value: target.path,
-              placeholder: "例如 %APPDATA%\\Claude\\claude_desktop_config.json",
-              onInput: (event) => patch({ path: event.target.value }),
-            }),
-            h(
-              "button",
-              {
-                class: "btn",
-                type: "button",
-                onClick: guard(async () => {
-                  const picked = await api.pickSaveFile(
-                    target.kind === "mcp" ? "mcp.json" : "sapvault-output.txt",
-                    null,
-                  );
-                  if (picked) patch({ path: picked });
-                }),
-              },
-              icon("folder", { size: 14 }),
-              "浏览",
-            ),
-          ),
+          "p",
+          { class: "form__hint", title: file.path },
+          file.path,
         ),
-        h(
-          "div",
-          { style: { display: "flex", flexWrap: "wrap", gap: "16px" } },
-          h(
-            "label",
-            { class: "checkbox" },
-            h("input", {
-              type: "checkbox",
-              checked: target.enabled,
-              onChange: (event) => patch({ enabled: event.target.checked }),
-            }),
-            h("span", null, "参与“全部写入”"),
-          ),
-          h(
-            "label",
-            { class: "checkbox" },
-            h("input", {
-              type: "checkbox",
-              checked: target.backup,
-              onChange: (event) => patch({ backup: event.target.checked }),
-            }),
-            h("span", null, "写入前备份原文件"),
-          ),
-        ),
-        h(
-          "div",
-          { class: "form__row" },
-          h(
-            "div",
-            { class: "detail__section-head" },
-            h("label", { class: "form__label" }, "模板"),
-            h(
-              "select",
-              {
-                class: "select",
-                style: { width: "220px" },
-                onChange: (event) => {
-                  const preset = (state.presets ?? []).find(
-                    (item) => item.format === event.target.value,
-                  );
-                  if (preset) patch({ format: preset.format, template: preset.template });
-                },
-              },
-              (state.presets ?? []).map((preset) =>
-                h(
-                  "option",
-                  { value: preset.format, selected: preset.format === target.format },
-                  `套用：${preset.label}`,
-                ),
-              ),
-            ),
-          ),
-          templateArea,
-          h(
-            "div",
-            { class: "form__row" },
-            h("label", { class: "form__label" }, "点击插入变量"),
-            h(
-              "div",
-              { class: "token-list" },
-              TOKENS.map((token) =>
-                h(
-                  "button",
-                  { class: "token", type: "button", onClick: () => insertToken(token) },
-                  `{{${token}}}`,
-                ),
-              ),
-            ),
-            h(
-              "p",
-              { class: "form__hint" },
-              "区块语法：{{#accounts}}…{{/accounts}} 逐个账号渲染；{{^accounts}}…{{/accounts}} 在账号为空时渲染；过滤器：{{knoxId|json}} 生成带引号的 JSON 字符串。",
-            ),
-          ),
-        ),
-        state.syncPreview
+        plan?.error
           ? h(
               "div",
-              { class: "form__row" },
-              h(
-                "div",
-                { class: "detail__section-head" },
-                h("label", { class: "form__label" }, "预览"),
-                h(
-                  "span",
-                  { class: "form__hint" },
-                  `${state.syncPreview.bytes} 字节 · ${state.syncPreview.accountCount} 个账号 · ${state.syncPreview.fileCount} 个关联文件`,
-                ),
-              ),
-              h("pre", { class: "preview" }, state.syncPreview.content),
+              { class: "banner banner--danger" },
+              h("span", { class: "banner__icon" }, icon("alert", { size: 16 })),
+              h("span", null, plan.error),
             )
           : null,
+        h(
+          "div",
+          { style: { display: "flex", gap: "var(--s-2)", flexWrap: "wrap" } },
+          h(
+            "button",
+            {
+              class: "btn btn--primary",
+              type: "button",
+              disabled: !plan?.updates,
+              onClick: guard(() => syncFile(file.id)),
+            },
+            icon("download", { size: 14 }),
+            plan?.updates ? `同步此文件（${plan.updates} 处密码）` : "无需同步",
+          ),
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              onClick: guard(() => syncAllFiles()),
+            },
+            icon("download", { size: 14 }),
+            "全部同步",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn--ghost",
+              type: "button",
+              onClick: guard(() => api.openInExplorer(file.path)),
+            },
+            icon("external", { size: 13 }),
+            "在资源管理器中显示",
+          ),
+        ),
+        unmatched.length
+          ? h(
+              "div",
+              { class: "banner banner--warn" },
+              h("span", { class: "banner__icon" }, icon("alert", { size: 16 })),
+              h(
+                "div",
+                { class: "banner__body" },
+                h("span", { class: "banner__title" }, `${unmatched.length} 个账号未能匹配到凭据块`),
+                ...unmatched.map((item) =>
+                  h("span", null, `${item.accountTitle}：${item.reason}`),
+                ),
+              ),
+            )
+          : null,
+        h(
+          "section",
+          { class: "card" },
+          h(
+            "div",
+            { class: "card__head" },
+            h(
+              "div",
+              null,
+              h(
+                "h3",
+                { class: "card__title" },
+                icon("filter", { size: 15 }),
+                "将写入的内容",
+              ),
+              h(
+                "p",
+                { class: "card__hint" },
+                "同步只替换下表中的「密码」值，文件里的其它内容（URL、用户名、注释、格式、编码）保持原样。",
+              ),
+            ),
+            plan ? h("span", { class: "tag tag--mono" }, plan.status) : null,
+          ),
+          recordsTable(file, plan),
+        ),
+        bindCard(file),
       ),
     ),
   );
 }
 
-/** Sync view: targets on the left, template editor and preview on the right. */
+/** Sync view: the uploaded files, their bindings and the password sync runner. */
 export function renderSync(container) {
-  if (!state.vault) return;
-  const targets = state.vault.syncTargets ?? [];
-  // Show the first target immediately instead of an empty editor pane.
-  if (!state.syncDraft && targets.length) {
-    selectSyncTarget(targets[0].id);
+  const vault = state.vault;
+  if (!vault) return;
+  const files = vault.files ?? [];
+
+  if (!state.syncSelection && files.length) {
+    // Pick the first file without triggering a re-render from inside render().
+    state.syncSelection = files[0].id;
+    if (!state.filePlans?.[files[0].id]) {
+      api
+        .filePlan(files[0].id)
+        .then((plan) => setState({ filePlans: { ...state.filePlans, [plan.fileId]: plan } }))
+        .catch(() => {});
+    }
   }
-  mount(container, h("div", { class: "sync-layout" }, targetList(), editorPane()));
+
+  const selected = files.find((file) => file.id === state.syncSelection) ?? files[0];
+  mount(
+    container,
+    h(
+      "div",
+      { class: "sync-layout" },
+      fileList(files),
+      selected
+        ? detailPane(selected)
+        : h(
+            "div",
+            { class: "pane" },
+            h(
+              "div",
+              { class: "pane__scroll" },
+              h(
+                "div",
+                { class: "empty" },
+                h("div", { class: "empty__icon" }, icon("file", { size: 20 })),
+                h("h3", { class: "empty__title" }, "还没有上传同步文件"),
+                h(
+                  "p",
+                  { class: "empty__text" },
+                  "上传 JSON、.env、TOML、YAML、XML 或纯文本文件，绑定账号后即可把密码写回文件中的对应位置。",
+                ),
+                h(
+                  "button",
+                  {
+                    class: "btn btn--primary",
+                    type: "button",
+                    onClick: guard(async () => {
+                      const files2 = await api.pickFiles();
+                      if (!files2.length) return;
+                      openFileDialog({ paths: files2 });
+                    }),
+                  },
+                  icon("upload", { size: 15 }),
+                  "上传文件",
+                ),
+              ),
+            ),
+          ),
+    ),
+  );
 }

@@ -11,6 +11,8 @@ import {
   handleLocked,
   refreshVault,
   saveSettings,
+  loadFilePlans,
+  syncAllFiles,
 } from "./state.js";
 import { toast } from "./toast.js";
 import { currentTheme, setTheme } from "./theme.js";
@@ -22,6 +24,7 @@ import { renderSync } from "./views/sync.js";
 import { renderSettings } from "./views/settings.js";
 import { renderAssociations } from "./views/associations.js";
 import { openEntryEditor } from "./views/editor.js";
+import { openFileDialog } from "./views/filedialog.js";
 
 const root = document.getElementById("app");
 
@@ -29,7 +32,7 @@ const VIEW_META = {
   accounts: { title: "账号", subtitle: "本地加密保存的账号与密码" },
   associations: { title: "关联关系", subtitle: "账号与需要同步的内容文件" },
 
-  sync: { title: "同步配置", subtitle: "把 SAP 账号写入全局配置文件（如 MCP）" },
+  sync: { title: "同步文件", subtitle: "把账号密码写回已上传的配置文件" },
   settings: { title: "设置", subtitle: "外观、安全、SAP 与数据" },
 };
 
@@ -435,6 +438,46 @@ function headerActions() {
       ),
     );
   }
+  if (state.view === "sync") {
+    return h(
+      "div",
+      { class: "main__actions" },
+      h(
+        "button",
+        {
+          class: "btn",
+          type: "button",
+          onClick: guard(() => loadFilePlans()),
+        },
+        icon("refresh", { size: 14 }),
+        "重新检测",
+      ),
+      h(
+        "button",
+        {
+          class: "btn",
+          type: "button",
+          onClick: guard(() => syncAllFiles()),
+        },
+        icon("download", { size: 14 }),
+        "全部同步",
+      ),
+      h(
+        "button",
+        {
+          class: "btn btn--primary",
+          type: "button",
+          onClick: guard(async () => {
+            const files = await api.pickFiles();
+            if (!files.length) return;
+            openFileDialog({ paths: files });
+          }),
+        },
+        icon("plus", { size: 15 }),
+        "上传文件",
+      ),
+    );
+  }
   if (state.view === "settings") {
     return h(
       "div",
@@ -470,11 +513,12 @@ function subtitle() {
   const vault = state.vault;
   if (!vault) return VIEW_META[state.view].subtitle;
   if (state.view === "accounts") {
-    const links = vault.entries.reduce((sum, entry) => sum + entry.linkCount, 0);
-    return `${vault.entries.length} 个账号 · 关联文件 ${links} 个`;
+    const files = vault.files?.length ?? 0;
+    const bound = vault.entries.reduce((sum, entry) => sum + entry.fileCount, 0);
+    return `${vault.entries.length} 个账号 · ${files} 个同步文件 · ${bound} 处绑定`;
   }
   if (state.view === "sync") {
-    return `${vault.syncTargets.length} 个同步目标 · 写入 SAP 账号与关联文件清单`;
+    return `${vault.files?.length ?? 0} 个已上传文件 · 只把密码写回原文件`;
   }
   return VIEW_META[state.view].subtitle;
 }

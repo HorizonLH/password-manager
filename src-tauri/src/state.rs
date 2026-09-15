@@ -23,9 +23,11 @@ impl Drop for Unlocked {
             for recorded in entry.password_history.iter_mut() {
                 recorded.password.zeroize();
             }
-            for link in entry.links.iter_mut() {
-                if let Some(parse) = link.parse.as_mut() {
-                    for field in parse.fields.iter_mut() {
+        }
+        for file in self.vault.files.iter_mut() {
+            if let Some(analysis) = file.analysis.as_mut() {
+                for record in analysis.records.iter_mut() {
+                    for field in record.fields.iter_mut() {
                         if field.kind == "password" {
                             field.value.zeroize();
                         }

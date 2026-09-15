@@ -27,9 +27,8 @@ export const state = {
   assocFilter: "",
   assocOnlyLinked: false,
   assocMode: "cards",
-  syncSelectedId: null,
-  syncDraft: null,
-  syncPreview: null,
+  syncSelection: null,
+  filePlans: {},
   refreshing: false,
 };
 
@@ -117,9 +116,8 @@ function applyLockedState(reason) {
     vault: null,
     selectedEntry: null,
     selectedEntryId: null,
-    syncDraft: null,
-    syncPreview: null,
-    syncSelectedId: null,
+    syncSelection: null,
+    filePlans: {},
   });
 }
 
@@ -204,28 +202,74 @@ export async function saveSettings(patch) {
 }
 
 
-// ------------------------------------------------------------------- links --
+// ------------------------------------------------------------------- files --
 
-export async function updateLinkKeys(entryId, linkId, keys) {
-  const entry = await api.linkUpdateKeys(entryId, linkId, keys);
-  await refreshVault();
-  if (state.selectedEntryId === entryId) setState({ selectedEntry: entry });
+/** Registers uploaded files and optionally binds them to accounts. */
+export async function addFiles(drafts) {
+  const vault = await api.fileAdd(drafts);
+  setState({ vault });
+  toast(`已上传 ${drafts.length} 个文件`, "success");
+  return vault;
+}
+
+export async function updateFileKeys(fileId, keys) {
+  const vault = await api.fileUpdateKeys(fileId, keys);
+  setState({ vault });
   toast("关键词已更新并重新检测", "success");
-  return entry;
+  return vault;
 }
 
-export async function reanalyzeLink(entryId, linkId) {
-  const entry = await api.linkReanalyze(entryId, linkId);
-  await refreshVault();
-  if (state.selectedEntryId === entryId) setState({ selectedEntry: entry });
-  return entry;
+export async function reanalyzeFile(fileId) {
+  const vault = await api.fileReanalyze(fileId);
+  setState({ vault });
+  return vault;
 }
 
-export async function removeLink(entryId, linkId) {
-  const entry = await api.linkRemove(entryId, linkId);
+export async function bindFile(fileId, entryIds) {
+  const vault = await api.fileBind(fileId, entryIds);
+  setState({ vault });
+  return vault;
+}
+
+export async function removeFile(fileId) {
+  const vault = await api.fileRemove(fileId);
+  setState({ vault, filePlans: {}, syncSelection: null });
+  toast("已移除文件", "success");
+  return vault;
+}
+
+/** Plans for every file, keyed by file id (shown in the sync view). */
+export async function loadFilePlans() {
+  const plans = await api.filePlans();
+  const keyed = {};
+  for (const plan of plans) keyed[plan.fileId] = plan;
+  setState({ filePlans: keyed });
+  return keyed;
+}
+
+export async function syncFile(fileId) {
+  const outcome = await api.fileSync(fileId);
   await refreshVault();
-  if (state.selectedEntryId === entryId) setState({ selectedEntry: entry });
-  return entry;
+  await loadFilePlans();
+  toast(
+    outcome.changed ? `${outcome.status}：${outcome.path}` : `${outcome.path}：${outcome.status}`,
+    outcome.changed ? "success" : "info",
+  );
+  return outcome;
+}
+
+export async function syncAllFiles() {
+  const outcomes = await api.fileSyncAll();
+  await refreshVault();
+  await loadFilePlans();
+  const updated = outcomes.reduce((sum, outcome) => sum + outcome.updates, 0);
+  toast(
+    outcomes.length
+      ? `同步完成：${outcomes.length} 个文件，更新 ${updated} 处密码`
+      : "没有可同步的文件",
+    outcomes.length ? "success" : "info",
+  );
+  return outcomes;
 }
 
 // ----------------------------------------------------------------- history --
@@ -251,21 +295,7 @@ export function clearHistory(entryId) {
 
 // -------------------------------------------------------------------- sync --
 
-export async function selectSyncTarget(id) {
-  const target = (state.vault?.syncTargets ?? []).find((item) => item.id === id);
-  setState({
-    syncSelectedId: id,
-    syncDraft: target ? { ...target } : null,
-    syncPreview: null,
-  });
-  if (!target) return;
-  try {
-    const preview = await api.syncPreview(id);
-    if (state.syncSelectedId === id) setState({ syncPreview: preview });
-  } catch {
-    // A target without a path yet simply has no preview.
-  }
-}
+
 
 export function navigate(view, patch = {}) {
   setState({ view, ...patch });

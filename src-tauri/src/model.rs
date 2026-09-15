@@ -2,14 +2,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
-/// Category id reserved for SAP accounts. It can never be renamed or removed,
-/// and it is the only category that participates in the SAP sync pipeline.
+/// Category id reserved for SAP accounts. It can never be renamed or removed.
 pub const SAP_CATEGORY_ID: &str = "sap";
 pub const DEFAULT_CATEGORY_ID: &str = "general";
 
-/// Upper bound on stored passwords per account. SAP systems typically require
-/// five or six passwords to be remembered, so this is comfortably generous
-/// while still bounding the vault size.
+/// Bumped when the on-disk shape changes so `store::normalize_vault` can migrate.
+pub const VAULT_SCHEMA: u32 = 2;
+
+/// Upper bound on stored passwords per account.
 pub const MAX_PASSWORD_HISTORY: usize = 50;
 
 pub fn now_string() -> String {
@@ -64,8 +64,6 @@ impl Category {
 // Password rules
 // ---------------------------------------------------------------------------
 
-/// Optional per-entry (or global default) password policy. A rule can generate
-/// a compliant password and validate one the user typed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PasswordRule {
@@ -79,9 +77,7 @@ pub struct PasswordRule {
     pub digits: bool,
     pub symbols: bool,
     pub symbols_set: String,
-    /// Characters that must not appear in the password.
     pub forbidden: String,
-    /// Some systems require the password to start with a letter.
     pub start_with_letter: bool,
     pub avoid_ambiguous: bool,
 }
@@ -113,14 +109,11 @@ impl PasswordRule {
             self.symbols_set = PasswordRule::default().symbols_set;
         }
         if !(self.upper || self.lower || self.digits || self.symbols) {
-            // A rule that forbids every character class cannot generate or
-            // validate anything, so fall back to the safe default.
             self.lower = true;
             self.digits = true;
         }
     }
 
-    /// Human readable one-liner used in lists and detail panes.
     pub fn summary(&self) -> String {
         if !self.enabled {
             return "未设置规则".to_string();
@@ -158,9 +151,6 @@ impl PasswordRule {
 // Password history
 // ---------------------------------------------------------------------------
 
-/// One previously used password. SAP systems remember a configurable number of
-/// old passwords and reject reuse, so keeping the list makes the next change
-/// easy to plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
@@ -178,8 +168,7 @@ pub struct HistoryEntry {
 // ---------------------------------------------------------------------------
 
 /// Which keys (and how strictly) identify the URL / user name / password inside
-/// a linked content file. Users can override this per file when their file uses
-/// an unexpected naming scheme.
+/// a content file. Users can override this per file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct KeyMapping {
@@ -254,6 +243,22 @@ impl KeyMapping {
     }
 }
 
+/// Where a value lives inside the file so it can be replaced **in place**,
+/// leaving every other byte untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldLocation {
+    /// Byte range of the replaceable value inside the decoded text (inside the
+    /// quotes when the value is quoted).
+    pub start: usize,
+    pub end: usize,
+    /// The value was wrapped in `"` or `'`; the quotes are kept as they are.
+    pub quoted: bool,
+    /// The value came from an XML attribute and needs entity escaping.
+    pub xml_attr: bool,
+    pub line: u32,
+}
+
 /// A value pulled out of a content file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -266,42 +271,64 @@ pub struct FieldHit {
     pub path: String,
     pub value: String,
     pub line: u32,
+    #[serde(default)]
+    pub location: Option<FieldLocation>,
 }
 
-/// Result of parsing one linked file with one key mapping.
+/// One credential block found in a file. A file may contain several (e.g. a JSON
+/// config with one block per SAP system), which is what makes a file able to be
+/// bound to several accounts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileRecord {
+    pub id: String,
+    /// Path of the containing block, e.g. `sap.production` or `[PRD]`.
+    pub path: String,
+    pub fields: Vec<FieldHit>,
+}
+
+impl FileRecord {
+    pub fn hit(&self, kind: &str) -> Option<&FieldHit> {
+        self.fields.iter().find(|field| field.kind == kind)
+    }
+
+    pub fn value(&self, kind: &str) -> String {
+        self.hit(kind).map(|hit| hit.value.clone()).unwrap_or_default()
+    }
+
+    pub fn url(&self) -> String {
+        self.value("url")
+    }
+
+    pub fn username(&self) -> String {
+        self.value("username")
+    }
+
+    pub fn password(&self) -> String {
+        self.value("password")
+    }
+
+}
+
+/// Result of parsing one file with one key mapping.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LinkParse {
+pub struct FileAnalysis {
     /// `json` | `env` | `toml` | `yaml` | `xml` | `text`
     pub format: String,
-    pub fields: Vec<FieldHit>,
-    /// Kinds that could not be located: `url` / `username` / `password`.
+    pub records: Vec<FileRecord>,
+    /// Kinds that no record contains at all.
     pub missing: Vec<String>,
     pub analyzed_at: String,
     pub error: Option<String>,
 }
 
-impl LinkParse {
-    pub fn hit(&self, kind: &str) -> Option<&FieldHit> {
-        self.fields.iter().find(|field| field.kind == kind)
-    }
 
-    pub fn value_of(&self, kind: &str) -> String {
-        self.hit(kind)
-            .map(|hit| hit.value.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn is_complete(&self) -> bool {
-        self.missing.is_empty()
-    }
-}
-
-/// A file that is associated with an account. Together these form the content
-/// that gets pushed into the global (e.g. MCP) configuration.
+/// A file the user uploaded. It is the *source of truth*: sync writes the
+/// password back into it in place, and never touches anything else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ContentLink {
+pub struct SyncFile {
     pub id: String,
     pub path: String,
     pub label: String,
@@ -309,20 +336,26 @@ pub struct ContentLink {
     pub exists: bool,
     pub size: u64,
     pub modified_at: Option<String>,
-    /// Per-file key mapping, seeded from the global default when added.
     #[serde(default)]
     pub keys: KeyMapping,
     #[serde(default)]
-    pub parse: Option<LinkParse>,
+    pub analysis: Option<FileAnalysis>,
+    /// Accounts this file is bound to (many-to-many).
+    #[serde(default)]
+    pub entry_ids: Vec<String>,
+    #[serde(default)]
+    pub last_sync_at: Option<String>,
+    #[serde(default)]
+    pub last_status: Option<String>,
 }
 
-impl ContentLink {
-    pub fn from_path(path: &str, keys: KeyMapping, parse: Option<LinkParse>) -> Self {
+impl SyncFile {
+    pub fn from_path(path: &str, keys: KeyMapping, analysis: Option<FileAnalysis>) -> Self {
         let label = std::path::Path::new(path)
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string());
-        let mut link = Self {
+        let mut file = Self {
             id: new_id(),
             path: path.to_string(),
             label,
@@ -331,10 +364,13 @@ impl ContentLink {
             size: 0,
             modified_at: None,
             keys,
-            parse,
+            analysis,
+            entry_ids: Vec::new(),
+            last_sync_at: None,
+            last_status: None,
         };
-        link.refresh_stat();
-        link
+        file.refresh_stat();
+        file
     }
 
     pub fn refresh_stat(&mut self) {
@@ -354,14 +390,11 @@ impl ContentLink {
             }
         }
     }
-
-    pub fn value_of(&self, kind: &str) -> String {
-        self.parse
-            .as_ref()
-            .map(|parse| parse.value_of(kind))
-            .unwrap_or_default()
-    }
 }
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -371,28 +404,25 @@ pub struct Entry {
     pub category_id: String,
     #[serde(default)]
     pub username: String,
-    /// When true the entry uses the global Knox ID as its user name. The stored
-    /// `username` is kept as a fallback so switching back is lossless.
+    /// When true the entry uses the global Knox ID as its user name.
     #[serde(default)]
     pub use_knox_id: bool,
     #[serde(default)]
     pub password: String,
+    /// URL (or host) used to pick the matching block inside a synced file when a
+    /// file is bound to more than one account. Not written to the files.
+    #[serde(default)]
+    pub match_url: String,
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
     pub favorite: bool,
-    /// Optional password policy for this entry. `None` means "no rule".
     #[serde(default)]
     pub rule: Option<PasswordRule>,
-    /// How many previous passwords the target system refuses to accept again.
-    /// `0` disables the check.
     #[serde(default)]
     pub history_cycle: u32,
-    /// Newest first.
     #[serde(default)]
     pub password_history: Vec<HistoryEntry>,
-    #[serde(default)]
-    pub links: Vec<ContentLink>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -408,21 +438,7 @@ impl Entry {
         }
     }
 
-    /// First value of the given kind found across the linked files. The files are
-    /// the source of truth for URLs and credentials, so this is what the UI shows
-    /// and what the sync output falls back to.
-    pub fn link_value(&self, kind: &str) -> String {
-        for link in &self.links {
-            let value = link.value_of(kind);
-            if !value.is_empty() {
-                return value;
-            }
-        }
-        String::new()
-    }
-
-    /// Passwords that the target system would still remember, newest first.
-    /// `current` is included because it becomes history on the next change.
+    /// Passwords the target system would still remember, newest first.
     pub fn forbidden_reuse(&self, current: &str) -> Vec<String> {
         let cycle = self.history_cycle as usize;
         if cycle == 0 {
@@ -444,52 +460,45 @@ impl Entry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SyncTarget {
-    pub id: String,
-    pub name: String,
-    /// `mcp` targets are highlighted in the UI as the primary use case.
-    #[serde(default)]
-    pub kind: String,
-    pub path: String,
-    pub format: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    pub template: String,
-    #[serde(default)]
-    pub include_files: bool,
-    #[serde(default)]
-    pub backup: bool,
-    #[serde(default)]
-    pub last_sync_at: Option<String>,
-    #[serde(default)]
-    pub last_status: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Vault {
     pub schema: u32,
     #[serde(default)]
     pub knox_id: String,
     pub categories: Vec<Category>,
     pub entries: Vec<Entry>,
+    /// Uploaded content files; bindings live in `SyncFile::entry_ids`.
     #[serde(default)]
-    pub sync_targets: Vec<SyncTarget>,
+    pub files: Vec<SyncFile>,
+    /// Legacy field from schema 1 (per-entry links); migrated on load.
+    #[serde(default, skip_serializing)]
+    pub legacy_links: Vec<LegacyEntryLinks>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyEntryLinks {
+    pub entry_id: String,
+    pub links: Vec<LegacyLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyLink {
+    pub path: String,
+    #[serde(default)]
+    pub keys: KeyMapping,
 }
 
 impl Default for Vault {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: VAULT_SCHEMA,
             knox_id: String::new(),
             categories: vec![Category::sap(), Category::general()],
             entries: Vec::new(),
-            sync_targets: Vec::new(),
+            files: Vec::new(),
+            legacy_links: Vec::new(),
             updated_at: now_string(),
         }
     }
@@ -517,10 +526,31 @@ impl Vault {
             .ok_or_else(|| AppError::NotFound(format!("条目 {id}")))
     }
 
+    pub fn file(&self, id: &str) -> AppResult<&SyncFile> {
+        self.files
+            .iter()
+            .find(|file| file.id == id)
+            .ok_or_else(|| AppError::NotFound(format!("同步文件 {id}")))
+    }
+
+    pub fn file_mut(&mut self, id: &str) -> AppResult<&mut SyncFile> {
+        self.files
+            .iter_mut()
+            .find(|file| file.id == id)
+            .ok_or_else(|| AppError::NotFound(format!("同步文件 {id}")))
+    }
+
     pub fn sap_entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries
             .iter()
             .filter(|entry| entry.category_id == SAP_CATEGORY_ID)
+    }
+
+    pub fn files_for(&self, entry_id: &str) -> Vec<&SyncFile> {
+        self.files
+            .iter()
+            .filter(|file| file.entry_ids.iter().any(|id| id == entry_id))
+            .collect()
     }
 }
 
@@ -536,28 +566,28 @@ pub struct EntrySummary {
     pub use_knox_id: bool,
     pub has_password: bool,
     pub favorite: bool,
-    pub link_count: usize,
+    pub match_url: String,
+    pub file_count: usize,
     pub has_rule: bool,
     pub rule_summary: String,
     pub history_cycle: u32,
     pub history_count: usize,
-    /// First URL recovered from the linked files, used as the list subtitle.
-    pub primary_url: String,
     pub updated_at: String,
     pub last_used_at: Option<String>,
 }
 
 impl EntrySummary {
-    pub fn from(entry: &Entry, knox_id: &str) -> Self {
+    pub fn from(entry: &Entry, vault: &Vault) -> Self {
         Self {
             id: entry.id.clone(),
             title: entry.title.clone(),
             category_id: entry.category_id.clone(),
-            username: entry.effective_username(knox_id),
+            username: entry.effective_username(&vault.knox_id),
             use_knox_id: entry.use_knox_id,
             has_password: !entry.password.is_empty(),
             favorite: entry.favorite,
-            link_count: entry.links.len(),
+            match_url: entry.match_url.clone(),
+            file_count: vault.files_for(&entry.id).len(),
             has_rule: entry.rule.as_ref().map(|rule| rule.enabled).unwrap_or(false),
             rule_summary: entry
                 .rule
@@ -566,22 +596,21 @@ impl EntrySummary {
                 .unwrap_or_else(|| "未设置规则".to_string()),
             history_cycle: entry.history_cycle,
             history_count: entry.password_history.len(),
-            primary_url: entry.link_value("url"),
             updated_at: entry.updated_at.clone(),
             last_used_at: entry.last_used_at.clone(),
         }
     }
 }
 
-/// Row used by the "关联关系" screen: one account and the content files tied to
-/// it, including what could be extracted from each file.
+/// Row used by the "关联关系" screen: one account and the files bound to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Association {
     pub entry_id: String,
     pub entry_title: String,
     pub username: String,
-    pub links: Vec<ContentLink>,
+    pub match_url: String,
+    pub files: Vec<SyncFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -590,7 +619,7 @@ pub struct VaultView {
     pub knox_id: String,
     pub categories: Vec<Category>,
     pub entries: Vec<EntrySummary>,
-    pub sync_targets: Vec<SyncTarget>,
+    pub files: Vec<SyncFile>,
     pub associations: Vec<Association>,
     pub updated_at: String,
 }
@@ -603,7 +632,12 @@ impl VaultView {
                 entry_id: entry.id.clone(),
                 entry_title: entry.title.clone(),
                 username: entry.effective_username(&vault.knox_id),
-                links: entry.links.clone(),
+                match_url: entry.match_url.clone(),
+                files: vault
+                    .files_for(&entry.id)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
             })
             .collect();
         Self {
@@ -612,9 +646,9 @@ impl VaultView {
             entries: vault
                 .entries
                 .iter()
-                .map(|entry| EntrySummary::from(entry, &vault.knox_id))
+                .map(|entry| EntrySummary::from(entry, vault))
                 .collect(),
-            sync_targets: vault.sync_targets.clone(),
+            files: vault.files.clone(),
             associations,
             updated_at: vault.updated_at.clone(),
         }

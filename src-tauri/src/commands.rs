@@ -8,14 +8,14 @@ use crate::crypto::{self, GeneratorOptions, PasswordStrength};
 use crate::error::{AppError, AppResult};
 use crate::keys;
 use crate::model::{
-    now_string, Category, ContentLink, Entry, EntrySummary, HistoryEntry, KeyMapping, LinkParse,
-    PasswordRule, SyncTarget, Vault, VaultView, DEFAULT_CATEGORY_ID, MAX_PASSWORD_HISTORY,
+    now_string, Category, Entry, EntrySummary, FileAnalysis, HistoryEntry, KeyMapping,
+    PasswordRule, SyncFile, Vault, VaultView, DEFAULT_CATEGORY_ID, MAX_PASSWORD_HISTORY,
     SAP_CATEGORY_ID,
 };
 use crate::rules;
 use crate::state::{AppState, Unlocked};
 use crate::store::{self, Settings, VaultMode};
-use crate::sync::{self, SyncOutcome, TemplatePreset};
+use crate::sync::{self, FilePlan, SyncOutcome};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -53,7 +53,6 @@ pub struct Bootstrap {
     pub data_dir: String,
     pub vault_path: String,
     pub portable: bool,
-    pub presets: Vec<TemplatePreset>,
     pub supported_formats: Vec<String>,
     pub version: String,
     pub startup_error: Option<String>,
@@ -78,7 +77,6 @@ pub fn app_bootstrap(state: State<'_, AppState>) -> AppResult<Bootstrap> {
         data_dir: store::data_dir().to_string_lossy().to_string(),
         vault_path: store::vault_path().to_string_lossy().to_string(),
         portable: store::is_portable(),
-        presets: sync::presets(),
         supported_formats: vec![
             "JSON".to_string(),
             ".env".to_string(),
@@ -350,6 +348,9 @@ pub struct EntryInput {
     pub use_knox_id: bool,
     #[serde(default)]
     pub password: String,
+    /// URL (or host) used to pick the matching block inside a synced file.
+    #[serde(default)]
+    pub match_url: String,
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
@@ -456,6 +457,7 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                 entry.username = input.username.clone();
                 entry.use_knox_id = input.use_knox_id;
                 entry.password = new_password;
+                entry.match_url = input.match_url.trim().to_string();
                 entry.notes = input.notes.clone();
                 entry.favorite = input.favorite;
                 entry.rule = rule.clone();
@@ -471,12 +473,12 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                     username: input.username.clone(),
                     use_knox_id: input.use_knox_id,
                     password: new_password,
+                    match_url: input.match_url.trim().to_string(),
                     notes: input.notes.clone(),
                     favorite: input.favorite,
                     rule,
                     history_cycle: cycle,
                     password_history: Vec::new(),
-                    links: Vec::new(),
                     created_at: now_string(),
                     updated_at: now_string(),
                     last_used_at: None,
@@ -515,7 +517,7 @@ pub fn entry_toggle_favorite(state: State<'_, AppState>, id: String) -> AppResul
 pub fn entry_summary(state: State<'_, AppState>, id: String) -> AppResult<EntrySummary> {
     state.with_vault(|vault| {
         let entry = vault.entry(&id)?;
-        Ok(EntrySummary::from(entry, &vault.knox_id))
+        Ok(EntrySummary::from(entry, vault))
     })
 }
 
@@ -713,16 +715,19 @@ pub fn clipboard_clear() -> AppResult<()> {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LinkDraft {
+pub struct FileDraft {
     pub path: String,
     /// Omit to use the global default key words.
     #[serde(default)]
     pub keys: Option<KeyMapping>,
+    /// Accounts this file should be bound to right away.
+    #[serde(default)]
+    pub entry_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LinkInspection {
+pub struct FileInspection {
     pub path: String,
     pub label: String,
     pub format: String,
@@ -730,146 +735,160 @@ pub struct LinkInspection {
     pub exists: bool,
     pub size: u64,
     pub keys: KeyMapping,
-    pub parse: LinkParse,
+    pub analysis: FileAnalysis,
 }
 
-fn inspect(path: &str, keys: KeyMapping) -> LinkInspection {
+fn inspect_file(path: &str, keys: KeyMapping) -> FileInspection {
     let target = PathBuf::from(path.trim());
     let mut keys = keys;
     keys.normalize();
-    let parse = keys::analyze_file(&target, &keys);
+    let analysis = keys::analyze_file(&target, &keys);
     let metadata = std::fs::metadata(&target).ok();
-    LinkInspection {
+    FileInspection {
         path: target.to_string_lossy().to_string(),
         label: target
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string()),
-        format: parse.format.clone(),
+        format: analysis.format.clone(),
         supported: keys::is_supported(&target),
         exists: metadata.is_some(),
         size: metadata.map(|meta| meta.len()).unwrap_or(0),
         keys,
-        parse,
+        analysis,
     }
 }
 
-/// Analyses files without attaching them, so the UI can show what was found and
-/// ask the user for different key words when a field is missing.
+/// Parses files without storing them, so the UI can show what was found and ask
+/// for different key words when a credential field is missing.
 #[tauri::command]
-pub fn link_inspect(
+pub fn file_inspect(
     state: State<'_, AppState>,
     paths: Vec<String>,
     keys: Option<KeyMapping>,
-) -> AppResult<Vec<LinkInspection>> {
+) -> AppResult<Vec<FileInspection>> {
     let mapping = keys.unwrap_or_else(|| state.settings_snapshot().key_mapping);
     Ok(paths
         .iter()
-        .map(|path| inspect(path, mapping.clone()))
+        .map(|path| inspect_file(path, mapping.clone()))
         .collect())
 }
 
+/// Stores uploaded files and binds them to the chosen accounts.
 #[tauri::command]
-pub fn link_add(
-    state: State<'_, AppState>,
-    entry_id: String,
-    drafts: Vec<LinkDraft>,
-) -> AppResult<Entry> {
+pub fn file_add(state: State<'_, AppState>, drafts: Vec<FileDraft>) -> AppResult<VaultView> {
     let fallback = state.settings_snapshot().key_mapping;
-    let mut prepared: Vec<ContentLink> = Vec::new();
-    for draft in &drafts {
-        let trimmed = draft.path.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut keys = draft.keys.clone().unwrap_or_else(|| fallback.clone());
-        keys.normalize();
-        let parse = keys::analyze_file(Path::new(trimmed), &keys);
-        prepared.push(ContentLink::from_path(trimmed, keys, Some(parse)));
-    }
-
     state.with_vault_mut(|vault| {
-        let entry = vault.entry_mut(&entry_id)?;
-        let mut added = 0usize;
-        for link in prepared {
-            if entry.links.iter().any(|existing| existing.path == link.path) {
+        for draft in &drafts {
+            let trimmed = draft.path.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            entry.links.push(link);
-            added += 1;
+            let mut keys = draft.keys.clone().unwrap_or_else(|| fallback.clone());
+            keys.normalize();
+
+            let entry_ids: Vec<String> = draft
+                .entry_ids
+                .iter()
+                .filter(|id| vault.entries.iter().any(|entry| entry.id == **id))
+                .cloned()
+                .collect();
+
+            // A path may already be registered (e.g. bound to another account).
+            if let Some(existing) = vault
+                .files
+                .iter_mut()
+                .find(|file| file.path.eq_ignore_ascii_case(trimmed))
+            {
+                let analysis = keys::analyze_file(Path::new(trimmed), &keys);
+                existing.keys = keys;
+                existing.analysis = Some(analysis);
+                existing.refresh_stat();
+                for id in entry_ids {
+                    if !existing.entry_ids.contains(&id) {
+                        existing.entry_ids.push(id);
+                    }
+                }
+                continue;
+            }
+
+            let analysis = keys::analyze_file(Path::new(trimmed), &keys);
+            let mut file = SyncFile::from_path(trimmed, keys, Some(analysis));
+            file.entry_ids = entry_ids;
+            vault.files.push(file);
         }
-        if added == 0 && !drafts.is_empty() {
-            return Err(AppError::Msg("所选文件已全部关联".to_string()));
-        }
-        entry.updated_at = now_string();
-        Ok(entry.clone())
-    })
+        Ok(())
+    })?;
+    vault_view(state)
 }
 
 #[tauri::command]
-pub fn link_update_keys(
+pub fn file_update_keys(
     state: State<'_, AppState>,
-    entry_id: String,
-    link_id: String,
+    file_id: String,
     keys: KeyMapping,
-) -> AppResult<Entry> {
+) -> AppResult<VaultView> {
     state.with_vault_mut(|vault| {
-        let entry = vault.entry_mut(&entry_id)?;
-        let link = entry
-            .links
-            .iter_mut()
-            .find(|link| link.id == link_id)
-            .ok_or_else(|| AppError::NotFound(format!("关联文件 {link_id}")))?;
+        let file = vault.file_mut(&file_id)?;
         let mut keys = keys;
         keys.normalize();
-        link.keys = keys;
-        link.parse = Some(keys::analyze_file(Path::new(&link.path), &link.keys));
-        link.refresh_stat();
-        entry.updated_at = now_string();
-        Ok(entry.clone())
-    })
+        file.keys = keys;
+        file.analysis = Some(keys::analyze_file(Path::new(&file.path), &file.keys));
+        file.refresh_stat();
+        Ok(())
+    })?;
+    vault_view(state)
 }
 
 #[tauri::command]
-pub fn link_reanalyze(
-    state: State<'_, AppState>,
-    entry_id: String,
-    link_id: String,
-) -> AppResult<Entry> {
+pub fn file_reanalyze(state: State<'_, AppState>, file_id: String) -> AppResult<VaultView> {
     state.with_vault_mut(|vault| {
-        let entry = vault.entry_mut(&entry_id)?;
-        for link in entry.links.iter_mut() {
-            if link.id == link_id {
-                link.parse = Some(keys::analyze_file(Path::new(&link.path), &link.keys));
-                link.refresh_stat();
+        let file = vault.file_mut(&file_id)?;
+        file.analysis = Some(keys::analyze_file(Path::new(&file.path), &file.keys));
+        file.refresh_stat();
+        Ok(())
+    })?;
+    vault_view(state)
+}
+
+/// Replaces the binding list of a file (many accounts per file).
+#[tauri::command]
+pub fn file_bind(
+    state: State<'_, AppState>,
+    file_id: String,
+    entry_ids: Vec<String>,
+) -> AppResult<VaultView> {
+    state.with_vault_mut(|vault| {
+        let known: Vec<String> = vault.entries.iter().map(|entry| entry.id.clone()).collect();
+        let file = vault.file_mut(&file_id)?;
+        let mut next: Vec<String> = Vec::new();
+        for id in entry_ids {
+            if known.contains(&id) && !next.contains(&id) {
+                next.push(id);
             }
         }
-        entry.updated_at = now_string();
-        Ok(entry.clone())
-    })
+        file.entry_ids = next;
+        Ok(())
+    })?;
+    vault_view(state)
 }
 
 #[tauri::command]
-pub fn link_remove(
-    state: State<'_, AppState>,
-    entry_id: String,
-    link_id: String,
-) -> AppResult<Entry> {
+pub fn file_remove(state: State<'_, AppState>, file_id: String) -> AppResult<VaultView> {
     state.with_vault_mut(|vault| {
-        let entry = vault.entry_mut(&entry_id)?;
-        let before = entry.links.len();
-        entry.links.retain(|link| link.id != link_id);
-        if entry.links.len() == before {
-            return Err(AppError::NotFound(format!("关联文件 {link_id}")));
+        let before = vault.files.len();
+        vault.files.retain(|file| file.id != file_id);
+        if vault.files.len() == before {
+            return Err(AppError::NotFound(format!("同步文件 {file_id}")));
         }
-        entry.updated_at = now_string();
-        Ok(entry.clone())
-    })
+        Ok(())
+    })?;
+    vault_view(state)
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LinkPreview {
+pub struct FilePreview {
     pub path: String,
     pub exists: bool,
     pub size: u64,
@@ -878,14 +897,14 @@ pub struct LinkPreview {
 }
 
 #[tauri::command]
-pub fn link_preview(path: String, limit: Option<usize>) -> AppResult<LinkPreview> {
+pub fn file_preview(path: String, limit: Option<usize>) -> AppResult<FilePreview> {
     let target = PathBuf::from(path.trim());
     let metadata = std::fs::metadata(&target)?;
     let limit = limit.unwrap_or(4000).clamp(200, 40_000);
     let bytes = std::fs::read(&target)?;
     let truncated = bytes.len() > limit;
     let slice = &bytes[..bytes.len().min(limit)];
-    Ok(LinkPreview {
+    Ok(FilePreview {
         path: target.to_string_lossy().to_string(),
         exists: true,
         size: metadata.len(),
@@ -948,142 +967,87 @@ pub fn open_path(path: String) -> AppResult<()> {
 // Sync targets
 // ---------------------------------------------------------------------------
 
+/// What syncing would change in one file (no writes).
 #[tauri::command]
-pub fn sync_presets() -> Vec<TemplatePreset> {
-    sync::presets()
-}
-
-#[tauri::command]
-pub fn sync_target_default(format: String) -> SyncTarget {
-    sync::default_target(&format)
-}
-
-#[tauri::command]
-pub fn sync_target_save(state: State<'_, AppState>, target: SyncTarget) -> AppResult<VaultView> {
-    state.with_vault_mut(|vault| {
-        let mut target = target;
-        if target.id.trim().is_empty() {
-            target.id = crate::model::new_id();
-        }
-        if target.name.trim().is_empty() {
-            target.name = "未命名同步目标".to_string();
-        }
-        match vault
-            .sync_targets
-            .iter_mut()
-            .find(|existing| existing.id == target.id)
-        {
-            Some(existing) => *existing = target,
-            None => vault.sync_targets.push(target),
-        }
-        Ok(())
-    })?;
-    vault_view(state)
-}
-
-#[tauri::command]
-pub fn sync_target_delete(state: State<'_, AppState>, id: String) -> AppResult<VaultView> {
-    state.with_vault_mut(|vault| {
-        let before = vault.sync_targets.len();
-        vault.sync_targets.retain(|target| target.id != id);
-        if vault.sync_targets.len() == before {
-            return Err(AppError::NotFound(format!("同步目标 {id}")));
-        }
-        Ok(())
-    })?;
-    vault_view(state)
-}
-
-fn find_target(vault: &Vault, id: &str) -> AppResult<SyncTarget> {
-    vault
-        .sync_targets
-        .iter()
-        .find(|target| target.id == id)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("同步目标 {id}")))
-}
-
-#[tauri::command]
-pub fn sync_preview(state: State<'_, AppState>, id: String) -> AppResult<SyncOutcome> {
+pub fn file_plan(state: State<'_, AppState>, file_id: String) -> AppResult<FilePlan> {
     state.touch();
-    let settings = state.settings_snapshot();
     state.with_vault(|vault| {
-        let target = find_target(vault, &id)?;
-        sync::preview(vault, &target, &settings.sap_line_separator)
+        let file = vault.file(&file_id)?.clone();
+        sync::plan_file(vault, &file)
     })
 }
 
 #[tauri::command]
-pub fn sync_preview_template(
-    state: State<'_, AppState>,
-    target: SyncTarget,
-) -> AppResult<SyncOutcome> {
-    let settings = state.settings_snapshot();
-    state.with_vault(|vault| sync::preview(vault, &target, &settings.sap_line_separator))
+pub fn file_plans(state: State<'_, AppState>) -> AppResult<Vec<FilePlan>> {
+    state.touch();
+    state.with_vault(|vault| Ok(sync::plan_all(vault)))
 }
 
+/// Writes the password of every bound account back into the file, in place.
 #[tauri::command]
-pub fn sync_run(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<SyncOutcome> {
-    let settings = state.settings_snapshot();
-    let target = state.with_vault(|vault| find_target(vault, &id))?;
-    let outcome =
-        state.with_vault(|vault| sync::execute(vault, &target, &settings.sap_line_separator))?;
-    let status = if outcome.changed {
-        format!("已写入 {} 字节", outcome.bytes)
-    } else {
-        "内容未变化，跳过写入".to_string()
-    };
+pub fn file_sync(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    file_id: String,
+) -> AppResult<SyncOutcome> {
+    state.touch();
+    let backup = state.settings_snapshot().sync_backup;
+    let outcome = state.with_vault(|vault| {
+        let file = vault.file(&file_id)?.clone();
+        sync::sync_file(vault, &file, backup)
+    })?;
     state.with_vault_mut(|vault| {
-        if let Some(existing) = vault.sync_targets.iter_mut().find(|item| item.id == id) {
-            existing.last_sync_at = Some(now_string());
-            existing.last_status = Some(status);
+        if let Some(file) = vault.files.iter_mut().find(|file| file.id == file_id) {
+            sync::stamp(file, &outcome);
         }
         Ok(())
     })?;
-    notice(&app, "success", format!("已写入 {}", outcome.path));
+    notice(&app, "success", format!("{}：{}", outcome.path, outcome.status));
     Ok(outcome)
 }
 
 #[tauri::command]
-pub fn sync_run_all(app: AppHandle, state: State<'_, AppState>) -> AppResult<Vec<SyncOutcome>> {
-    let settings = state.settings_snapshot();
-    let targets: Vec<SyncTarget> = state.with_vault(|vault| {
-        Ok(vault
-            .sync_targets
-            .iter()
-            .filter(|target| target.enabled && !target.path.trim().is_empty())
-            .cloned()
-            .collect())
-    })?;
-
-    let mut outcomes = Vec::new();
-    for target in targets {
-        let result =
-            state.with_vault(|vault| sync::execute(vault, &target, &settings.sap_line_separator));
-        let (status, outcome) = match result {
-            Ok(outcome) => (
-                if outcome.changed {
-                    format!("已写入 {} 字节", outcome.bytes)
-                } else {
-                    "内容未变化".to_string()
-                },
-                Some(outcome),
-            ),
-            Err(err) => (format!("失败：{err}"), None),
-        };
-        let id = target.id.clone();
-        let _ = state.with_vault_mut(|vault| {
-            if let Some(existing) = vault.sync_targets.iter_mut().find(|item| item.id == id) {
-                existing.last_sync_at = Some(now_string());
-                existing.last_status = Some(status);
-            }
-            Ok(())
+pub fn file_sync_all(app: AppHandle, state: State<'_, AppState>) -> AppResult<Vec<SyncOutcome>> {
+    let backup = state.settings_snapshot().sync_backup;
+    let ids: Vec<String> =
+        state.with_vault(|vault| Ok(vault.files.iter().map(|file| file.id.clone()).collect()))?;
+    let mut outcomes: Vec<SyncOutcome> = Vec::new();
+    for id in ids {
+        let result = state.with_vault(|vault| {
+            let file = vault.file(&id)?.clone();
+            sync::sync_file(vault, &file, backup)
         });
-        if let Some(outcome) = outcome {
-            outcomes.push(outcome);
+        match result {
+            Ok(outcome) => {
+                state.with_vault_mut(|vault| {
+                    if let Some(file) = vault.files.iter_mut().find(|file| file.id == id) {
+                        sync::stamp(file, &outcome);
+                    }
+                    Ok(())
+                })?;
+                outcomes.push(outcome);
+            }
+            Err(err) => {
+                state.with_vault_mut(|vault| {
+                    if let Some(file) = vault.files.iter_mut().find(|file| file.id == id) {
+                        file.last_sync_at = Some(now_string());
+                        file.last_status = Some(format!("失败：{err}"));
+                    }
+                    Ok(())
+                })?;
+            }
         }
     }
-    notice(&app, "success", format!("已同步 {} 个目标", outcomes.len()));
+    let updated: usize = outcomes.iter().map(|outcome| outcome.updates).sum();
+    notice(
+        &app,
+        "success",
+        format!(
+            "同步完成：{} 个文件，共更新 {} 处密码",
+            outcomes.len(),
+            updated
+        ),
+    );
     Ok(outcomes)
 }
 
