@@ -302,17 +302,33 @@ const VIEWS = [
   {
     nav: "账号",
     label: "账号",
-    needles: ["全部账号", "SAP 账号", "SAP 生产机", "循环 5", "有规则", "新建条目", "prd.sap.corp.example"],
+    needles: ["全部账号", "SAP 账号", "SAP 生产机", "SAP 测试机", "循环 5", "有规则", "新建条目", "KNOX01"],
   },
   {
     nav: "关联关系",
     label: "关联关系",
-    needles: ["SAP 生产机", "已绑定", "个凭据块", "匹配 prd.sap.corp.example", "查看账号"],
+    needles: [
+      "SAP 生产机",
+      "已绑定",
+      "sap-login.json",
+      "sap.production.password",
+      "SAP_PRD_PASSWORD",
+      "查看账号",
+    ],
   },
   {
     nav: "同步文件",
     label: "同步文件",
-    needles: ["已上传文件", "sap-login.json", "绑定账号", "将写入的内容", "同步此文件"],
+    needles: [
+      "已上传文件",
+      "sap-login.json",
+      "文件内容（选择密码对应的键）",
+      "疑似密码",
+      "将更新",
+      "已最新",
+      "第 6 行",
+      "全部同步",
+    ],
   },
   {
     nav: "设置",
@@ -324,7 +340,8 @@ const VIEWS = [
       "默认密码规则",
       "文件关键词",
       "数据与备份",
-      "URL 关键词",
+      "密码关键词",
+      "键名必须完全一致",
     ],
   },
 ];
@@ -356,16 +373,16 @@ async function audit(cdp, { includeModals = true } = {}) {
     "复制用户名 + 密码",
     "用户名（全局 Knox ID）",
     "KNOX01",
-    "匹配用 URL",
     "密码规则",
     "集团口令策略 2024",
     "密码循环",
     "禁止重复最近 5 个",
     "查看 2 个历史密码",
-    "同步文件（1）",
+    "同步文件（2）",
     "sap-login.json",
-    "键 password",
-    "匹配到本账号",
+    "sap.production.password",
+    "SAP_PRD_PASSWORD",
+    "键已不存在",
   ]);
 
   await cdp.eval(clickByText("编辑", ".detail__title button"));
@@ -380,7 +397,6 @@ async function audit(cdp, { includeModals = true } = {}) {
     "编辑条目",
     "基本信息",
     "凭据",
-    "匹配用 URL",
     "密码规则",
     "使用规则",
     "不使用规则",
@@ -483,7 +499,9 @@ async function main() {
 
   if (cdp.errors.length) {
     console.log("\n---- 页面运行时错误 ----");
-    for (const error of [...new Set(cdp.errors)]) console.log(`  ERROR ${String(error).split("\n")[0]}`);
+    for (const error of [...new Set(cdp.errors)]) {
+      console.log(`  ERROR ${String(error).replace(/\s+/g, " ").slice(0, 400)}`);
+    }
   }
   if (command === "audit" || command === "sizes" || command === "resize" || command === "modal") {
     console.log(`\n---- ${results.pass.length} passed, ${results.fail.length} failed ----`);

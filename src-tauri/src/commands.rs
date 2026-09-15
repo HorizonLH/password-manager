@@ -77,14 +77,7 @@ pub fn app_bootstrap(state: State<'_, AppState>) -> AppResult<Bootstrap> {
         data_dir: store::data_dir().to_string_lossy().to_string(),
         vault_path: store::vault_path().to_string_lossy().to_string(),
         portable: store::is_portable(),
-        supported_formats: vec![
-            "JSON".to_string(),
-            ".env".to_string(),
-            "TOML".to_string(),
-            "YAML".to_string(),
-            "XML".to_string(),
-            "纯文本".to_string(),
-        ],
+        supported_formats: keys::supported_labels(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         startup_error: state.startup_error(),
     })
@@ -348,9 +341,6 @@ pub struct EntryInput {
     pub use_knox_id: bool,
     #[serde(default)]
     pub password: String,
-    /// URL (or host) used to pick the matching block inside a synced file.
-    #[serde(default)]
-    pub match_url: String,
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
@@ -457,7 +447,6 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                 entry.username = input.username.clone();
                 entry.use_knox_id = input.use_knox_id;
                 entry.password = new_password;
-                entry.match_url = input.match_url.trim().to_string();
                 entry.notes = input.notes.clone();
                 entry.favorite = input.favorite;
                 entry.rule = rule.clone();
@@ -473,7 +462,6 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                     username: input.username.clone(),
                     use_knox_id: input.use_knox_id,
                     password: new_password,
-                    match_url: input.match_url.trim().to_string(),
                     notes: input.notes.clone(),
                     favorite: input.favorite,
                     rule,
@@ -720,9 +708,6 @@ pub struct FileDraft {
     /// Omit to use the global default key words.
     #[serde(default)]
     pub keys: Option<KeyMapping>,
-    /// Accounts this file should be bound to right away.
-    #[serde(default)]
-    pub entry_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -787,14 +772,7 @@ pub fn file_add(state: State<'_, AppState>, drafts: Vec<FileDraft>) -> AppResult
             let mut keys = draft.keys.clone().unwrap_or_else(|| fallback.clone());
             keys.normalize();
 
-            let entry_ids: Vec<String> = draft
-                .entry_ids
-                .iter()
-                .filter(|id| vault.entries.iter().any(|entry| entry.id == **id))
-                .cloned()
-                .collect();
-
-            // A path may already be registered (e.g. bound to another account).
+            // A path may already be registered; then only its parse is refreshed.
             if let Some(existing) = vault
                 .files
                 .iter_mut()
@@ -804,17 +782,11 @@ pub fn file_add(state: State<'_, AppState>, drafts: Vec<FileDraft>) -> AppResult
                 existing.keys = keys;
                 existing.analysis = Some(analysis);
                 existing.refresh_stat();
-                for id in entry_ids {
-                    if !existing.entry_ids.contains(&id) {
-                        existing.entry_ids.push(id);
-                    }
-                }
                 continue;
             }
 
             let analysis = keys::analyze_file(Path::new(trimmed), &keys);
-            let mut file = SyncFile::from_path(trimmed, keys, Some(analysis));
-            file.entry_ids = entry_ids;
+            let file = SyncFile::from_path(trimmed, keys, Some(analysis));
             vault.files.push(file);
         }
         Ok(())
@@ -851,23 +823,54 @@ pub fn file_reanalyze(state: State<'_, AppState>, file_id: String) -> AppResult<
     vault_view(state)
 }
 
-/// Replaces the binding list of a file (many accounts per file).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingInput {
+    pub key_path: String,
+    pub entry_id: String,
+}
+
+/// Replaces the `(file, key) → account` bindings of one file. The key path is
+/// what sync writes to, so a file can serve several accounts unambiguously.
 #[tauri::command]
 pub fn file_bind(
     state: State<'_, AppState>,
     file_id: String,
-    entry_ids: Vec<String>,
+    bindings: Vec<BindingInput>,
 ) -> AppResult<VaultView> {
     state.with_vault_mut(|vault| {
         let known: Vec<String> = vault.entries.iter().map(|entry| entry.id.clone()).collect();
         let file = vault.file_mut(&file_id)?;
-        let mut next: Vec<String> = Vec::new();
-        for id in entry_ids {
-            if known.contains(&id) && !next.contains(&id) {
-                next.push(id);
+        let mut next: Vec<crate::model::FileBinding> = Vec::new();
+        for input in bindings {
+            let key = input.key_path.trim();
+            if key.is_empty() || !known.contains(&input.entry_id) {
+                continue;
             }
+            if file
+                .analysis
+                .as_ref()
+                .map(|analysis| analysis.value(key).is_none())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if next
+                .iter()
+                .any(|binding| binding.key_path == key && binding.entry_id == input.entry_id)
+            {
+                continue;
+            }
+            let existing = file
+                .bindings
+                .iter()
+                .find(|binding| binding.key_path == key && binding.entry_id == input.entry_id);
+            next.push(match existing {
+                Some(binding) => binding.clone(),
+                None => crate::model::FileBinding::new(key, &input.entry_id),
+            });
         }
-        file.entry_ids = next;
+        file.bindings = next;
         Ok(())
     })?;
     vault_view(state)
@@ -973,7 +976,7 @@ pub fn file_plan(state: State<'_, AppState>, file_id: String) -> AppResult<FileP
     state.touch();
     state.with_vault(|vault| {
         let file = vault.file(&file_id)?.clone();
-        sync::plan_file(vault, &file)
+        Ok(sync::plan_file(vault, &file))
     })
 }
 

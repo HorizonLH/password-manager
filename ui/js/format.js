@@ -73,31 +73,22 @@ export function ruleSummary(rule, { includeDescription = true } = {}) {
   return parts.join(" · ");
 }
 
-/** Host part of a URL, used as a compact subtitle. */
-export function urlHost(url) {
-  const value = (url || "").trim();
-  if (!value) return "";
-  const withoutScheme = value.replace(/^[a-z]+:\/\//i, "");
-  return withoutScheme.split(/[/?#]/)[0];
-}
 
 const FORMAT_LABELS = {
   json: "JSON",
   env: ".env",
   toml: "TOML",
+  ini: "INI",
+  properties: "properties",
+  hcl: "HCL / tfvars",
   yaml: "YAML",
   xml: "XML",
-  text: "文本",
+  unsupported: "不支持的格式",
 };
 
 export function formatLabel(format) {
   return FORMAT_LABELS[format] ?? format ?? "文本";
 }
 
-export const FIELD_LABELS = {
-  url: "URL",
-  username: "用户名",
-  password: "密码",
-};
-
-export const FIELD_ORDER = ["url", "username", "password"];
+/** Key names that get flagged as 「疑似密码」 when a file is parsed. */
+export const PASSWORD_KEY_HINT = "password / passwd / pwd / secret / passwort / kennwort / token";

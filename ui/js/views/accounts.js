@@ -5,6 +5,7 @@ import {
   state,
   setState,
   selectEntry,
+  navigate,
   copyPassword,
   copyUsername,
   copySap,
@@ -17,15 +18,12 @@ import {
 import { openModal } from "../modal.js";
 import { toast } from "../toast.js";
 import {
-  FIELD_LABELS,
-  FIELD_ORDER,
   formatBytes,
   formatLabel,
   formatTime,
   initials,
   mask,
   ruleSummary,
-  urlHost,
 } from "../format.js";
 import { openEntryEditor } from "./editor.js";
 import { openFileDialog, openFileKeys } from "./filedialog.js";
@@ -37,7 +35,9 @@ function effectiveUsername(entry) {
 }
 
 function filesFor(entryId) {
-  return (state.vault?.files ?? []).filter((file) => (file.entryIds ?? []).includes(entryId));
+  return (state.vault?.files ?? []).filter((file) =>
+    (file.bindings ?? []).some((binding) => binding.entryId === entryId),
+  );
 }
 
 function filterEntries() {
@@ -45,7 +45,7 @@ function filterEntries() {
   return (state.vault?.entries ?? []).filter((entry) => {
     if (state.categoryId !== "all" && entry.categoryId !== state.categoryId) return false;
     if (!term) return true;
-    return [entry.title, entry.username, entry.matchUrl]
+    return [entry.title, entry.username]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(term));
   });
@@ -53,7 +53,7 @@ function filterEntries() {
 
 function entryRow(entry) {
   const selected = state.selectedEntryId === entry.id;
-  const subtitle = entry.matchUrl || entry.username;
+  const subtitle = entry.username;
   return h(
     "div",
     {
@@ -140,61 +140,42 @@ function entryRow(entry) {
   );
 }
 
-function recordRow(record, highlight) {
+function bindingRow(entry, file, binding) {
+  const value = (file.analysis?.values ?? []).find((item) => item.path === binding.keyPath);
   return h(
     "div",
-    { class: `evidence${highlight ? "" : ""}` },
+    { class: "assoc__file" },
+    icon("key", { size: 13 }),
+    h("span", { class: "assoc__file-path", title: binding.keyPath }, binding.keyPath),
+    value
+      ? h(
+          "span",
+          { class: "tag tag--mono" },
+          mask(value.value, state.settings?.maskPasswords === false),
+        )
+      : h("span", { class: "tag tag--danger" }, "键已不存在"),
+    value?.passwordCandidate ? h("span", { class: "tag tag--warn" }, "疑似密码") : null,
     h(
-      "div",
-      { class: "token-list" },
-      h("span", { class: "tag tag--mono" }, record.path || "文件级"),
-      highlight ? h("span", { class: "tag tag--accent" }, "匹配到本账号") : null,
+      "button",
+      {
+        class: "btn btn--icon btn--sm",
+        type: "button",
+        title: "解除绑定",
+        onClick: guard(async () => {
+          const next = file.bindings
+            .filter((item) => item.id !== binding.id)
+            .map((item) => ({ keyPath: item.keyPath, entryId: item.entryId }));
+          await bindFile(file.id, next);
+          toast("已解除绑定", "success");
+        }),
+      },
+      icon("x", { size: 13 }),
     ),
-    ...FIELD_ORDER.map((kind) => {
-      const hit = (record.fields ?? []).find((field) => field.kind === kind);
-      return h(
-        "div",
-        { class: "evidence__row" },
-        h("span", { class: "field__label" }, FIELD_LABELS[kind]),
-        hit
-          ? h(
-              "span",
-              { class: "field__text", title: hit.value },
-              kind === "password" ? mask(hit.value, false) : hit.value,
-            )
-          : h("span", { class: "tag tag--warn" }, "未识别"),
-        hit ? h("span", { class: "tag tag--mono" }, `键 ${hit.key}`) : null,
-        hit
-          ? h(
-              "button",
-              {
-                class: "btn btn--icon btn--sm",
-                type: "button",
-                title: `复制${FIELD_LABELS[kind]}`,
-                onClick: guard(() => copyText(hit.value, FIELD_LABELS[kind])),
-              },
-              icon("copy", { size: 12 }),
-            )
-          : null,
-      );
-    }),
   );
 }
 
 function fileCard(entry, file) {
-  const records = file.analysis?.records ?? [];
-  const bare = (value) => urlHost(value).toLowerCase().split(":")[0];
-  const match = bare(entry.matchUrl ?? "");
-  const matchedIndex = match
-    ? records.findIndex((record) => {
-        const url = (record.fields ?? []).find((field) => field.kind === "url")?.value ?? "";
-        const host = bare(url);
-        return host === match || host.endsWith(`.${match}`) || match.endsWith(`.${host}`);
-      })
-    : records.length === 1
-      ? 0
-      : -1;
-
+  const mine = (file.bindings ?? []).filter((binding) => binding.entryId === entry.id);
   return h(
     "div",
     { class: "stack stack--tight" },
@@ -204,17 +185,14 @@ function fileCard(entry, file) {
       icon(file.exists ? "file" : "alert", { size: 14 }),
       h("span", { class: "assoc__file-path", title: file.path }, file.path),
       h("span", { class: "tag tag--accent" }, formatLabel(file.analysis?.format)),
-      h("span", { class: "tag tag--mono" }, `${records.length} 个凭据块`),
-      file.exists
-        ? h("span", { class: "tag tag--mono" }, formatBytes(file.size))
-        : h("span", { class: "tag tag--danger" }, "文件不存在"),
+      h("span", { class: "tag tag--mono" }, `${file.analysis?.values?.length ?? 0} 个键`),
       h(
         "button",
         {
           class: "btn btn--icon btn--sm",
           type: "button",
-          title: "关键词 / 重新检测",
-          onClick: () => openFileKeys({ file }),
+          title: "查看文件内容 / 选择密码键",
+          onClick: () => navigate("sync", { syncSelection: file.id }),
         },
         icon("sliders", { size: 13 }),
       ),
@@ -238,28 +216,18 @@ function fileCard(entry, file) {
         },
         icon("external", { size: 13 }),
       ),
-      h(
-        "button",
-        {
-          class: "btn btn--icon btn--sm",
-          type: "button",
-          title: "解除与该账号的绑定",
-          onClick: guard(async () => {
-            const next = (file.entryIds ?? []).filter((id) => id !== entry.id);
-            await bindFile(file.id, next);
-            toast("已解除绑定", "success");
-          }),
-        },
-        icon("x", { size: 13 }),
-      ),
     ),
-    records.length
+    mine.length
       ? h(
           "div",
           { class: "stack stack--tight" },
-          records.map((record, index) => recordRow(record, index === matchedIndex)),
+          mine.map((binding) => bindingRow(entry, file, binding)),
         )
-      : h("p", { class: "form__hint" }, "没有解析到凭据块，请调整关键词后重新检测。"),
+      : h(
+          "p",
+          { class: "form__hint" },
+          "还没有为这个账号选择密码键：到「同步文件」页点选。",
+        ),
   );
 }
 
@@ -493,20 +461,6 @@ function detailPane(entry) {
           ),
         ),
       ),
-      h(
-        "div",
-        { class: "field" },
-        h("span", { class: "field__label" }, "匹配用 URL（用于在同步文件中定位凭据块）"),
-        h(
-          "span",
-          { class: "field__value" },
-          h(
-            "span",
-            { class: "field__text", title: entry.matchUrl },
-            entry.matchUrl || "未设置",
-          ),
-        ),
-      ),
     ),
     h(
       "div",
@@ -575,7 +529,7 @@ function detailPane(entry) {
         : h(
             "p",
             { class: "form__hint" },
-            "还没有绑定文件。点击「添加文件」选择 JSON、.env、TOML、YAML、XML 或纯文本文件；同步时只会改写其中的密码。",
+            "还没有绑定文件。点击「添加文件」选择 JSON、.env、TOML/INI、YAML 或 XML 文件，再在「同步文件」页点选密码对应的键；同步只会改写这些键的值。",
           ),
     ),
     h(

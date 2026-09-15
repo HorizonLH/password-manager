@@ -1,8 +1,8 @@
-//! Syncing = writing each account's password back into the uploaded files.
+//! Syncing = writing each account's password into the key it is bound to.
 //!
-//! Only the password value is replaced; every other byte of the file is kept.
-//! Before writing, the updated document is re-parsed and compared with the
-//! original so a bad match can never corrupt a file.
+//! The binding `(file, key path) → account` is decided by the user in the UI, so
+//! nothing has to be guessed here. Only that key's value is replaced; every other
+//! byte of the file is kept, and the result is re-parsed before it is written.
 
 use std::path::Path;
 
@@ -10,37 +10,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::keys;
-use crate::model::{now_string, Entry, FileAnalysis, FileRecord, SyncFile, Vault};
+use crate::model::{now_string, FileAnalysis, SyncFile, Vault};
 use crate::patch::{self, Edit};
 
-/// What sync will do with one credential block inside a file.
+/// What syncing will do for one binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RecordPlan {
-    pub record_id: String,
-    pub path: String,
-    pub url: String,
-    pub username: String,
-    pub password: String,
-    /// `update` | `same` | `unbound` | `no-password` | `unreachable`
+pub struct PlanRow {
+    pub binding_id: String,
+    pub key_path: String,
+    pub key_label: String,
+    /// Current value in the file.
+    pub file_value: String,
+    /// `update` | `same` | `missing-key` | `no-password`
     pub action: String,
-    #[serde(default)]
-    pub account_id: Option<String>,
-    #[serde(default)]
-    pub account_title: Option<String>,
+    pub account_id: String,
+    pub account_title: String,
     #[serde(default)]
     pub new_password: Option<String>,
     #[serde(default)]
     pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UnmatchedAccount {
-    pub account_id: String,
-    pub account_title: String,
-    pub match_url: String,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,8 +40,7 @@ pub struct FilePlan {
     pub label: String,
     pub format: String,
     pub exists: bool,
-    pub records: Vec<RecordPlan>,
-    pub unmatched: Vec<UnmatchedAccount>,
+    pub rows: Vec<PlanRow>,
     pub updates: usize,
     pub status: String,
     #[serde(default)]
@@ -72,343 +60,148 @@ pub struct SyncOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// URL matching
-// ---------------------------------------------------------------------------
-
-fn normalize_url(value: &str) -> String {
-    let trimmed = value.trim().to_ascii_lowercase();
-    let without_scheme = match trimmed.find("://") {
-        Some(index) => trimmed[index + 3..].to_string(),
-        None => trimmed,
-    };
-    without_scheme.trim_end_matches('/').to_string()
-}
-
-fn host_of(value: &str) -> String {
-    let normalized = normalize_url(value);
-    let host = normalized.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or(host);
-    // Files often store `host:8443` while the account records just the host, so
-    // the port is ignored when comparing (IPv6 literals keep their brackets).
-    if host.starts_with('[') {
-        return host.split(']').next().unwrap_or(host).to_string() + "]";
-    }
-    host.split(':').next().unwrap_or(host).to_string()
-}
-
-/// Two URLs refer to the same system when their hosts match; the full URL is
-/// accepted too, so a path can disambiguate several blocks on one host.
-fn url_matches(account_url: &str, record_url: &str) -> bool {
-    let account = normalize_url(account_url);
-    let record = normalize_url(record_url);
-    if account.is_empty() || record.is_empty() {
-        return false;
-    }
-    if account == record {
-        return true;
-    }
-    let account_host = host_of(&account);
-    let record_host = host_of(&record);
-    !account_host.is_empty() && account_host == record_host
-}
-
-fn same_username(account: &str, record: &str) -> bool {
-    !account.is_empty() && !record.is_empty() && account.eq_ignore_ascii_case(record)
-}
-
-/// Picks the credential block that belongs to an account.
-fn match_record(
-    records: &[FileRecord],
-    account: &Entry,
-    account_username: &str,
-    bound_accounts: usize,
-) -> Result<usize, String> {
-    if records.is_empty() {
-        return Err("文件里没有解析到任何凭据块".to_string());
-    }
-
-    if !account.match_url.trim().is_empty() {
-        let candidates: Vec<usize> = records
-            .iter()
-            .enumerate()
-            .filter(|(_, record)| url_matches(&account.match_url, &record.url()))
-            .map(|(index, _)| index)
-            .collect();
-        match candidates.len() {
-            1 => return Ok(candidates[0]),
-            0 => {
-                return Err(format!(
-                    "文件里没有 URL 匹配「{}」的凭据块",
-                    account.match_url
-                ))
-            }
-            _ => {
-                if let Some(index) = candidates
-                    .iter()
-                    .copied()
-                    .find(|index| same_username(account_username, &records[*index].username()))
-                {
-                    return Ok(index);
-                }
-                return Err(format!(
-                    "有 {} 个凭据块的 URL 都匹配「{}」，且用户名无法区分",
-                    candidates.len(),
-                    account.match_url
-                ));
-            }
-        }
-    }
-
-    // No match URL: only unambiguous cases are allowed through.
-    if records.len() == 1 {
-        return Ok(0);
-    }
-    if bound_accounts == 1 {
-        if let Some(index) = records
-            .iter()
-            .position(|record| same_username(account_username, &record.username()))
-        {
-            return Ok(index);
-        }
-        return Ok(0);
-    }
-    Err("文件包含多个凭据块：请为该账号填写「匹配用 URL」".to_string())
-}
-
-// ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
 
-fn plan_for(
-    analysis: &FileAnalysis,
-    entries: &[(Entry, String)],
-    rows: &mut Vec<RecordPlan>,
-    unmatched: &mut Vec<UnmatchedAccount>,
-) -> AppResult<usize> {
-    let mut assigned: Vec<Option<usize>> = vec![None; analysis.records.len()];
+fn plan_from_analysis(vault: &Vault, file: &SyncFile, analysis: &FileAnalysis) -> FilePlan {
+    let mut rows: Vec<PlanRow> = Vec::new();
     let mut updates = 0usize;
 
-    for (index, (entry, username)) in entries.iter().enumerate() {
-        match match_record(&analysis.records, entry, username, entries.len()) {
-            Ok(record_index) => {
-                if let Some(previous) = assigned[record_index] {
-                    unmatched.push(UnmatchedAccount {
-                        account_id: entry.id.clone(),
-                        account_title: entry.title.clone(),
-                        match_url: entry.match_url.clone(),
-                        reason: format!("该凭据块已分配给「{}」", entries[previous].0.title),
-                    });
-                    continue;
-                }
-                assigned[record_index] = Some(index);
-                if entry.password.is_empty() {
-                    unmatched.push(UnmatchedAccount {
-                        account_id: entry.id.clone(),
-                        account_title: entry.title.clone(),
-                        match_url: entry.match_url.clone(),
-                        reason: "该账号没有保存密码".to_string(),
-                    });
-                }
-            }
-            Err(reason) => unmatched.push(UnmatchedAccount {
-                account_id: entry.id.clone(),
-                account_title: entry.title.clone(),
-                match_url: entry.match_url.clone(),
-                reason,
-            }),
-        }
-    }
-
-    for (index, record) in analysis.records.iter().enumerate() {
-        let owner = assigned[index].map(|slot| &entries[slot]);
-        let password_hit = record.hit("password");
-        let row = match owner {
-            None => RecordPlan {
-                record_id: record.id.clone(),
-                path: record.path.clone(),
-                url: record.url(),
-                username: record.username(),
-                password: record.password(),
-                action: "unbound".to_string(),
-                account_id: None,
-                account_title: None,
+    for binding in &file.bindings {
+        let Some(value) = analysis.value(&binding.key_path) else {
+            rows.push(PlanRow {
+                binding_id: binding.id.clone(),
+                key_path: binding.key_path.clone(),
+                key_label: key_label(&binding.key_path),
+                file_value: String::new(),
+                action: "missing-key".to_string(),
+                account_id: binding.entry_id.clone(),
+                account_title: account_title(vault, &binding.entry_id),
                 new_password: None,
-                detail: "该凭据块没有绑定账号".to_string(),
-            },
-            Some((entry, username)) => {
-                let mut notes: Vec<String> = Vec::new();
-                if !record.username().is_empty() && !same_username(username, &record.username()) {
-                    notes.push(format!(
-                        "用户名不一致（文件 {} / 账号 {}），未修改",
-                        record.username(),
-                        username
-                    ));
-                }
-                let (action, new_password, detail) = if entry.password.is_empty() {
-                    (
-                        "no-password".to_string(),
-                        None,
-                        "账号没有保存密码".to_string(),
-                    )
-                } else if password_hit.is_none() {
-                    (
-                        "no-password".to_string(),
-                        None,
-                        "该凭据块没有识别到密码字段".to_string(),
-                    )
-                } else if password_hit.and_then(|hit| hit.location.as_ref()).is_none() {
-                    (
-                        "unreachable".to_string(),
-                        None,
-                        "无法定位密码在文件中的位置".to_string(),
-                    )
-                } else if record.password() == entry.password {
-                    (
-                        "same".to_string(),
-                        Some(entry.password.clone()),
-                        "文件里的密码已是最新".to_string(),
-                    )
-                } else {
-                    updates += 1;
-                    (
-                        "update".to_string(),
-                        Some(entry.password.clone()),
-                        notes.join("；"),
-                    )
-                };
-                RecordPlan {
-                    record_id: record.id.clone(),
-                    path: record.path.clone(),
-                    url: record.url(),
-                    username: record.username(),
-                    password: record.password(),
-                    action,
-                    account_id: Some(entry.id.clone()),
-                    account_title: Some(entry.title.clone()),
-                    new_password,
-                    detail,
-                }
-            }
+                detail: "文件里已经没有这个键了".to_string(),
+            });
+            continue;
         };
-        rows.push(row);
+        let Ok(account) = vault.entry(&binding.entry_id) else {
+            continue;
+        };
+        let (action, new_password, detail) = if account.password.is_empty() {
+            (
+                "no-password".to_string(),
+                None,
+                "账号没有保存密码".to_string(),
+            )
+        } else if value.value == account.password {
+            (
+                "same".to_string(),
+                Some(account.password.clone()),
+                "文件里的密码已是最新".to_string(),
+            )
+        } else {
+            updates += 1;
+            (
+                "update".to_string(),
+                Some(account.password.clone()),
+                String::new(),
+            )
+        };
+        rows.push(PlanRow {
+            binding_id: binding.id.clone(),
+            key_path: binding.key_path.clone(),
+            key_label: key_label(&binding.key_path),
+            file_value: value.value.clone(),
+            action,
+            account_id: account.id.clone(),
+            account_title: account.title.clone(),
+            new_password,
+            detail,
+        });
     }
 
-    Ok(updates)
-}
-
-fn bound_entries(vault: &Vault, file: &SyncFile) -> Vec<(Entry, String)> {
-    file.entry_ids
-        .iter()
-        .filter_map(|id| vault.entry(id).ok())
-        .map(|entry| (entry.clone(), entry.effective_username(&vault.knox_id)))
-        .collect()
-}
-
-fn plan_from_analysis(
-    vault: &Vault,
-    file: &SyncFile,
-    analysis: &FileAnalysis,
-) -> AppResult<FilePlan> {
-    let mut rows: Vec<RecordPlan> = Vec::new();
-    let mut unmatched: Vec<UnmatchedAccount> = Vec::new();
-    let updates = plan_for(analysis, &bound_entries(vault, file), &mut rows, &mut unmatched)?;
-
-    let status = if file.entry_ids.is_empty() {
-        "尚未绑定账号".to_string()
+    let status = if file.bindings.is_empty() {
+        "尚未选择密码键".to_string()
     } else if updates > 0 {
         format!("{updates} 处将更新")
-    } else if !unmatched.is_empty() {
-        format!("无更新（{} 个账号未匹配）", unmatched.len())
+    } else if rows.iter().any(|row| row.action == "missing-key") {
+        "有绑定失效".to_string()
+    } else if rows.iter().any(|row| row.action == "no-password") {
+        "账号缺少密码".to_string()
     } else {
         "已是最新".to_string()
     };
 
-    Ok(FilePlan {
+    FilePlan {
         file_id: file.id.clone(),
         path: file.path.clone(),
         label: file.label.clone(),
         format: analysis.format.clone(),
         exists: file.exists,
-        records: rows,
-        unmatched,
+        rows,
         updates,
         status,
         error: analysis.error.clone(),
-    })
+    }
+}
+
+fn account_title(vault: &Vault, id: &str) -> String {
+    vault
+        .entry(id)
+        .map(|entry| entry.title.clone())
+        .unwrap_or_else(|_| "（已删除的账号）".to_string())
+}
+
+fn key_label(path: &str) -> String {
+    match path.rfind(['.', '@']) {
+        Some(index) => path[index + 1..].to_string(),
+        None => path.to_string(),
+    }
 }
 
 /// Re-reads the file from disk and reports what syncing would change.
-pub fn plan_file(vault: &Vault, file: &SyncFile) -> AppResult<FilePlan> {
+pub fn plan_file(vault: &Vault, file: &SyncFile) -> FilePlan {
     let loaded = keys::load(Path::new(&file.path), &file.keys);
     plan_from_analysis(vault, file, &loaded.analysis)
 }
 
 pub fn plan_all(vault: &Vault) -> Vec<FilePlan> {
-    vault
-        .files
-        .iter()
-        .map(|file| {
-            plan_file(vault, file).unwrap_or_else(|err| FilePlan {
-                file_id: file.id.clone(),
-                path: file.path.clone(),
-                label: file.label.clone(),
-                format: String::new(),
-                exists: file.exists,
-                records: Vec::new(),
-                unmatched: Vec::new(),
-                updates: 0,
-                status: "计划失败".to_string(),
-                error: Some(err.to_string()),
-            })
-        })
-        .collect()
+    vault.files.iter().map(|file| plan_file(vault, file)).collect()
 }
 
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
 
-/// Verifies that the edited document still parses to the same structure and that
-/// only the intended password values changed.
+/// The file must still parse to the same keys, and only the bound ones may have
+/// changed — otherwise nothing is written.
 fn verify(
     before: &FileAnalysis,
     after: &FileAnalysis,
-    expected: &[(usize, String)],
+    expected: &[(String, String)],
 ) -> AppResult<()> {
-    if before.records.len() != after.records.len() {
+    if before.values.len() != after.values.len() {
         return Err(AppError::Msg(
             "写入后的文件结构发生变化，已取消（未写入任何内容）".to_string(),
         ));
     }
-    for (index, (record_before, record_after)) in
-        before.records.iter().zip(after.records.iter()).enumerate()
-    {
-        let new_password = expected
-            .iter()
-            .find(|(target, _)| *target == index)
-            .map(|(_, value)| value.clone());
-        for kind in ["url", "username", "password"] {
-            let value_before = record_before.value(kind);
-            let value_after = record_after.value(kind);
-            if kind == "password" {
-                match &new_password {
-                    Some(expected_value) if value_after == *expected_value => {}
-                    Some(_) => {
-                        return Err(AppError::Msg(
-                            "写入后的密码校验失败，已取消（未写入任何内容）".to_string(),
-                        ))
-                    }
-                    None if value_after == value_before => {}
-                    None => {
-                        return Err(AppError::Msg(
-                            "写入后的文件内容发生变化，已取消（未写入任何内容）".to_string(),
-                        ))
-                    }
-                }
-            } else if value_after != value_before {
+    for (old, new) in before.values.iter().zip(after.values.iter()) {
+        if old.path != new.path {
+            return Err(AppError::Msg(
+                "写入后的键顺序发生变化，已取消（未写入任何内容）".to_string(),
+            ));
+        }
+        match expected.iter().find(|(path, _)| *path == old.path) {
+            Some((_, value)) if new.value == *value => {}
+            Some(_) => {
+                return Err(AppError::Msg(
+                    "写入后的密码校验失败，已取消（未写入任何内容）".to_string(),
+                ))
+            }
+            None if new.value == old.value => {}
+            None => {
                 return Err(AppError::Msg(format!(
-                    "写入影响了 {kind} 字段，已取消（未写入任何内容）"
-                )));
+                    "写入影响了未绑定的键 {}，已取消（未写入任何内容）",
+                    old.path
+                )))
             }
         }
     }
@@ -425,16 +218,29 @@ pub fn sync_file(vault: &Vault, file: &SyncFile, backup: bool) -> AppResult<Sync
         return Err(AppError::Msg(format!("文件不存在：{}", file.path)));
     }
 
-    let plan = plan_from_analysis(vault, file, &loaded.analysis)?;
-    let targets: Vec<(usize, String)> = plan
-        .records
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.action == "update")
-        .filter_map(|(index, row)| row.new_password.clone().map(|value| (index, value)))
-        .collect();
+    let plan = plan_from_analysis(vault, file, &loaded.analysis);
+    let mut edits: Vec<Edit> = Vec::new();
+    let mut expected: Vec<(String, String)> = Vec::new();
+    for row in &plan.rows {
+        if row.action != "update" {
+            continue;
+        }
+        let Some(password) = row.new_password.clone() else {
+            continue;
+        };
+        let Some(value) = loaded.analysis.value(&row.key_path) else {
+            continue;
+        };
+        let text = patch::encode_value(&loaded.analysis.format, &value.location, &password)?;
+        edits.push(Edit {
+            start: value.location.start,
+            end: value.location.end,
+            text,
+        });
+        expected.push((row.key_path.clone(), password));
+    }
 
-    if targets.is_empty() {
+    if edits.is_empty() {
         return Ok(SyncOutcome {
             file_id: file.id.clone(),
             path: file.path.clone(),
@@ -442,28 +248,13 @@ pub fn sync_file(vault: &Vault, file: &SyncFile, backup: bool) -> AppResult<Sync
             updates: 0,
             bytes: file.size as usize,
             backup_path: None,
-            status: plan.status.clone(),
-        });
-    }
-
-    let mut edits: Vec<Edit> = Vec::new();
-    for (index, password) in &targets {
-        let record = &loaded.analysis.records[*index];
-        let location = record
-            .hit("password")
-            .and_then(|hit| hit.location.as_ref())
-            .ok_or_else(|| AppError::Msg("无法定位密码位置".to_string()))?;
-        let text = patch::encode_value(&loaded.analysis.format, location, password)?;
-        edits.push(Edit {
-            start: location.start,
-            end: location.end,
-            text,
+            status: plan.status,
         });
     }
 
     let updated_text = patch::apply(&loaded.text, &edits)?;
     let after = keys::analyze_text(&updated_text, &loaded.analysis.format, &file.keys);
-    verify(&loaded.analysis, &after, &targets)?;
+    verify(&loaded.analysis, &after, &expected)?;
 
     let bytes = patch::encode(&updated_text, loaded.encoding);
     let mut backup_path = None;
@@ -485,10 +276,10 @@ pub fn sync_file(vault: &Vault, file: &SyncFile, backup: bool) -> AppResult<Sync
         file_id: file.id.clone(),
         path: file.path.clone(),
         changed: true,
-        updates: targets.len(),
+        updates: expected.len(),
         bytes: bytes.len(),
         backup_path,
-        status: format!("已更新 {} 处密码", targets.len()),
+        status: format!("已更新 {} 处密码", expected.len()),
     })
 }
 
@@ -506,9 +297,15 @@ pub fn stamp(file: &mut SyncFile, outcome: &SyncOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Category, KeyMapping, PasswordRule};
+    use crate::model::{Category, Entry, FileBinding, KeyMapping, PasswordRule};
 
-    fn account(id: &str, title: &str, username: &str, match_url: &str, password: &str) -> Entry {
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sapvault-sync-{}", crate::model::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn account(id: &str, title: &str, username: &str, password: &str) -> Entry {
         Entry {
             id: id.to_string(),
             title: title.to_string(),
@@ -516,7 +313,6 @@ mod tests {
             username: username.to_string(),
             use_knox_id: false,
             password: password.to_string(),
-            match_url: match_url.to_string(),
             notes: String::new(),
             favorite: false,
             rule: Some(PasswordRule::default()),
@@ -528,251 +324,209 @@ mod tests {
         }
     }
 
-    fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("sapvault-sync-{}", crate::model::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn vault_with(entries: Vec<Entry>, file: SyncFile) -> (Vault, SyncFile) {
+    fn setup(path: &std::path::Path, text: &str, format: &str, bindings: &[(&str, &str)]) -> (Vault, SyncFile) {
+        std::fs::write(path, text).unwrap();
+        let keys = KeyMapping::default();
+        let analysis = keys::analyze_text(text, format, &keys);
+        let mut file = SyncFile::from_path(&path.to_string_lossy(), keys, Some(analysis));
+        file.bindings = bindings
+            .iter()
+            .map(|(key, entry)| FileBinding::new(key, entry))
+            .collect();
         let mut vault = Vault {
             categories: vec![Category::sap(), Category::general()],
-            entries,
             ..Vault::default()
         };
-        vault.files.push(file);
-        let file = vault.files[0].clone();
+        vault.files.push(file.clone());
         (vault, file)
     }
 
-    fn sample_file(path: &str, text: &str, format: &str, entry_ids: Vec<String>) -> SyncFile {
-        let keys = KeyMapping::default();
-        let analysis = keys::analyze_text(text, format, &keys);
-        let mut file = SyncFile::from_path(path, keys, Some(analysis));
-        file.entry_ids = entry_ids;
-        file
-    }
-
     #[test]
-    fn single_record_file_syncs_without_a_match_url() {
+    fn one_file_two_keys_two_accounts() {
         let dir = temp_dir();
-        let path = dir.join("single.json");
-        let original = "{\n  \"url\": \"https://prd.corp.example\",\n  \"username\": \"JDOE\",\n  \"password\": \"old-pw\"\n}\n";
-        std::fs::write(&path, original).unwrap();
-
-        let entry = account("e1", "PRD", "JDOE", "", "new-pw");
-        let file = sample_file(&path.to_string_lossy(), original, "json", vec!["e1".into()]);
-        let (vault, file) = vault_with(vec![entry], file);
-
-        let plan = plan_file(&vault, &file).unwrap();
-        assert_eq!(plan.updates, 1, "{:?}", plan.records);
-        assert_eq!(plan.records[0].action, "update");
-
-        let outcome = sync_file(&vault, &file, false).unwrap();
-        assert!(outcome.changed);
-        assert_eq!(outcome.updates, 1);
-        let updated = std::fs::read_to_string(&path).unwrap();
-        assert!(updated.contains("\"password\": \"new-pw\""));
-        assert!(updated.contains("\"username\": \"JDOE\""));
-        assert!(updated.starts_with("{\n  \"url\": \"https://prd.corp.example\","));
-    }
-
-    #[test]
-    fn multiple_records_use_the_match_url() {
-        let dir = temp_dir();
-        let path = dir.join("multi.json");
-        let original = r#"{
-  "systems": {
-    "prd": { "url": "https://prd.corp.example", "username": "PRDUSER", "password": "prd-old" },
-    "dev": { "url": "https://dev.corp.example", "username": "DEVUSER", "password": "dev-old" }
-  }
-}
-"#;
-        std::fs::write(&path, original).unwrap();
-
-        let prd = account("e1", "PRD", "PRDUSER", "prd.corp.example", "prd-new");
-        let dev = account("e2", "DEV", "DEVUSER", "https://dev.corp.example/", "dev-new");
-        let file = sample_file(
-            &path.to_string_lossy(),
+        let path = dir.join("two.json");
+        let original = "{\n  \"prd\": { \"password\": \"old-prd\" },\n  \"dev\": { \"password\": \"old-dev\" }\n}\n";
+        let (vault, file) = setup(
+            &path,
             original,
             "json",
-            vec!["e1".into(), "e2".into()],
+            &[("prd.password", "e1"), ("dev.password", "e2")],
         );
-        let (vault, file) = vault_with(vec![prd, dev], file);
+        let mut vault = vault;
+        vault.entries.push(account("e1", "PRD", "u", "new-prd"));
+        vault.entries.push(account("e2", "DEV", "u", "new-dev"));
 
-        let plan = plan_file(&vault, &file).unwrap();
-        assert_eq!(plan.updates, 2, "{:?}", plan.records);
-        assert_eq!(plan.unmatched.len(), 0, "{:?}", plan.unmatched);
-        assert!(
-            plan.records.iter().all(|row| row.action == "update"),
-            "{:?}",
-            plan.records
-        );
+        let plan = plan_file(&vault, &file);
+        assert_eq!(plan.updates, 2, "{:?}", plan.rows);
 
-        sync_file(&vault, &file, true).unwrap();
-        let updated = std::fs::read_to_string(&path).unwrap();
-        assert!(updated.contains("\"password\": \"prd-new\""));
-        assert!(updated.contains("\"password\": \"dev-new\""));
-        assert!(updated.contains("\"username\": \"PRDUSER\""));
-        assert!(updated.contains("\"username\": \"DEVUSER\""));
-        assert_eq!(updated.matches('\n').count(), original.matches('\n').count());
-    }
-
-    #[test]
-    fn a_port_in_the_url_does_not_prevent_matching() {
-        let text = "{\"url\":\"https://prd.corp.example:8443\",\"username\":\"u\",\"password\":\"old\"}";
-        let entry = account("e1", "PRD", "u", "prd.corp.example", "new");
-        let file = sample_file("C:/demo/port.json", text, "json", vec!["e1".into()]);
-        let (vault, file) = vault_with(vec![entry], file);
-        let plan = plan_from_analysis(&vault, &file, &file.analysis.clone().unwrap()).unwrap();
-        assert_eq!(plan.updates, 1, "{:?}", plan.records);
-    }
-
-    #[test]
-    fn env_files_group_by_key_prefix() {
-        let text = "SAP_PRD_URL=https://prd.corp.example\nSAP_PRD_USER=JDOE\nSAP_PRD_PASSWORD=old\n\nSAP_DEV_URL=https://dev.corp.example\nSAP_DEV_USER=JDOE\nSAP_DEV_PASSWORD=old\n";
-        let keys = KeyMapping::default();
-        let analysis = keys::analyze_text(text, "env", &keys);
-        assert_eq!(analysis.records.len(), 2, "{:?}", analysis.records);
-        assert_eq!(analysis.records[0].path, "SAP_PRD");
-        assert_eq!(analysis.records[1].path, "SAP_DEV");
-        assert!(analysis.missing.is_empty());
-    }
-
-    #[test]
-    fn ambiguous_files_ask_for_a_match_url() {
-        let dir = temp_dir();
-        let path = dir.join("ambiguous.json");
-        let text = "{\"a\":{\"url\":\"https://a.example\",\"password\":\"1\"},\"b\":{\"url\":\"https://b.example\",\"password\":\"2\"}}";
-        std::fs::write(&path, text).unwrap();
-        let entry = account("e1", "A", "user", "", "new");
-        let other = account("e2", "B", "user", "", "new");
-        let file = sample_file(
-            &path.to_string_lossy(),
-            text,
-            "json",
-            vec!["e1".into(), "e2".into()],
-        );
-        let (vault, file) = vault_with(vec![entry, other], file);
-        let plan = plan_file(&vault, &file).unwrap();
-        assert_eq!(plan.updates, 0);
-        assert!(
-            plan.unmatched.iter().any(|item| item.reason.contains("匹配用 URL")),
-            "{:?}",
-            plan.unmatched
-        );
-    }
-
-    #[test]
-    fn unbound_records_are_reported_not_changed() {
-        let dir = temp_dir();
-        let path = dir.join("unbound.json");
-        let text = "{\"url\":\"https://a.example\",\"password\":\"1\"}";
-        std::fs::write(&path, text).unwrap();
-        let file = sample_file(&path.to_string_lossy(), text, "json", Vec::new());
-        let (vault, file) = vault_with(Vec::new(), file);
-        let plan = plan_file(&vault, &file).unwrap();
-        assert_eq!(plan.updates, 0);
-        assert_eq!(plan.records[0].action, "unbound");
-    }
-
-    #[test]
-    fn sync_keeps_the_original_encoding_and_comments() {
-        let dir = temp_dir();
-        let path = dir.join("app.conf");
-        let original = "# 生产环境配置\nurl = \"https://prd.corp.example\"\nuser = \"JDOE\"\npassword = \"old\" # 每季度轮换\n";
-        std::fs::write(&path, original).unwrap();
-
-        let entry = account("e1", "PRD", "JDOE", "", "new-pw!");
-        let file = sample_file(&path.to_string_lossy(), original, "toml", vec!["e1".into()]);
-        let (vault, file) = vault_with(vec![entry], file);
         sync_file(&vault, &file, false).unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("\"password\": \"new-prd\""), "{updated}");
+        assert!(updated.contains("\"password\": \"new-dev\""), "{updated}");
+        // Structure, spacing and order are untouched.
+        assert_eq!(updated.matches('\n').count(), original.matches('\n').count());
+        assert!(updated.starts_with("{\n  \"prd\": { \"password\":"));
+    }
 
+    #[test]
+    fn a_deleted_key_is_reported_not_written() {
+        let dir = temp_dir();
+        let path = dir.join("gone.json");
+        let (vault, file) = setup(&path, "{\"a\":{\"password\":\"x\"}}", "json", &[("b.password", "e1")]);
+        let mut vault = vault;
+        vault.entries.push(account("e1", "A", "u", "new"));
+        let plan = plan_file(&vault, &file);
+        assert_eq!(plan.updates, 0);
+        assert_eq!(plan.rows[0].action, "missing-key");
+        let outcome = sync_file(&vault, &file, false).unwrap();
+        assert!(!outcome.changed);
+    }
+
+    #[test]
+    fn only_the_bound_key_changes() {
+        let dir = temp_dir();
+        let path = dir.join("mixed.env");
+        let original = "SAP_PRD_URL=https://prd.example\nSAP_PRD_PASSWORD=old\nSAP_DEV_PASSWORD=keep-me\n";
+        let (vault, file) = setup(&path, original, "env", &[("SAP_PRD_PASSWORD", "e1")]);
+        let mut vault = vault;
+        vault.entries.push(account("e1", "PRD", "u", "new-pw"));
+
+        sync_file(&vault, &file, false).unwrap();
         let updated = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             updated,
-            "# 生产环境配置\nurl = \"https://prd.corp.example\"\nuser = \"JDOE\"\npassword = \"new-pw!\" # 每季度轮换\n"
+            "SAP_PRD_URL=https://prd.example\nSAP_PRD_PASSWORD=new-pw\nSAP_DEV_PASSWORD=keep-me\n"
         );
     }
 
     #[test]
-    fn xml_sync_only_touches_the_password_text() {
+    fn xml_element_and_attribute_values_can_be_bound() {
         let dir = temp_dir();
         let path = dir.join("logon.xml");
-        let original = "<config>\n  <system id=\"PRD\">\n    <url>https://prd.corp.example</url>\n    <username>JDOE</username>\n    <password>old&amp;1</password>\n  </system>\n</config>\n";
-        std::fs::write(&path, original).unwrap();
+        let original = "<config>\n  <system id=\"PRD\" password=\"old-attr\">\n    <password>old-text</password>\n  </system>\n</config>\n";
+        let (vault, file) = setup(
+            &path,
+            original,
+            "xml",
+            &[("config.system@password", "e1"), ("config.system.password", "e2")],
+        );
+        let mut vault = vault;
+        vault.entries.push(account("e1", "PRD", "u", "a&b<c"));
+        vault.entries.push(account("e2", "PRD2", "u", "text-new"));
 
-        let entry = account("e1", "PRD", "JDOE", "", "a&b<c");
-        let file = sample_file(&path.to_string_lossy(), original, "xml", vec!["e1".into()]);
-        let (vault, file) = vault_with(vec![entry], file);
-        let plan = plan_file(&vault, &file).unwrap();
-        assert_eq!(plan.updates, 1, "{:?}", plan.records);
-
+        let plan = plan_file(&vault, &file);
+        assert_eq!(plan.updates, 2, "{:?}", plan.rows);
         sync_file(&vault, &file, false).unwrap();
         let updated = std::fs::read_to_string(&path).unwrap();
-        assert!(updated.contains("<password>a&amp;b&lt;c</password>"), "{updated}");
-        assert!(updated.contains("<url>https://prd.corp.example</url>"));
-        assert!(updated.contains("<system id=\"PRD\">"));
+        assert!(updated.contains("password=\"a&amp;b&lt;c\""), "{updated}");
+        assert!(updated.contains("<password>text-new</password>"), "{updated}");
+        assert!(updated.contains("<system id=\"PRD\""));
     }
 
     #[test]
-    fn blank_line_separated_text_blocks_are_separate_records() {
-        let text = "系统一\nurl: https://a.example\nuser: JDOE\npassword: one\n\n系统二\nurl: https://b.example\nuser: JDOE\npassword: two\n";
-        let keys = KeyMapping::default();
-        let analysis = keys::analyze_text(text, "text", &keys);
-        assert_eq!(analysis.records.len(), 2, "{:?}", analysis.records);
-        assert_eq!(analysis.records[0].password(), "one");
-        assert_eq!(analysis.records[1].password(), "two");
-    }
-
-    #[test]
-    fn passwords_needing_quotes_are_quoted() {
+    fn toml_comments_and_quoting_survive() {
         let dir = temp_dir();
-        let path = dir.join("plain.env");
-        let original = "url=https://prd.corp.example\nuser=JDOE\npassword=old\n";
-        std::fs::write(&path, original).unwrap();
+        let path = dir.join("app.conf");
+        let original = "# 生产环境\n[prd]\nurl = \"https://prd.example\"\npassword = \"old\" # 每季度轮换\n";
+        let (vault, file) = setup(&path, original, "toml", &[("prd.password", "e1")]);
+        let mut vault = vault;
+        vault.entries.push(account("e1", "PRD", "u", "has space#and=signs"));
 
-        let entry = account("e1", "PRD", "JDOE", "", "has space#and=signs");
-        let file = sample_file(&path.to_string_lossy(), original, "env", vec!["e1".into()]);
-        let (vault, file) = vault_with(vec![entry], file);
         sync_file(&vault, &file, false).unwrap();
-
-        let updated = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            updated.contains("password=\"has space#and=signs\""),
-            "{updated}"
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# 生产环境\n[prd]\nurl = \"https://prd.example\"\npassword = \"has space#and=signs\" # 每季度轮换\n"
         );
     }
 
     #[test]
-    fn backup_contains_the_original_file() {
+    fn yaml_nested_keys_are_addressable() {
         let dir = temp_dir();
-        let path = dir.join("b.json");
-        let original = "{\"url\":\"https://a.example\",\"username\":\"u\",\"password\":\"old\"}";
-        std::fs::write(&path, original).unwrap();
-
-        let entry = account("e1", "A", "u", "", "new");
-        let file = sample_file(&path.to_string_lossy(), original, "json", vec!["e1".into()]);
-        let (vault, file) = vault_with(vec![entry], file);
-        let outcome = sync_file(&vault, &file, true).unwrap();
-        let backup = outcome.backup_path.expect("backup path");
-        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        let path = dir.join("app.yml");
+        let original = "sap:\n  prd:\n    password: old\n  dev:\n    password: old2\n";
+        let (vault, file) = setup(
+            &path,
+            original,
+            "yaml",
+            &[("sap.prd.password", "e1"), ("sap.dev.password", "e2")],
+        );
+        let mut vault = vault;
+        vault.entries.push(account("e1", "PRD", "u", "p1"));
+        vault.entries.push(account("e2", "DEV", "u", "p2"));
+        sync_file(&vault, &file, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "sap:\n  prd:\n    password: p1\n  dev:\n    password: p2\n"
+        );
     }
 
     #[test]
-    fn a_second_sync_is_a_no_op() {
+    fn backup_contains_the_original_and_second_sync_is_a_no_op() {
         let dir = temp_dir();
-        let path = dir.join("c.json");
-        let original = "{\"url\":\"https://a.example\",\"username\":\"u\",\"password\":\"old\"}";
-        std::fs::write(&path, original).unwrap();
-        let entry = account("e1", "A", "u", "", "new");
-        let file = sample_file(&path.to_string_lossy(), original, "json", vec!["e1".into()]);
-        let (vault, file) = vault_with(vec![entry], file);
-        sync_file(&vault, &file, false).unwrap();
+        let path = dir.join("b.json");
+        let original = "{\"a\":{\"password\":\"old\"}}";
+        let (vault, file) = setup(&path, original, "json", &[("a.password", "e1")]);
+        let mut vault = vault;
+        vault.entries.push(account("e1", "A", "u", "new"));
+
+        let outcome = sync_file(&vault, &file, true).unwrap();
+        let backup = outcome.backup_path.expect("backup");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
 
         let after_first = std::fs::read_to_string(&path).unwrap();
-        let outcome = sync_file(&vault, &file, false).unwrap();
-        assert!(!outcome.changed);
+        let second = sync_file(&vault, &file, false).unwrap();
+        assert!(!second.changed);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+    }
+
+    #[test]
+    fn password_candidates_come_from_the_key_names() {
+        let text = "{\"sap\":{\"password\":\"x\",\"user\":\"u\",\"token\":\"t\",\"url\":\"https://a\"}}";
+        let analysis = keys::analyze_text(text, "json", &KeyMapping::default());
+        let candidates: Vec<String> = analysis
+            .values
+            .iter()
+            .filter(|value| value.password_candidate)
+            .map(|value| value.path.clone())
+            .collect();
+        assert!(candidates.contains(&"sap.password".to_string()), "{candidates:?}");
+        assert!(candidates.contains(&"sap.token".to_string()), "{candidates:?}");
+        assert!(!candidates.contains(&"sap.user".to_string()), "{candidates:?}");
+        assert_eq!(analysis.values.len(), 4);
+    }
+
+    #[test]
+    fn unsupported_formats_are_rejected() {
+        let analysis = keys::analyze_text("hello", "unsupported", &KeyMapping::default());
+        assert!(analysis.error.is_some());
+        assert!(analysis.values.is_empty());
+        assert!(keys::detect_format(std::path::Path::new("C:/x/notes.txt")) == "unsupported");
+        assert!(keys::is_supported(std::path::Path::new("C:/x/app.properties")));
+        assert!(keys::is_supported(std::path::Path::new("C:/x/app.xml")));
+    }
+
+    /// Common configuration files share the `key = value` shape but keep their
+    /// own label, so the UI can say INI / properties / tfvars instead of TOML.
+    #[test]
+    fn config_dialects_keep_their_own_label() {
+        let detect = |name: &str| keys::detect_format(std::path::Path::new(name)).to_string();
+        assert_eq!(detect("C:/x/app.ini"), "ini");
+        assert_eq!(detect("C:/x/app.conf"), "ini");
+        assert_eq!(detect("C:/x/app.properties"), "properties");
+        assert_eq!(detect("C:/x/main.tfvars"), "hcl");
+        assert_eq!(detect("C:/x/app.toml"), "toml");
+        assert_eq!(detect("C:/x/.env"), "env");
+        for name in ["C:/x/app.ini", "C:/x/app.properties", "C:/x/main.tfvars"] {
+            assert!(keys::is_supported(std::path::Path::new(name)), "{name}");
+        }
+
+        let text = "[sap]\r\npassword = \"Geheim1!\"\r\n# comment\r\n";
+        for format in ["ini", "properties", "hcl"] {
+            let analysis = keys::analyze_text(text, format, &KeyMapping::default());
+            assert!(analysis.error.is_none(), "{format}: {:?}", analysis.error);
+            let value = analysis.value("sap.password").expect("sap.password");
+            assert_eq!(value.value, "Geheim1!");
+            assert!(value.password_candidate);
+        }
     }
 }

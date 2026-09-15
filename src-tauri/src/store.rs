@@ -288,17 +288,28 @@ pub fn normalize_vault(vault: &mut Vault) {
     let known_entries: Vec<String> = vault.entries.iter().map(|entry| entry.id.clone()).collect();
     for file in vault.files.iter_mut() {
         file.keys.normalize();
-        // Drop bindings that point at deleted entries.
-        file.entry_ids.retain(|id| known_entries.contains(id));
-        file.entry_ids.dedup();
-        file.refresh_stat();
-        if let Some(analysis) = file.analysis.as_mut() {
-            for record in analysis.records.iter_mut() {
-                if record.id.is_empty() {
-                    record.id = crate::model::new_id();
+        // Drop bindings that point at deleted entries or at keys that are gone.
+        file.bindings.retain(|binding| {
+            known_entries.contains(&binding.entry_id)
+                && file
+                    .analysis
+                    .as_ref()
+                    .map(|analysis| analysis.value(&binding.key_path).is_some())
+                    .unwrap_or(false)
+        });
+        if file.bindings.len() > 1 {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            file.bindings.retain(|binding| {
+                let key = (binding.key_path.clone(), binding.entry_id.clone());
+                if seen.contains(&key) {
+                    false
+                } else {
+                    seen.push(key);
+                    true
                 }
-            }
+            });
         }
+        file.refresh_stat();
     }
     // Two files must not point at the same path twice.
     let mut seen_paths: Vec<String> = Vec::new();
@@ -318,7 +329,7 @@ pub fn normalize_vault(vault: &mut Vault) {
 /// Schema 1 stored content files inside each entry (`entry.links`). Fold those
 /// into the shared file list so a file can be bound to several accounts.
 fn migrate_legacy_links(vault: &mut Vault) {
-    if vault.schema >= crate::model::VAULT_SCHEMA || vault.legacy_links.is_empty() {
+    if vault.schema >= 3 || vault.legacy_links.is_empty() {
         vault.legacy_links.clear();
         vault.schema = crate::model::VAULT_SCHEMA;
         return;
@@ -331,17 +342,12 @@ fn migrate_legacy_links(vault: &mut Vault) {
                 .iter_mut()
                 .find(|file| file.path.eq_ignore_ascii_case(&link.path));
             match existing {
-                Some(file) => {
-                    if !file.entry_ids.contains(&group.entry_id) {
-                        file.entry_ids.push(group.entry_id.clone());
-                    }
-                }
+                Some(_) => {}
                 None => {
                     let mut keys = link.keys;
                     keys.normalize();
                     let analysis = crate::keys::analyze_file(std::path::Path::new(&link.path), &keys);
-                    let mut file = crate::model::SyncFile::from_path(&link.path, keys, Some(analysis));
-                    file.entry_ids = vec![group.entry_id.clone()];
+                    let file = crate::model::SyncFile::from_path(&link.path, keys, Some(analysis));
                     vault.files.push(file);
                 }
             }
@@ -440,7 +446,6 @@ mod tests {
             username: String::new(),
             use_knox_id: false,
             password: String::new(),
-            match_url: String::new(),
             notes: String::new(),
             favorite: false,
             rule: None,
@@ -545,28 +550,29 @@ mod tests {
         normalize_vault(&mut vault);
         assert_eq!(vault.schema, crate::model::VAULT_SCHEMA);
         assert_eq!(vault.files.len(), 1);
-        assert_eq!(vault.files[0].entry_ids, vec!["sap".to_string()]);
+        assert!(vault.files[0].bindings.is_empty());
         assert!(vault.legacy_links.is_empty());
     }
 
     #[test]
-    fn normalize_prunes_bindings_and_normalizes_file_keys() {
+    fn normalize_prunes_dangling_bindings() {
         let mut vault = Vault::default();
         vault.entries.push(blank_entry("sap", SAP_CATEGORY_ID));
-        let mut keys = KeyMapping::default();
-        keys.username = vec!["  ".to_string(), "  ".to_string()];
-        let mut file = SyncFile::from_path("C:/demo/a.json", keys, None);
-        file.entry_ids = vec!["sap".to_string(), "deleted".to_string()];
+        let keys = KeyMapping::default();
+        let analysis = crate::keys::analyze_text("{\"a\":{\"password\":\"x\"}}", "json", &keys);
+        let mut file = SyncFile::from_path("C:/demo/a.json", keys, Some(analysis));
+        file.bindings = vec![
+            crate::model::FileBinding::new("a.password", "sap"),
+            crate::model::FileBinding::new("a.password", "deleted"),
+            crate::model::FileBinding::new("a.gone", "sap"),
+        ];
         vault.files.push(file);
-        vault.files.push(SyncFile::from_path("C:/demo/a.json", KeyMapping::default(), None));
 
         normalize_vault(&mut vault);
-        assert_eq!(vault.files.len(), 1, "duplicate paths are merged");
-        assert_eq!(vault.files[0].entry_ids, vec!["sap".to_string()]);
-        assert_eq!(
-            vault.files[0].keys.username,
-            KeyMapping::default().username
-        );
+        assert_eq!(vault.files.len(), 1);
+        assert_eq!(vault.files[0].bindings.len(), 1);
+        assert_eq!(vault.files[0].bindings[0].entry_id, "sap");
+        assert_eq!(vault.files[0].bindings[0].key_path, "a.password");
     }
 
     #[test]
@@ -577,8 +583,6 @@ mod tests {
             clipboard_clear_seconds: 100_000,
             auto_lock_minutes: 100_000,
             key_mapping: KeyMapping {
-                url: Vec::new(),
-                username: Vec::new(),
                 password: Vec::new(),
                 ignore_case: true,
                 exact: false,
@@ -595,7 +599,7 @@ mod tests {
         assert_eq!(settings.sap_line_separator, "\r\n");
         assert_eq!(settings.clipboard_clear_seconds, 600);
         assert_eq!(settings.auto_lock_minutes, 240);
-        assert!(!settings.key_mapping.url.is_empty());
+        assert!(!settings.key_mapping.password.is_empty());
         let rule = settings.default_rule.unwrap();
         assert!(rule.max_length >= rule.min_length);
     }

@@ -14,81 +14,72 @@
 | 能力 | 说明 |
 | --- | --- |
 | 账号与密码 | 任意分类下的账号；本地加密保存，详情面板可复制用户名/密码 |
-| SAP 换行复制 | SAP 分类的账号提供「复制用户名 + 密码」，按 `CRLF` 拼成两行，可直接粘贴进 SAP GUI 登录界面 |
+| SAP 换行复制 | SAP 分类的账号提供「复制用户名 + 密码」，拼成两行（默认 `CRLF`），可直接粘贴进 SAP GUI 登录界面 |
 | 全局 Knox ID | 侧边栏常驻；条目勾选「使用全局 Knox ID」后，用户名、复制与同步输出都改用该值 |
 | 分类 | SAP 为固定分类（不可重命名/删除），另有通用分类与自定义分类 |
-| 同步内容文件 | 账号下挂载 JSON、`.env`、TOML、YAML、XML 或纯文本文件，自动解析出 URL / 用户名 / 密码 |
-| 关键词可指定 | 解析不到的字段可以让用户指定关键词，逐文件覆盖，可随时重新检测 |
-| 全局配置同步 | 把账号与解析结果按模板写入 MCP/JSON、`.env`、TOML、YAML、CSV 或纯文本文件 |
+| 上传同步文件 | 选择 JSON、`.env`、TOML / INI / `.properties` / `.tfvars`、YAML、XML 文件，解析结果**可视化呈现**（树或表格），每个键都带行号与「疑似密码」标记 |
+| 点选密码键并绑定 | 关系是 **(文件 + 键) → 账号**：一个文件可以绑定多个账号（各选不同的键），一个账号也可以绑定多个文件；同步只改写被绑定的键 |
+| 只改密码 | 同步在原文件**原地替换**这些键的值，其它字节（注释、缩进、键顺序、编码、引号风格）保持原样；写入前校验，并按设置保留备份 |
 | 密码规则 | 每个条目可加规则，也可以完全不加；支持按规则生成与校验 |
 | 密码循环与历史 | 设置循环周期（例如 5），自动记录历史密码并拦截重复 |
 | 主题 | 暗色 / 亮色 / 跟随系统 |
 | 锁定 | 启动、锁屏（Win+L）、空闲、手动都会锁定；解锁前内存中没有明文 |
 | 便携模式 | exe 旁放 `portable.txt` 即把所有数据写在同目录，适合 U 盘携带 |
 
-> 关于最初的「维护 SAP 系统 ID + 读取 SAPUILandscape.xml + 扫描磁盘」需求：
-> 按后续确认，这三项**已全部移除**。账号身份改由同步文件里的 URL 表达，
-> 关联关系由用户在界面上的选择确定。
+> 早期设想里的 **SAP 系统 ID、读取 SAPUILandscape.xml、按 IP 扫描 C 盘、纯文本文件、
+> 用 URL 自动匹配账号** 都已移除。原因是它们都需要「猜」文件里的哪个值对应哪个账号；
+> 现在由用户在界面上直接点选密码所在的键，关系明确且不会误改文件。
 
 ---
 
 ## 2. 同步流程（当前设计）
 
-### 2.1 先选账号，再添加文件
+### 2.1 三步
 
-1. 打开要同步的 SAP 账号；
-2. 在详情面板点击「添加文件」，选择该账号对应的配置文件
-   （JSON、`.env`、TOML、YAML、XML 或纯文本）；
-3. SapVault 按固定规则解析文件，弹出确认窗口显示每个文件里识别到的
-   **URL / 用户名 / 密码**（含命中的键名与行号）；
-4. 若某个字段没找到，可直接在弹窗里为它填写关键词并「重新检测」，
-   也可以套用其它文件的关键词或恢复默认；
-5. 确认后写入保险库，之后随时可以调整关键词或重新检测。
+1. **上传文件**：在「同步文件」页点「上传文件」（也可以在某个 SAP 账号的详情里点
+   「添加文件」），选择要同步的配置文件；弹窗立刻列出解析到的每个键、值、行号，
+   以及哪些键命中了密码关键词。
+2. **点选密码键并绑定账号**：在「同步文件」页的文件内容里找到密码所在的键，
+   在它右侧的下拉框里选择账号。文件名 + 键路径就是这条绑定的唯一身份，
+   不需要 URL 匹配，也不需要给账号配置任何系统信息。
+3. **同步**：文件顶部显示「将更新 N 处密码」，点「同步」即可；也可以「全部同步」
+   一次处理所有文件。文件里的值与账号密码一致时显示「已最新」，不会写盘。
 
-### 2.2 解析规则
+从账号详情进入上传时，SapVault 会把命中的「疑似密码」键自动绑到这个账号，
+随后跳到「同步文件」页方便核对——绑定关系始终可以在那里改。
 
-| 格式 | 识别方式 | 说明 |
-| --- | --- | --- |
-| JSON | `.json` / `.jsonc` | 递归展开嵌套对象与数组，路径形如 `sap.production.url` |
-| .env | `.env`、`.env.*`、`*.env` | `KEY=VALUE`，支持 `export` 前缀、单双引号、`#` 注释 |
-| TOML | `.toml` `.ini` `.conf` `.cfg` `.properties` | 支持 `[section]`，路径形如 `sap.auth.password` |
-| YAML | `.yaml` / `.yml` | 按缩进构建路径 |
-| XML | `.xml` `.plist` `.config` `.resx` | 元素文本与属性都会读取（属性形如 `connection@host`） |
-| 纯文本 | 其它扩展名 | 识别 `key=value`、`key: value`，并识别裸写的 `http(s)://` 链接 |
+### 2.2 支持的文件与呈现方式
 
-关键词匹配：默认忽略大小写、允许包含匹配（`sap_password` 能匹配 `password`，
-但优先选择更精确的键名，例如 `username` 优先于 `user`）；设置页可改为「必须完全一致」，
-并可修改全局默认关键词（默认 URL：`url/uri/link/endpoint/host/server/address`；
-用户名：`username/user/login/account/sap_user`；密码：`password/passwd/pwd/secret`）。
+| 格式 | 扩展名 | 画面呈现 | 解析规则 |
+| --- | --- | --- | --- |
+| JSON | `.json`、`.jsonc` | 折叠树 | 递归展开嵌套对象与数组，路径形如 `sap.production.password` |
+| YAML | `.yaml`、`.yml` | 折叠树 | 按缩进层级构建路径 |
+| XML | `.xml`、`.config`、`.plist`、`.resx`、`.xsd`、`.svg` | 折叠树 | 叶子元素文本与属性都会读取（属性形如 `connection@host`） |
+| `.env` | `.env`、`.env.*`、`*.env` | 扁平表格 | `KEY=VALUE`，支持 `export` 前缀、单双引号、`#` 注释 |
+| TOML / INI / properties / tfvars | `.toml`、`.ini`、`.conf`、`.cfg`、`.properties`、`.tfvars`、`.hcl` | 扁平表格 | 支持 `[section]`，路径形如 `sap.auth.password` |
+
+其它扩展名（例如 `.txt`）不再作为同步目标：纯文本没法可靠定位「哪个值才是密码」，
+而同步需要精确的键路径才能只改一个值。
+
+关键词匹配（设置 → 文件关键词，每个文件也可以单独覆盖）只决定哪些键被标成
+「疑似密码」，默认包含 `password / passwd / pwd / pass / secret / passwort / kennwort / token`，
+忽略大小写、允许包含匹配；没有被标到的键同样可以手动绑定。
 
 ### 2.3 关联关系的呈现
 
-「关联关系」页面用**卡片**与**表格**两种视图列出每个 SAP 账号与它的同步文件，
-并展示每个文件解析出的 URL / 用户名 / 密码（可复制、可见命中键名）；
-顶部统计账号数、文件数、字段不完整的文件数、已失效（文件被删除）的文件数。
+「关联关系」页用**卡片**与**表格**两种视图列出账号 ↔（文件，键）绑定，展示文件路径、
+键路径、文件里的当前值（默认打码，可在设置里关闭打码）与「疑似密码」标记；
+顶部统计 SAP 账号数、涉及文件数、键绑定数与未绑定账号数。
+账号详情里也能看到该账号绑定的每个键，并可直接解绑或把文件跳到「同步文件」页。
 
-### 2.4 写入全局配置（例如 MCP）
+### 2.4 写入规则
 
-「同步配置」页面支持多个目标，每个目标 = 一个输出文件 + 一套模板：
-
-- 内置模板：**MCP / JSON**、**凭据清单 (JSON)**、`.env`、TOML、YAML、CSV、纯文本；
-- 写入前自动备份原文件（可关闭）；内容未变化时跳过写入；
-- 支持「预览」「写入文件」「全部写入」，写入后弹出提示。
-
-账号字段为空时，同步会自动使用关联文件中解析到的值（`effectiveUrl` /
-`effectiveUsername` / `effectivePassword`），所以账号记录可以填得很简单。
-
-模板变量（界面点击即可插入）：
-
-| 变量 | 说明 |
-| --- | --- |
-| `{{knoxId}}` | 全局 Knox ID |
-| `{{accountCount}}` / `{{fileCount}}` | 账号数 / 源文件数 |
-| `{{accountsJson}}` / `{{filesJson}}` | 预渲染好的 JSON 数组 |
-| `{{#accounts}}…{{/accounts}}` | 逐个账号渲染：`{{title}} {{slug}} {{number}} {{username}} {{password}} {{effectiveUrl}} {{effectiveUsername}} {{effectivePassword}} {{usernamePassword}} {{linkCount}} {{ruleSummary}}` |
-| `{{#sources}}…{{/sources}}` | 账号内逐个文件渲染：`{{path}} {{label}} {{format}} {{url}} {{username}} {{password}} {{complete}}` |
-| `{{^accounts}}…{{/accounts}}` | 账号为空时渲染 |
-| `{{x\|json}}` | 输出带引号的 JSON 字符串（写 JSON/TOML/YAML 时用它避免转义问题） |
+- 只改被绑定的键：值在原地按字节区间替换，其余内容一个字节都不动；
+- 保留原编码（UTF-8 / UTF-8 BOM / UTF-16 LE / UTF-16 BE）与原有引号风格，
+  需要时按 JSON / XML 规则转义；
+- 写入前重新解析文件并核对（键的数量、顺序、被改动的值），不通过就放弃写入；
+- 默认先写 `<文件>.bak-<时间戳>` 备份（设置 → 数据与备份可关闭）；
+- 内容未变化时不写盘，重复点「同步」是安全的空操作。
 
 ---
 
@@ -119,7 +110,7 @@
 | 空闲 | 默认 10 分钟无操作自动锁定（可关闭或调整） |
 | 手动 | 侧边栏「锁定保险库」、`Ctrl+L`、设置页「立即锁定」 |
 
-锁定时清除内存中的密钥、密码与历史密码（`zeroize`）。
+锁定时清除内存中的密钥、密码、历史密码与文件解析结果（`zeroize`）。
 
 > **「仅本机账户」模式没有密码可输入**：它的密钥由 Windows DPAPI 保管，解锁时点一下按钮即可。
 > 若要求「锁屏 / 重启后必须输入主密码」，请使用**主密码模式**，
@@ -165,7 +156,7 @@
 
 ```powershell
 cd src-tauri
-cargo test           # 后端单元测试：加密、DPAPI、解析、关键词、规则、历史、模板
+cargo test           # 后端单元测试：加密、DPAPI、解析、原地改写、规则、历史、绑定
 cargo build --release
 ```
 
@@ -185,7 +176,7 @@ MSVC 运行库已静态链接（见 `src-tauri/.cargo/config.toml`），
 ```powershell
 pwsh tools/audit-ui.ps1 -WithModals                                     # 含弹窗的完整审计
 pwsh tools/audit-ui.ps1 -Sizes 1000x660,1240x800,1600x900,1920x1080    # 多窗口尺寸
-pwsh tools/audit-ui.ps1 -Sizes 1240x800 -ShotView 设置                  # 附带字符画截图
+pwsh tools/audit-ui.ps1 -Sizes 1240x800 -ShotView 同步文件              # 附带字符画截图
 ```
 
 审计检查：外壳是否铺满窗口、每页是否有横向溢出、是否有元素超出窗口、
@@ -200,10 +191,10 @@ pwsh tools/audit-ui.ps1 -Sizes 1240x800 -ShotView 设置                  # 附�
 1. 首次启动 → 选择解锁方式（主密码 / 仅本机账户）。
 2. 「新建条目」→ 填标题、分类（SAP 账号）、用户名（可勾选全局 Knox ID）、密码；
    需要时打开密码规则与循环周期。
-3. 在账号详情里「添加文件」，选择要同步的配置文件 → 在弹窗里核对解析结果，
-   缺字段时填关键词重新检测 → 关联到账号。
-4. 「关联关系」核对账号、文件与解析出的凭据。
-5. 「同步配置」→ 新建目标（例如 MCP / JSON）→ 设置输出路径 → 预览 → 写入文件。
+3. 「同步文件」→ 上传配置文件 → 在文件内容里找到密码所在的键，右侧下拉框选账号；
+   JSON/YAML/XML 可以折叠展开，TOML/INI/.env 是扁平表格。
+4. 需要看文件里到底记了什么时，点「显示密码值」（临时解开打码）或「预览」。
+5. 点「同步」把账号密码写回文件；「关联关系」页可以总览所有绑定。
 
 快捷键：`Ctrl+K` 聚焦搜索、`Ctrl+N` 新建条目、`Ctrl+L` 立即锁定。
 
@@ -217,16 +208,17 @@ src-tauri/src/
   commands.rs    全部 IPC 命令（前端唯一入口）
   crypto.rs      Argon2id / AES-256-GCM / DPAPI / 口令强度
   rules.rs       密码规则：合规生成与违规检查
-  keys.rs        内容文件解析：JSON / .env / TOML / YAML / XML / 文本
-  store.rs       保险库信封、设置文件、备份轮转、便携模式、数据归一化
-  model.rs       Vault / Entry / PasswordRule / HistoryEntry / ContentLink / KeyMapping
-  sync.rs        同步上下文、模板引擎、内置模板、写盘与备份
+  keys.rs        内容文件解析：JSON / .env / TOML / INI / properties / tfvars / YAML / XML
+  patch.rs       原地改写：编码保留、按字节区间替换、转义、写前核对
+  store.rs       保险库信封、设置文件、备份轮转、便携模式、数据迁移与归一化
+  model.rs       Vault / Entry / FileValue / FileBinding / SyncFile / KeyMapping
+  sync.rs        同步计划与执行：只改被绑定的键，写入前校验并备份
   state.rs       解锁状态、设置快照、锁屏检测（OpenInputDesktop）
 ui/
   index.html
   styles/        tokens.css（设计变量）、app.css（布局模型见文件头注释）
   js/            app.js（外壳与路由）、state.js（状态与动作）、api.js、theme.js …
-  js/views/      lock / accounts / editor / linkkeys / sync / associations / settings
+  js/views/      lock / accounts / editor / filedialog / sync / associations / settings
 tools/
   serve-ui.mjs、ui-fixtures.js、inspect-ui.mjs、audit-ui.ps1、ascii-shot.ps1
 ```
@@ -245,8 +237,10 @@ tools/
 
 - 仅支持 Windows（DPAPI、锁屏检测与资源管理器集成依赖 Windows API）。
 - 字段解析基于键名匹配与格式遍历，不解析加密 / 压缩文件；
-  复杂格式（例如多行 YAML 块标量）建议在界面上直接指定关键词。
-- 同步是「渲染后写入」，不会合并已有 JSON；请保留备份，或把目标指向 SapVault 专属文件。
+  复杂格式（例如多行 YAML 块标量、JSON 里重复的同名键路径）建议改用文件里的唯一键名，
+  或在同步后核对结果。
+- 同步是「原地改一个值」，不会格式化文件，也不会重排键顺序；
+  如果某个键名在文件里出现多次，绑定的是解析到的第一个可定位位置。
 - 便携模式依赖 `portable.txt` 标记，不会自动迁移 `%APPDATA%` 里已有的数据。
 - 账号不再记录系统 ID、客户端、登录语言等信息，也不读取 SAP 登录配置；
   如需按系统维度区分，请写在账号标题里。

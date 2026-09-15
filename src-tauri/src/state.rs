@@ -26,11 +26,9 @@ impl Drop for Unlocked {
         }
         for file in self.vault.files.iter_mut() {
             if let Some(analysis) = file.analysis.as_mut() {
-                for record in analysis.records.iter_mut() {
-                    for field in record.fields.iter_mut() {
-                        if field.kind == "password" {
-                            field.value.zeroize();
-                        }
+                for value in analysis.values.iter_mut() {
+                    if value.password_candidate {
+                        value.value.zeroize();
                     }
                 }
             }

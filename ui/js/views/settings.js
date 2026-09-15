@@ -443,9 +443,11 @@ function keyMapCard() {
 
     mount(
       container,
-      row("url", "URL 关键词", "例如 url、server、host、endpoint"),
-      row("username", "用户名关键词", "例如 username、user、login、sap_user"),
-      row("password", "密码关键词", "例如 password、passwd、pwd、secret"),
+      row(
+        "password",
+        "密码关键词",
+        "例如 password、passwd、pwd、secret、passwort、kennwort、token",
+      ),
       h(
         "div",
         { style: { display: "flex", flexWrap: "wrap", gap: "var(--s-4)" } },
@@ -495,7 +497,7 @@ function keyMapCard() {
   return card(
     "文件关键词",
     "filter",
-    "决定如何在关联文件中识别 URL、用户名与密码；每个文件都可以单独覆盖。",
+    "决定文件里哪些键会被标成「疑似密码」，只是提示；任意键都能手动绑定账号。每个文件可单独覆盖。",
     container,
   );
 }
@@ -537,6 +539,11 @@ function dataCard() {
             : null,
         ),
       ),
+    ),
+    h(
+      "p",
+      { class: "form__hint" },
+      `可同步的格式：${(state.paths?.supportedFormats ?? []).join("、")}`,
     ),
     h(
       "div",

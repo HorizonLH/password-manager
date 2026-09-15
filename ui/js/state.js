@@ -72,7 +72,6 @@ export async function bootstrap() {
       dataDir: info.dataDir,
       vaultPath: info.vaultPath,
       supportedFormats: info.supportedFormats,
-      supportedFormats: info.supportedFormats,
     },
   });
 }
@@ -225,8 +224,8 @@ export async function reanalyzeFile(fileId) {
   return vault;
 }
 
-export async function bindFile(fileId, entryIds) {
-  const vault = await api.fileBind(fileId, entryIds);
+export async function bindFile(fileId, bindings) {
+  const vault = await api.fileBind(fileId, bindings);
   setState({ vault });
   return vault;
 }

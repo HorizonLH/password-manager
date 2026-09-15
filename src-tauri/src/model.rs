@@ -7,7 +7,7 @@ pub const SAP_CATEGORY_ID: &str = "sap";
 pub const DEFAULT_CATEGORY_ID: &str = "general";
 
 /// Bumped when the on-disk shape changes so `store::normalize_vault` can migrate.
-pub const VAULT_SCHEMA: u32 = 2;
+pub const VAULT_SCHEMA: u32 = 3;
 
 /// Upper bound on stored passwords per account.
 pub const MAX_PASSWORD_HISTORY: usize = 50;
@@ -68,7 +68,6 @@ impl Category {
 #[serde(rename_all = "camelCase", default)]
 pub struct PasswordRule {
     pub enabled: bool,
-    /// Free text shown in the UI, e.g. "集团口令策略 2024".
     pub description: String,
     pub min_length: usize,
     pub max_length: usize,
@@ -131,12 +130,7 @@ impl PasswordRule {
         if self.symbols {
             classes.push("符号");
         }
-        let mut text = format!(
-            "{}-{} 位 · {}",
-            self.min_length,
-            self.max_length,
-            classes.join("+")
-        );
+        let mut text = format!("{}-{} 位 · {}", self.min_length, self.max_length, classes.join("+"));
         if !self.forbidden.is_empty() {
             text.push_str(&format!(" · 禁用 {}", self.forbidden));
         }
@@ -167,43 +161,18 @@ pub struct HistoryEntry {
 // Content files
 // ---------------------------------------------------------------------------
 
-/// Which keys (and how strictly) identify the URL / user name / password inside
-/// a content file. Users can override this per file.
+/// Which key names are treated as a password candidate when a file is parsed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct KeyMapping {
-    pub url: Vec<String>,
-    pub username: Vec<String>,
     pub password: Vec<String>,
     pub ignore_case: bool,
-    /// `true` requires the key to equal a listed word; `false` also accepts a
-    /// key that merely contains it (`sap_password` matches `password`).
     pub exact: bool,
 }
 
 impl Default for KeyMapping {
     fn default() -> Self {
         Self {
-            url: vec![
-                "url".into(),
-                "uri".into(),
-                "link".into(),
-                "endpoint".into(),
-                "host".into(),
-                "server".into(),
-                "address".into(),
-                "base_url".into(),
-            ],
-            username: vec![
-                "username".into(),
-                "user".into(),
-                "user_id".into(),
-                "userid".into(),
-                "login".into(),
-                "account".into(),
-                "sap_user".into(),
-                "sapuser".into(),
-            ],
             password: vec![
                 "password".into(),
                 "passwd".into(),
@@ -211,6 +180,8 @@ impl Default for KeyMapping {
                 "pass".into(),
                 "secret".into(),
                 "passwort".into(),
+                "kennwort".into(),
+                "token".into(),
             ],
             ignore_case: true,
             exact: false,
@@ -220,26 +191,41 @@ impl Default for KeyMapping {
 
 impl KeyMapping {
     pub fn normalize(&mut self) {
-        let clean = |values: &mut Vec<String>| {
-            values
-                .iter_mut()
-                .for_each(|value| *value = value.trim().to_string());
-            values.retain(|value| !value.is_empty());
-            values.dedup();
-        };
-        clean(&mut self.url);
-        clean(&mut self.username);
-        clean(&mut self.password);
-        let fallback = KeyMapping::default();
-        if self.url.is_empty() {
-            self.url = fallback.url;
-        }
-        if self.username.is_empty() {
-            self.username = fallback.username;
-        }
+        self.password
+            .iter_mut()
+            .for_each(|value| *value = value.trim().to_string());
+        self.password.retain(|value| !value.is_empty());
+        self.password.dedup();
         if self.password.is_empty() {
-            self.password = fallback.password;
+            self.password = KeyMapping::default().password;
         }
+    }
+
+    /// Does this key name look like a password?
+    pub fn is_password_key(&self, key: &str) -> bool {
+        let equals = |a: &str, b: &str| {
+            if self.ignore_case {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        if self.password.iter().any(|needle| equals(key, needle)) {
+            return true;
+        }
+        if self.exact {
+            return false;
+        }
+        self.password.iter().any(|needle| {
+            if needle.len() < 3 {
+                return false;
+            }
+            if self.ignore_case {
+                key.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+            } else {
+                key.contains(needle)
+            }
+        })
     }
 }
 
@@ -252,80 +238,69 @@ pub struct FieldLocation {
     /// quotes when the value is quoted).
     pub start: usize,
     pub end: usize,
-    /// The value was wrapped in `"` or `'`; the quotes are kept as they are.
     pub quoted: bool,
     /// The value came from an XML attribute and needs entity escaping.
     pub xml_attr: bool,
     pub line: u32,
 }
 
-/// A value pulled out of a content file.
+/// One key/value pair found in a file, shown in the UI so the user can point at
+/// the password themselves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FieldHit {
-    /// `url` | `username` | `password`
-    pub kind: String,
-    /// The key as it appears in the file.
+pub struct FileValue {
+    /// Last path segment, e.g. `password`.
     pub key: String,
-    /// Dotted path / element path, useful for XML and nested JSON.
+    /// Full path, e.g. `sap.production.password` (also the binding key).
     pub path: String,
+    /// Containing block, used to build the tree.
+    pub parent: String,
     pub value: String,
     pub line: u32,
-    #[serde(default)]
-    pub location: Option<FieldLocation>,
+    pub location: FieldLocation,
+    /// The key name matches the password keywords.
+    pub password_candidate: bool,
 }
 
-/// One credential block found in a file. A file may contain several (e.g. a JSON
-/// config with one block per SAP system), which is what makes a file able to be
-/// bound to several accounts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileRecord {
-    pub id: String,
-    /// Path of the containing block, e.g. `sap.production` or `[PRD]`.
-    pub path: String,
-    pub fields: Vec<FieldHit>,
-}
-
-impl FileRecord {
-    pub fn hit(&self, kind: &str) -> Option<&FieldHit> {
-        self.fields.iter().find(|field| field.kind == kind)
-    }
-
-    pub fn value(&self, kind: &str) -> String {
-        self.hit(kind).map(|hit| hit.value.clone()).unwrap_or_default()
-    }
-
-    pub fn url(&self) -> String {
-        self.value("url")
-    }
-
-    pub fn username(&self) -> String {
-        self.value("username")
-    }
-
-    pub fn password(&self) -> String {
-        self.value("password")
-    }
-
-}
-
-/// Result of parsing one file with one key mapping.
+/// Result of parsing one file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileAnalysis {
-    /// `json` | `env` | `toml` | `yaml` | `xml` | `text`
+    /// `json` | `env` | `toml` | `yaml` | `xml`
     pub format: String,
-    pub records: Vec<FileRecord>,
-    /// Kinds that no record contains at all.
-    pub missing: Vec<String>,
+    pub values: Vec<FileValue>,
     pub analyzed_at: String,
     pub error: Option<String>,
 }
 
+impl FileAnalysis {
+    pub fn value(&self, path: &str) -> Option<&FileValue> {
+        self.values.iter().find(|value| value.path == path)
+    }
 
-/// A file the user uploaded. It is the *source of truth*: sync writes the
-/// password back into it in place, and never touches anything else.
+}
+
+/// (file, key) → account. This is the only thing that decides where a password
+/// is written, so no URL matching is needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileBinding {
+    pub id: String,
+    pub key_path: String,
+    pub entry_id: String,
+}
+
+impl FileBinding {
+    pub fn new(key_path: &str, entry_id: &str) -> Self {
+        Self {
+            id: new_id(),
+            key_path: key_path.to_string(),
+            entry_id: entry_id.to_string(),
+        }
+    }
+}
+
+/// A file the user uploaded. Sync writes passwords back into it in place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncFile {
@@ -340,9 +315,9 @@ pub struct SyncFile {
     pub keys: KeyMapping,
     #[serde(default)]
     pub analysis: Option<FileAnalysis>,
-    /// Accounts this file is bound to (many-to-many).
+    /// Key → account bindings (many keys and many accounts per file).
     #[serde(default)]
-    pub entry_ids: Vec<String>,
+    pub bindings: Vec<FileBinding>,
     #[serde(default)]
     pub last_sync_at: Option<String>,
     #[serde(default)]
@@ -365,7 +340,7 @@ impl SyncFile {
             modified_at: None,
             keys,
             analysis,
-            entry_ids: Vec::new(),
+            bindings: Vec::new(),
             last_sync_at: None,
             last_status: None,
         };
@@ -390,6 +365,7 @@ impl SyncFile {
             }
         }
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -404,15 +380,10 @@ pub struct Entry {
     pub category_id: String,
     #[serde(default)]
     pub username: String,
-    /// When true the entry uses the global Knox ID as its user name.
     #[serde(default)]
     pub use_knox_id: bool,
     #[serde(default)]
     pub password: String,
-    /// URL (or host) used to pick the matching block inside a synced file when a
-    /// file is bound to more than one account. Not written to the files.
-    #[serde(default)]
-    pub match_url: String,
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
@@ -466,10 +437,9 @@ pub struct Vault {
     pub knox_id: String,
     pub categories: Vec<Category>,
     pub entries: Vec<Entry>,
-    /// Uploaded content files; bindings live in `SyncFile::entry_ids`.
     #[serde(default)]
     pub files: Vec<SyncFile>,
-    /// Legacy field from schema 1 (per-entry links); migrated on load.
+    /// Legacy per-entry file lists (schema 1/2), migrated on load.
     #[serde(default, skip_serializing)]
     pub legacy_links: Vec<LegacyEntryLinks>,
     pub updated_at: String,
@@ -549,13 +519,11 @@ impl Vault {
     pub fn files_for(&self, entry_id: &str) -> Vec<&SyncFile> {
         self.files
             .iter()
-            .filter(|file| file.entry_ids.iter().any(|id| id == entry_id))
+            .filter(|file| file.bindings.iter().any(|b| b.entry_id == entry_id))
             .collect()
     }
 }
 
-/// Trimmed entry payload used for list rendering. Passwords never travel in the
-/// list payload; the frontend asks for a single entry when it needs a secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntrySummary {
@@ -566,8 +534,8 @@ pub struct EntrySummary {
     pub use_knox_id: bool,
     pub has_password: bool,
     pub favorite: bool,
-    pub match_url: String,
     pub file_count: usize,
+    pub key_count: usize,
     pub has_rule: bool,
     pub rule_summary: String,
     pub history_cycle: u32,
@@ -578,6 +546,16 @@ pub struct EntrySummary {
 
 impl EntrySummary {
     pub fn from(entry: &Entry, vault: &Vault) -> Self {
+        let files = vault.files_for(&entry.id);
+        let key_count = files
+            .iter()
+            .map(|file| {
+                file.bindings
+                    .iter()
+                    .filter(|binding| binding.entry_id == entry.id)
+                    .count()
+            })
+            .sum();
         Self {
             id: entry.id.clone(),
             title: entry.title.clone(),
@@ -586,8 +564,8 @@ impl EntrySummary {
             use_knox_id: entry.use_knox_id,
             has_password: !entry.password.is_empty(),
             favorite: entry.favorite,
-            match_url: entry.match_url.clone(),
-            file_count: vault.files_for(&entry.id).len(),
+            file_count: files.len(),
+            key_count,
             has_rule: entry.rule.as_ref().map(|rule| rule.enabled).unwrap_or(false),
             rule_summary: entry
                 .rule
@@ -602,15 +580,28 @@ impl EntrySummary {
     }
 }
 
-/// Row used by the "关联关系" screen: one account and the files bound to it.
+/// One (file, key) pair bound to an account, used by the relationship view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountBinding {
+    pub binding_id: String,
+    pub file_id: String,
+    pub file_path: String,
+    pub file_label: String,
+    pub file_exists: bool,
+    pub format: String,
+    pub key_path: String,
+    pub value: String,
+    pub password_candidate: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Association {
     pub entry_id: String,
     pub entry_title: String,
     pub username: String,
-    pub match_url: String,
-    pub files: Vec<SyncFile>,
+    pub bindings: Vec<AccountBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,11 +623,37 @@ impl VaultView {
                 entry_id: entry.id.clone(),
                 entry_title: entry.title.clone(),
                 username: entry.effective_username(&vault.knox_id),
-                match_url: entry.match_url.clone(),
-                files: vault
-                    .files_for(&entry.id)
-                    .into_iter()
-                    .cloned()
+                bindings: vault
+                    .files
+                    .iter()
+                    .flat_map(|file| {
+                        file.bindings
+                            .iter()
+                            .filter(|binding| binding.entry_id == entry.id)
+                            .map(|binding| {
+                                let value = file
+                                    .analysis
+                                    .as_ref()
+                                    .and_then(|analysis| analysis.value(&binding.key_path));
+                                AccountBinding {
+                                    binding_id: binding.id.clone(),
+                                    file_id: file.id.clone(),
+                                    file_path: file.path.clone(),
+                                    file_label: file.label.clone(),
+                                    file_exists: file.exists,
+                                    format: file
+                                        .analysis
+                                        .as_ref()
+                                        .map(|analysis| analysis.format.clone())
+                                        .unwrap_or_default(),
+                                    key_path: binding.key_path.clone(),
+                                    value: value.map(|item| item.value.clone()).unwrap_or_default(),
+                                    password_candidate: value
+                                        .map(|item| item.password_candidate)
+                                        .unwrap_or(false),
+                                }
+                            })
+                    })
                     .collect(),
             })
             .collect();

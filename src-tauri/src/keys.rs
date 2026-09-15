@@ -13,25 +13,27 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use crate::model::{
-    now_string, FieldHit, FieldLocation, FileAnalysis, FileRecord, KeyMapping,
+    now_string, FieldLocation, FileAnalysis, FileValue, KeyMapping,
 };
 use crate::patch::{self, TextEncoding};
-
-pub const KIND_URL: &str = "url";
-pub const KIND_USERNAME: &str = "username";
-pub const KIND_PASSWORD: &str = "password";
-const KINDS: [&str; 3] = [KIND_URL, KIND_USERNAME, KIND_PASSWORD];
 
 /// Guards against pulling a whole database dump into memory.
 pub const MAX_ANALYZE_BYTES: u64 = 4 * 1024 * 1024;
 
-const FORMATS: [&str; 6] = ["json", "env", "toml", "yaml", "xml", "text"];
+/// Supported formats. Plain text was dropped on purpose: every sync target has
+/// to be addressable by a key so the user can point at the password value.
+pub const FORMATS: [&str; 8] = ["json", "env", "toml", "ini", "properties", "hcl", "yaml", "xml"];
 
-/// Suffixes used to group `PREFIX_URL` / `PREFIX_USER` / `PREFIX_PASSWORD` keys.
-const ENV_SUFFIXES: [&str; 12] = [
-    "_url", "_uri", "_host", "_server", "_user", "_username", "_userid", "_login", "_password",
-    "_passwd", "_pwd", "_secret",
-];
+/// Human readable names for the supported formats.
+pub fn supported_labels() -> Vec<String> {
+    vec![
+        "JSON (.json)".to_string(),
+        ".env".to_string(),
+        "TOML / INI / properties (.toml .ini .conf .cfg .properties .tfvars)".to_string(),
+        "YAML (.yaml .yml)".to_string(),
+        "XML (.xml .config .plist .resx)".to_string(),
+    ]
+}
 
 #[derive(Debug, Clone)]
 struct FlatValue {
@@ -74,10 +76,13 @@ pub fn detect_format(path: &Path) -> String {
     match extension.as_str() {
         "json" | "jsonc" => "json",
         "env" => "env",
-        "toml" | "ini" | "conf" | "cfg" | "properties" => "toml",
+        "toml" => "toml",
+        "ini" | "conf" | "cfg" | "cnf" => "ini",
+        "properties" => "properties",
+        "tfvars" | "hcl" => "hcl",
         "yaml" | "yml" => "yaml",
-        "xml" | "plist" | "config" | "resx" => "xml",
-        _ => "text",
+        "xml" | "config" | "plist" | "resx" | "xsd" | "svg" => "xml",
+        _ => "unsupported",
     }
     .to_string()
 }
@@ -86,14 +91,14 @@ pub fn is_supported(path: &Path) -> bool {
     FORMATS.contains(&detect_format(path).as_str())
 }
 
+
 /// Reads and parses a file. Errors are reported inside `analysis.error` so the
 /// UI can show a per-file message.
 pub fn load(path: &Path, mapping: &KeyMapping) -> LoadedFile {
     let format = detect_format(path);
     let error_analysis = |error: String| FileAnalysis {
         format: format.clone(),
-        records: Vec::new(),
-        missing: KINDS.iter().map(|kind| kind.to_string()).collect(),
+        values: Vec::new(),
         analyzed_at: now_string(),
         error: Some(error),
     };
@@ -152,19 +157,36 @@ pub fn analyze_file(path: &Path, mapping: &KeyMapping) -> FileAnalysis {
 }
 
 pub fn analyze_text(text: &str, format: &str, mapping: &KeyMapping) -> FileAnalysis {
-    let values = extract(text, format);
-    let records = group(&values, mapping, format);
-
-    let missing: Vec<String> = KINDS
-        .iter()
-        .filter(|kind| !records.iter().any(|record| record.hit(kind).is_some()))
-        .map(|kind| kind.to_string())
+    if !FORMATS.contains(&format) {
+        return FileAnalysis {
+            format: format.to_string(),
+            values: Vec::new(),
+            analyzed_at: now_string(),
+            error: Some("不支持的文件类型".to_string()),
+        };
+    }
+    let values: Vec<FileValue> = extract(text, format)
+        .into_iter()
+        .map(|value| FileValue {
+            password_candidate: mapping.is_password_key(&value.key),
+            key: value.key,
+            path: value.path,
+            parent: value.parent,
+            value: value.value,
+            line: value.line,
+            location: FieldLocation {
+                start: value.start,
+                end: value.end,
+                quoted: value.quoted,
+                xml_attr: value.xml_attr,
+                line: value.line,
+            },
+        })
         .collect();
 
     FileAnalysis {
         format: format.to_string(),
-        records,
-        missing,
+        values,
         analyzed_at: now_string(),
         error: None,
     }
@@ -178,10 +200,10 @@ fn extract(text: &str, format: &str) -> Vec<FlatValue> {
     match format {
         "json" => extract_json(text),
         "env" => extract_env(text),
-        "toml" => extract_toml(text),
+        "toml" | "ini" | "properties" | "hcl" => extract_toml(text),
         "yaml" => extract_yaml(text),
         "xml" => extract_xml(text),
-        _ => extract_text(text),
+        _ => Vec::new(),
     }
 }
 
@@ -394,92 +416,6 @@ fn extract_yaml(text: &str) -> Vec<FlatValue> {
         });
     }
     out
-}
-
-/// Plain text: `key=value` / `key: value` pairs and bare URLs, grouped into
-/// paragraphs so a file describing several systems still yields several records.
-fn extract_text(text: &str) -> Vec<FlatValue> {
-    let mut out = Vec::new();
-    let lines = LineIndex::new(text);
-    let mut block = 0usize;
-    let mut previous_blank = true;
-
-    for raw_line in text.split_inclusive('\n') {
-        let full = raw_line.trim_end_matches(['\n', '\r']);
-        if full.trim().is_empty() {
-            previous_blank = true;
-            continue;
-        }
-        if previous_blank {
-            block += 1;
-            previous_blank = false;
-        }
-        let parent = format!("段落 {block}");
-        let line = full.trim();
-        if line.starts_with('#') || line.starts_with("//") {
-            continue;
-        }
-
-        let mut matched = false;
-        for separator in ['=', ':'] {
-            if let Some(index) = line.find(separator) {
-                let key = line[..index]
-                    .trim()
-                    .trim_start_matches('-')
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .trim();
-                if key.is_empty() || key.len() > 64 {
-                    continue;
-                }
-                let raw_value = &line[index + 1..];
-                if raw_value.trim().is_empty() {
-                    continue;
-                }
-                let (start, end, quoted) = value_range(text, raw_value);
-                out.push(FlatValue {
-                    key: key.to_string(),
-                    path: key.to_string(),
-                    parent: parent.clone(),
-                    value: unquote(raw_value),
-                    start,
-                    end,
-                    quoted,
-                    xml_attr: false,
-                    line: lines.line_at(offset_of(text, key)),
-                });
-                matched = true;
-                break;
-            }
-        }
-        if matched {
-            continue;
-        }
-        // Bare URLs are useful even without a key.
-        for token in line.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',') {
-            if looks_like_url(token) {
-                let start = offset_of(text, token);
-                out.push(FlatValue {
-                    key: "url".to_string(),
-                    path: "url".to_string(),
-                    parent: parent.clone(),
-                    value: token.to_string(),
-                    start,
-                    end: start + token.len(),
-                    quoted: false,
-                    xml_attr: false,
-                    line: lines.line_at(start),
-                });
-            }
-        }
-    }
-    out
-}
-
-fn looks_like_url(value: &str) -> bool {
-    let lower = value.trim().to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 // --------------------------------------------------------------- JSON -------
@@ -783,7 +719,9 @@ fn extract_xml(text: &str) -> Vec<FlatValue> {
                     continue;
                 }
                 let raw = &text[start..before];
-                if raw.trim().is_empty() {
+                // Containers (elements with child markup) are not values: their
+                // content is markup, and a child edit would "change" them.
+                if raw.trim().is_empty() || raw.contains('<') {
                     continue;
                 }
                 let parent = stack_path(&stack);
@@ -808,9 +746,6 @@ fn extract_xml(text: &str) -> Vec<FlatValue> {
             Err(_) => break,
             _ => {}
         }
-    }
-    if out.is_empty() {
-        return extract_text(text);
     }
     out
 }
@@ -856,182 +791,5 @@ fn collect_xml_attributes(
             xml_attr: true,
             line: lines.line_at(before),
         });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Record grouping
-// ---------------------------------------------------------------------------
-
-/// Key kind for a value, or `None` when the key is not a credential keyword.
-fn kind_of(key: &str, mapping: &KeyMapping) -> Option<&'static str> {
-    // Password first: `user_password` should be a password, not a user name.
-    for (kind, keys) in [
-        (KIND_PASSWORD, &mapping.password),
-        (KIND_USERNAME, &mapping.username),
-        (KIND_URL, &mapping.url),
-    ] {
-        if keys.iter().any(|candidate| key_matches(key, candidate, mapping)) {
-            return Some(kind);
-        }
-    }
-    None
-}
-
-fn key_matches(candidate: &str, key: &str, mapping: &KeyMapping) -> bool {
-    let equals = |a: &str, b: &str| {
-        if mapping.ignore_case {
-            a.eq_ignore_ascii_case(b)
-        } else {
-            a == b
-        }
-    };
-    if equals(candidate, key) {
-        return true;
-    }
-    if mapping.exact || key.chars().count() < 3 {
-        return false;
-    }
-    if mapping.ignore_case {
-        candidate.to_ascii_lowercase().contains(&key.to_ascii_lowercase())
-    } else {
-        candidate.contains(key)
-    }
-}
-
-/// Group key for a value: the containing block for structured formats, and a
-/// prefix for `PREFIX_URL` style env files.
-fn group_key(value: &FlatValue, format: &str) -> String {
-    match format {
-        "env" => {
-            let lower = value.key.to_ascii_lowercase();
-            for suffix in ENV_SUFFIXES {
-                if lower.ends_with(suffix) {
-                    let cut = value.key.len() - suffix.len();
-                    return value.key[..cut].to_string();
-                }
-            }
-            String::new()
-        }
-        _ => value.parent.clone(),
-    }
-}
-
-fn group(values: &[FlatValue], mapping: &KeyMapping, format: &str) -> Vec<FileRecord> {
-    let mut order: Vec<String> = Vec::new();
-    let mut buckets: std::collections::HashMap<String, Vec<(FlatValue, &'static str)>> =
-        std::collections::HashMap::new();
-
-    for value in values {
-        let Some(kind) = kind_of(&value.key, mapping) else {
-            continue;
-        };
-        let key = group_key(value, format);
-        if !buckets.contains_key(&key) {
-            order.push(key.clone());
-        }
-        buckets.entry(key).or_default().push((value.clone(), kind));
-    }
-
-    // A block that is missing a field often shares it with a parent block
-    // (e.g. `[sap] url = ...` and `[sap.auth] password = ...`), so pull the
-    // missing kinds down from the nearest ancestor before giving up.
-    if matches!(format, "json" | "toml" | "yaml" | "xml") {
-        for key in order.clone() {
-            let ancestors = ancestor_paths(&key);
-            let mut present: std::collections::HashSet<&'static str> = buckets
-                .get(&key)
-                .map(|items| items.iter().map(|(_, kind)| *kind).collect())
-                .unwrap_or_default();
-            for ancestor in ancestors {
-                if ancestor == key {
-                    continue;
-                }
-                let Some(items) = buckets.get(&ancestor).cloned() else {
-                    continue;
-                };
-                for (value, kind) in items {
-                    if present.insert(kind) {
-                        buckets.entry(key.clone()).or_default().push((value, kind));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut records = Vec::new();
-    for key in order {
-        let Some(items) = buckets.get(&key) else { continue };
-        let mut fields: Vec<FieldHit> = Vec::new();
-        for kind in KINDS {
-            let candidate = items
-                .iter()
-                .filter(|(_, item_kind)| *item_kind == kind)
-                .min_by_key(|(value, _)| {
-                    let matchers = mapping.matchers(kind);
-                    let exact = matchers.iter().any(|needle| {
-                        if mapping.ignore_case {
-                            value.key.eq_ignore_ascii_case(needle)
-                        } else {
-                            value.key == *needle
-                        }
-                    });
-                    let specificity = matchers
-                        .iter()
-                        .filter(|needle| key_matches(&value.key, needle, mapping))
-                        .map(|needle| needle.chars().count())
-                        .max()
-                        .unwrap_or(0);
-                    (if exact { 0u8 } else { 1u8 }, usize::MAX - specificity)
-                });
-            let Some((value, _)) = candidate else { continue };
-            fields.push(FieldHit {
-                kind: kind.to_string(),
-                key: value.key.clone(),
-                path: value.path.clone(),
-                value: value.value.clone(),
-                line: value.line,
-                location: Some(FieldLocation {
-                    start: value.start,
-                    end: value.end,
-                    quoted: value.quoted,
-                    xml_attr: value.xml_attr,
-                    line: value.line,
-                }),
-            });
-        }
-        if fields.is_empty() {
-            continue;
-        }
-        records.push(FileRecord {
-            id: crate::model::new_id(),
-            path: if key.is_empty() {
-                "（文件级）".to_string()
-            } else {
-                key
-            },
-            fields,
-        });
-    }
-    records
-}
-
-fn ancestor_paths(path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = path.to_string();
-    while let Some(index) = current.rfind('.') {
-        current.truncate(index);
-        out.push(current.clone());
-    }
-    out
-}
-
-impl KeyMapping {
-    fn matchers(&self, kind: &str) -> &Vec<String> {
-        match kind {
-            KIND_URL => &self.url,
-            KIND_USERNAME => &self.username,
-            _ => &self.password,
-        }
     }
 }
