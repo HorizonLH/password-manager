@@ -21,21 +21,30 @@ import {
   formatBytes,
   formatLabel,
   formatTime,
+  initials,
   mask,
-  shortSid,
+  ruleSummary,
+  urlHost,
 } from "../format.js";
 import { openEntryEditor } from "./editor.js";
 import { openKeyEditor, openLinkDialog } from "./linkkeys.js";
 
-/** List rows carry `systemId` directly; a full entry nests it under `sap`. */
-const sidOf = (entry) => entry.sap?.systemId ?? entry.systemId ?? "";
+/** The user name actually used: the Knox ID wins when the entry asks for it. */
+function effectiveUsername(entry) {
+  if (entry.useKnoxId && state.vault?.knoxId) return state.vault.knoxId;
+  return entry.username ?? "";
+}
+
+function isSap(entry) {
+  return entry.categoryId === "sap";
+}
 
 function filterEntries() {
   const term = state.search.trim().toLowerCase();
   return (state.vault?.entries ?? []).filter((entry) => {
     if (state.categoryId !== "all" && entry.categoryId !== state.categoryId) return false;
     if (!term) return true;
-    return [entry.title, entry.username, entry.systemId, entry.client, entry.url]
+    return [entry.title, entry.username, entry.primaryUrl]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(term));
   });
@@ -43,6 +52,7 @@ function filterEntries() {
 
 function entryRow(entry) {
   const selected = state.selectedEntryId === entry.id;
+  const subtitle = entry.primaryUrl ? urlHost(entry.primaryUrl) : entry.username;
   return h(
     "div",
     {
@@ -57,7 +67,7 @@ function entryRow(entry) {
         }
       },
     },
-    h("span", { class: "row__badge" }, shortSid(entry.systemId || entry.title)),
+    h("span", { class: "row__badge" }, initials(entry.title)),
     h(
       "span",
       { class: "row__body" },
@@ -71,17 +81,9 @@ function entryRow(entry) {
       h(
         "span",
         { class: "row__meta" },
-        h("span", { class: "mono" }, entry.username || "无用户名"),
-        entry.client ? h("span", { class: "row__sep" }, "·") : null,
-        entry.client ? h("span", null, `客户端 ${entry.client}`) : null,
-        entry.linkCount ? h("span", { class: "row__sep" }, "·") : null,
+        h("span", { class: "mono" }, subtitle || "未设置用户名"),
         entry.linkCount
-          ? h(
-              "span",
-              { class: "tag" },
-              icon("link", { size: 11 }),
-              `${entry.linkCount} 个文件`,
-            )
+          ? h("span", { class: "tag" }, icon("link", { size: 11 }), `${entry.linkCount} 文件`)
           : null,
         entry.historyCycle
           ? h("span", { class: "tag tag--mono" }, `循环 ${entry.historyCycle}`)
@@ -105,7 +107,7 @@ function entryRow(entry) {
         },
         icon("copy", { size: 14 }),
       ),
-      sidOf(entry)
+      isSap(entry)
         ? h(
             "button",
             {
@@ -137,17 +139,6 @@ function entryRow(entry) {
   );
 }
 
-/** What the attached files contributed for this account. */
-function parsedFields(entry) {
-  return FIELD_ORDER.map((kind) => {
-    for (const link of entry.links ?? []) {
-      const hit = (link.parse?.fields ?? []).find((field) => field.kind === kind);
-      if (hit && hit.value) return { kind, value: hit.value };
-    }
-    return { kind, value: "" };
-  });
-}
-
 function linkCard(entry, link) {
   const parse = link.parse ?? { format: "text", fields: [], missing: [...FIELD_ORDER] };
   const missing = parse.missing ?? [];
@@ -165,7 +156,7 @@ function linkCard(entry, link) {
         ? h("span", { class: "tag tag--mono" }, formatBytes(link.size))
         : h("span", { class: "tag tag--danger" }, "文件不存在"),
       missing.length
-        ? h("span", { class: "tag tag--warn" }, `缺少 ${missing.length} 个字段`)
+        ? h("span", { class: "tag tag--warn" }, `缺 ${missing.length} 项`)
         : h("span", { class: "tag tag--success" }, "字段完整"),
       h(
         "button",
@@ -262,7 +253,7 @@ function linkCard(entry, link) {
           h("span", { class: "field__label" }, FIELD_LABELS[kind]),
           h(
             "span",
-            { class: "field__text" },
+            { class: "field__text", title: hit.value },
             kind === "password" ? mask(hit.value, false) : hit.value,
           ),
           h("span", { class: "tag tag--mono" }, `键 ${hit.key}`),
@@ -282,97 +273,101 @@ function linkCard(entry, link) {
   );
 }
 
-function historySection(entry) {
+function historyBlock(entry) {
   let revealed = new Set();
-  const list = h("div", { class: "stack stack--tight" });
   let expanded = false;
-
-  const toggle = h(
-    "button",
-    {
-      class: "btn btn--ghost btn--sm",
-      type: "button",
-      onClick: () => {
-        expanded = !expanded;
-        paint();
-      },
-    },
-    icon(expanded ? "chevronDown" : "chevronRight", { size: 13 }),
-    expanded ? "收起" : `查看 ${entry.passwordHistory.length} 个历史密码`,
-  );
+  const body = h("div", { class: "stack stack--tight" });
 
   function paint() {
     mount(
-      list,
-      toggle,
+      body,
       expanded
-        ? h(
-            "div",
-            { class: "stack stack--tight" },
-            entry.passwordHistory.map((item, index) =>
+        ? entry.passwordHistory.map((item, index) =>
+            h(
+              "div",
+              { class: "assoc__file" },
               h(
-                "div",
-                { class: "assoc__file" },
-                h(
-                  "span",
-                  { class: "tag tag--mono" },
-                  entry.historyCycle > 0 && index < entry.historyCycle ? "循环内" : "更早",
-                ),
-                h(
-                  "span",
-                  { class: "field__text", style: { flex: "1" } },
-                  revealed.has(item.id) ? item.password : mask(item.password, false),
-                ),
-                h("span", { class: "subtle" }, item.note || formatTime(item.recordedAt)),
-                h(
-                  "button",
-                  {
-                    class: "btn btn--icon btn--sm",
-                    type: "button",
-                    title: "显示 / 隐藏",
-                    onClick: () => {
-                      if (revealed.has(item.id)) revealed.delete(item.id);
-                      else revealed.add(item.id);
-                      paint();
-                    },
+                "span",
+                { class: "tag tag--mono" },
+                entry.historyCycle > 0 && index < entry.historyCycle ? "循环内" : "更早",
+              ),
+              h(
+                "span",
+                { class: "field__text", style: { flex: "1" } },
+                revealed.has(item.id) ? item.password : mask(item.password, false),
+              ),
+              h("span", { class: "subtle nowrap" }, item.note || formatTime(item.recordedAt)),
+              h(
+                "button",
+                {
+                  class: "btn btn--icon btn--sm",
+                  type: "button",
+                  title: "显示 / 隐藏",
+                  onClick: () => {
+                    if (revealed.has(item.id)) revealed.delete(item.id);
+                    else revealed.add(item.id);
+                    paint();
                   },
-                  icon(revealed.has(item.id) ? "eyeOff" : "eye", { size: 13 }),
-                ),
-                h(
-                  "button",
-                  {
-                    class: "btn btn--icon btn--sm",
-                    type: "button",
-                    title: "复制该历史密码",
-                    onClick: guard(() => copyText(item.password, "历史密码")),
-                  },
-                  icon("copy", { size: 13 }),
-                ),
-                h(
-                  "button",
-                  {
-                    class: "btn btn--icon btn--sm",
-                    type: "button",
-                    title: "删除",
-                    onClick: guard(async () => {
-                      await removeHistory(entry.id, item.id);
-                    }),
-                  },
-                  icon("x", { size: 13 }),
-                ),
+                },
+                icon(revealed.has(item.id) ? "eyeOff" : "eye", { size: 13 }),
+              ),
+              h(
+                "button",
+                {
+                  class: "btn btn--icon btn--sm",
+                  type: "button",
+                  title: "复制该历史密码",
+                  onClick: guard(() => copyText(item.password, "历史密码")),
+                },
+                icon("copy", { size: 13 }),
+              ),
+              h(
+                "button",
+                {
+                  class: "btn btn--icon btn--sm",
+                  type: "button",
+                  title: "删除",
+                  onClick: guard(async () => {
+                    await removeHistory(entry.id, item.id);
+                  }),
+                },
+                icon("x", { size: 13 }),
               ),
             ),
           )
         : null,
     );
   }
-
   paint();
-  return list;
+
+  return h(
+    "div",
+    { class: "stack stack--tight" },
+    h(
+      "button",
+      {
+        class: "btn btn--ghost btn--sm",
+        type: "button",
+        onClick: () => {
+          expanded = !expanded;
+          paint();
+        },
+      },
+      icon(expanded ? "chevronDown" : "chevronRight", { size: 13 }),
+      expanded ? "收起历史密码" : `查看 ${entry.passwordHistory.length} 个历史密码`,
+    ),
+    body,
+  );
+}
+
+function ruleText(rule) {
+  if (!rule?.enabled) return "未设置规则，任何密码都会被接受。";
+  return ruleSummary(rule);
 }
 
 function detailPane(entry) {
   let revealed = false;
+  const username = effectiveUsername(entry);
   const passwordValue = h("span", { class: "secret__value" }, mask(entry.password, revealed));
   const revealButton = h(
     "button",
@@ -389,7 +384,13 @@ function detailPane(entry) {
     icon("eye", { size: 14 }),
   );
 
-  const parseState = parsedFields(entry);
+  const parsed = FIELD_ORDER.map((kind) => {
+    for (const link of entry.links ?? []) {
+      const hit = (link.parse?.fields ?? []).find((field) => field.kind === kind);
+      if (hit?.value) return { kind, value: hit.value, key: hit.key };
+    }
+    return null;
+  }).filter(Boolean);
 
   return h(
     "div",
@@ -415,16 +416,17 @@ function detailPane(entry) {
       h(
         "div",
         { class: "detail__tags" },
-        sidOf(entry) ? h("span", { class: "tag tag--accent" }, sidOf(entry)) : null,
-        entry.client ? h("span", { class: "tag tag--mono" }, `客户端 ${entry.client}`) : null,
-        entry.language ? h("span", { class: "tag tag--mono" }, entry.language) : null,
+        entry.categoryId === "sap" ? h("span", { class: "tag tag--accent" }, "SAP 账号") : null,
         entry.useKnoxId ? h("span", { class: "tag tag--accent" }, "Knox ID") : null,
         entry.favorite ? h("span", { class: "tag" }, "已收藏") : null,
+        entry.links.length
+          ? h("span", { class: "tag tag--mono" }, `${entry.links.length} 个关联文件`)
+          : null,
       ),
     ),
     h(
       "div",
-      { class: `copy-row${sidOf(entry) ? "" : " copy-row--single"}` },
+      { class: `copy-row${entry.categoryId === "sap" ? "" : " copy-row--single"}` },
       h(
         "button",
         {
@@ -435,7 +437,7 @@ function detailPane(entry) {
         icon("copy", { size: 14 }),
         "复制密码",
       ),
-      sidOf(entry)
+      entry.categoryId === "sap"
         ? h(
             "button",
             {
@@ -465,11 +467,15 @@ function detailPane(entry) {
       h(
         "div",
         { class: "field" },
-        h("span", { class: "field__label" }, "用户名"),
+        h(
+          "span",
+          { class: "field__label" },
+          entry.useKnoxId ? "用户名（全局 Knox ID）" : "用户名",
+        ),
         h(
           "span",
           { class: "field__value" },
-          h("span", { class: "field__text" }, entry.username || "—"),
+          h("span", { class: "field__text", title: username }, username || "—"),
           h(
             "span",
             { class: "field__actions" },
@@ -512,50 +518,7 @@ function detailPane(entry) {
         ),
       ),
     ),
-    h(
-      "div",
-      { class: "detail__section" },
-      h(
-        "div",
-        { class: "detail__section-head" },
-        h("div", { class: "section-title" }, icon("sliders", { size: 12 }), "密码规则"),
-        h(
-          "span",
-          { class: "tag" },
-          entry.rule?.enabled ? "已启用" : "未设置",
-        ),
-      ),
-      h(
-        "p",
-        { class: "form__hint" },
-        entry.rule?.enabled
-          ? describeRule(entry.rule)
-          : "该条目没有规则，任何密码都会被接受。可在编辑条目时添加。",
-      ),
-    ),
-    h(
-      "div",
-      { class: "detail__section" },
-      h(
-        "div",
-        { class: "detail__section-head" },
-        h(
-          "div",
-          { class: "section-title" },
-          icon("clock", { size: 12 }),
-          "密码循环",
-        ),
-        h(
-          "span",
-          { class: "tag tag--mono" },
-          entry.historyCycle > 0 ? `禁止重复最近 ${entry.historyCycle} 个` : "不校验重复",
-        ),
-      ),
-      entry.passwordHistory.length
-        ? historySection(entry)
-        : h("p", { class: "form__hint" }, "还没有历史密码；修改密码时会自动记录。"),
-    ),
-    parseState.some((item) => item.value)
+    parsed.length
       ? h(
           "div",
           { class: "detail__section" },
@@ -563,12 +526,12 @@ function detailPane(entry) {
             "div",
             { class: "section-title" },
             icon("filter", { size: 12 }),
-            "从关联文件解析到的字段",
+            "关联文件中解析到的字段",
           ),
           h(
             "div",
             { class: "stack stack--tight" },
-            parseState.map((item) =>
+            parsed.map((item) =>
               h(
                 "div",
                 { class: "field" },
@@ -578,9 +541,10 @@ function detailPane(entry) {
                   { class: "field__value" },
                   h(
                     "span",
-                    { class: "field__text" },
+                    { class: "field__text", title: item.value },
                     item.kind === "password" ? mask(item.value, false) : item.value,
                   ),
+                  h("span", { class: "tag tag--mono" }, `键 ${item.key}`),
                   h(
                     "button",
                     {
@@ -597,26 +561,29 @@ function detailPane(entry) {
           ),
         )
       : null,
-    entry.hosts?.length
-      ? h(
-          "div",
-          { class: "detail__section" },
-          h("div", { class: "section-title" }, icon("server", { size: 12 }), "登录配置中的主机"),
-          h(
-            "div",
-            { class: "token-list" },
-            entry.hosts.map((host) => h("span", { class: "token" }, host)),
-          ),
-        )
-      : null,
-    entry.url
-      ? h(
-          "div",
-          { class: "detail__section" },
-          h("div", { class: "section-title" }, icon("external", { size: 12 }), "链接"),
-          h("span", { class: "field__text" }, entry.url),
-        )
-      : null,
+    h(
+      "div",
+      { class: "detail__section" },
+      h("div", { class: "section-title" }, icon("sliders", { size: 12 }), "密码规则"),
+      h("p", { class: "form__hint" }, ruleText(entry.rule)),
+    ),
+    h(
+      "div",
+      { class: "detail__section" },
+      h(
+        "div",
+        { class: "detail__section-head" },
+        h("div", { class: "section-title" }, icon("clock", { size: 12 }), "密码循环"),
+        h(
+          "span",
+          { class: "tag tag--mono" },
+          entry.historyCycle > 0 ? `禁止重复最近 ${entry.historyCycle} 个` : "不校验重复",
+        ),
+      ),
+      entry.passwordHistory.length
+        ? historyBlock(entry)
+        : h("p", { class: "form__hint" }, "还没有历史密码；修改密码时会自动记录。"),
+    ),
     entry.notes
       ? h(
           "div",
@@ -635,7 +602,7 @@ function detailPane(entry) {
           "div",
           { class: "section-title" },
           icon("link", { size: 12 }),
-          `关联内容（${entry.links.length}）`,
+          `同步内容（${entry.links.length}）`,
         ),
         h(
           "button",
@@ -661,7 +628,7 @@ function detailPane(entry) {
         : h(
             "p",
             { class: "form__hint" },
-            "还没有关联文件。点击「添加文件」选择 JSON、.env、TOML、YAML、XML 或纯文本文件，SapVault 会自动找出 URL、用户名与密码。",
+            "还没有关联文件。点击「添加文件」选择 JSON、.env、TOML、YAML、XML 或纯文本文件，SapVault 会按关键词找出 URL、用户名与密码。",
           ),
     ),
     h(
@@ -689,19 +656,6 @@ function detailPane(entry) {
   );
 }
 
-function describeRule(rule) {
-  const classes = [];
-  if (rule.lower) classes.push("小写");
-  if (rule.upper) classes.push("大写");
-  if (rule.digits) classes.push("数字");
-  if (rule.symbols) classes.push("符号");
-  const parts = [`${rule.minLength}-${rule.maxLength} 位`, classes.join("+") || "无字符集"];
-  if (rule.forbidden) parts.push(`禁用 ${rule.forbidden}`);
-  if (rule.startWithLetter) parts.push("首字符为字母");
-  if (rule.description) parts.unshift(rule.description);
-  return parts.join(" · ");
-}
-
 /** Master/detail view for every entry, filtered by the selected category. */
 export function renderAccounts(listHost, detailHost) {
   if (!state.vault) return;
@@ -725,7 +679,7 @@ export function renderAccounts(listHost, detailHost) {
             { class: "empty__text" },
             state.search
               ? "试试其它关键字，或清空搜索框。"
-              : "点击右上角「新建条目」，SAP 账号会自动关联系统 ID 与登录配置中的主机名。",
+              : "点击右上角「新建条目」创建账号，然后在详情里添加需要同步的内容文件。",
           ),
         ),
   );

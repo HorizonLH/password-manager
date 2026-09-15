@@ -8,8 +8,34 @@ use crate::model::{Entry, SyncTarget, Vault};
 // Context
 // ---------------------------------------------------------------------------
 
+/// A template-friendly identifier derived from the account title, so `.env`-style
+/// templates can build stable variable names. Falls back to `ACC<n>` when the
+/// title has no ASCII characters (e.g. a fully Chinese name).
+fn slug(title: &str, index: usize) -> String {
+    let mut out = String::new();
+    let mut last_was_separator = true;
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.extend(ch.to_uppercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            out.push('_');
+            last_was_separator = true;
+        }
+        if out.len() >= 24 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        format!("ACC{}", index + 1)
+    } else {
+        trimmed
+    }
+}
+
 /// The values a linked file contributed for one account.
-fn source_values(entry: &Entry, knox_id: &str) -> Vec<Value> {
+fn source_values(entry: &Entry, account_username: &str, index: usize) -> Vec<Value> {
     let mut out = Vec::new();
     for link in &entry.links {
         let parse = link.parse.clone().unwrap_or_default();
@@ -30,9 +56,10 @@ fn source_values(entry: &Entry, knox_id: &str) -> Vec<Value> {
                 "username": link.keys.username,
                 "password": link.keys.password,
             },
-            "systemId": entry.system_id(),
             "account": entry.title,
-            "accountUsername": entry.effective_username(knox_id),
+            "accountUsername": account_username,
+            "accountIndex": index + 1,
+            "accountSlug": slug(&entry.title, index),
         }));
     }
     out
@@ -47,10 +74,9 @@ pub fn build_context(vault: &Vault, line_separator: &str) -> AppResult<Value> {
     let mut entries: Vec<Value> = Vec::new();
     let mut files: Vec<Value> = Vec::new();
 
-    for entry in &vault.entries {
-        let sap = entry.sap.clone().unwrap_or_default();
+    for (index, entry) in vault.entries.iter().enumerate() {
         let username = entry.effective_username(&knox_id);
-        let sources = source_values(entry, &knox_id);
+        let sources = source_values(entry, &username, index);
         for source in &sources {
             files.push(source.clone());
         }
@@ -70,11 +96,6 @@ pub fn build_context(vault: &Vault, line_separator: &str) -> AppResult<Value> {
 
         // A file that already holds the credentials is a perfectly good source,
         // so the effective value falls back to it when the entry field is empty.
-        let effective_url = if entry.url.is_empty() {
-            first("url")
-        } else {
-            entry.url.clone()
-        };
         let effective_username = if username.is_empty() {
             first("username")
         } else {
@@ -85,34 +106,29 @@ pub fn build_context(vault: &Vault, line_separator: &str) -> AppResult<Value> {
         } else {
             entry.password.clone()
         };
+        let effective_url = first("url");
 
         let value = json!({
             "id": entry.id,
+            "index": index,
+            "number": index + 1,
+            "slug": slug(&entry.title, index),
             "title": entry.title,
             "categoryId": entry.category_id,
-            "systemId": sap.system_id,
-            "systemName": sap.system_name,
-            "client": sap.client,
-            "language": sap.language,
             "username": username,
             "useKnoxId": entry.use_knox_id,
             "password": entry.password,
-            "url": effective_url,
-            "ownUrl": entry.url,
-            "ownPassword": entry.password,
             "notes": entry.notes,
-            "hosts": sap.hosts,
-            "domains": sap.hosts,
-            "landscapeSource": sap.landscape_source,
+            "url": effective_url,
+            "effectiveUrl": effective_url,
+            "effectiveUsername": effective_username,
+            "effectivePassword": effective_password,
+            "usernamePassword": format!("{effective_username}{line_separator}{effective_password}"),
             "linkCount": entry.links.len(),
             "sources": sources,
             "sourceUrl": first("url"),
             "sourceUsername": first("username"),
             "sourcePassword": first("password"),
-            "effectiveUrl": effective_url,
-            "effectiveUsername": effective_username,
-            "effectivePassword": effective_password,
-            "usernamePassword": format!("{effective_username}{line_separator}{effective_password}"),
             "ruleSummary": entry.rule.as_ref().map(|rule| rule.summary()).unwrap_or_default(),
             "historyCycle": entry.history_cycle,
             "updatedAt": entry.updated_at,
@@ -240,7 +256,9 @@ fn extract_section(template: &str, from: usize, name: &str) -> AppResult<(usize,
         }
         cursor = end;
     }
-    Err(AppError::Msg(format!("模板区块 {{{{#{name}}}}} 缺少结束标签")))
+    Err(AppError::Msg(format!(
+        "模板区块 {{{{#{name}}}}} 缺少结束标签"
+    )))
 }
 
 fn with_loop_meta(item: &Value, index: usize, total: usize) -> Value {
@@ -263,7 +281,9 @@ fn with_loop_meta(item: &Value, index: usize, total: usize) -> Value {
 fn resolve_token(scope: &Value, token: &str) -> String {
     let mut parts = token.split('|');
     let path = parts.next().unwrap_or("").trim().to_string();
-    let filters: Vec<String> = parts.map(|filter| filter.trim().to_ascii_lowercase()).collect();
+    let filters: Vec<String> = parts
+        .map(|filter| filter.trim().to_ascii_lowercase())
+        .collect();
     let value = resolve(scope, &path);
     let mut text = stringify(&value);
     for filter in filters {
@@ -377,8 +397,6 @@ pub fn presets() -> Vec<TemplatePreset> {
   "credentials": [
 {{#accounts}}    {
       "account": {{title|json}},
-      "systemId": {{systemId|json}},
-      "client": {{client|json}},
       "url": {{effectiveUrl|json}},
       "username": {{effectiveUsername|json}},
       "password": {{effectivePassword|json}},
@@ -394,13 +412,12 @@ pub fn presets() -> Vec<TemplatePreset> {
         TemplatePreset {
             format: "dotenv".to_string(),
             label: ".env".to_string(),
-            description: "按系统 ID 展开的环境变量".to_string(),
+            description: "按账号生成环境变量（变量名取自标题中的英文字母）".to_string(),
             template: r#"# SapVault 自动生成于 {{generatedAt}}
 SAP_KNOX_ID={{knoxId}}
-{{#accounts}}SAP_{{systemId}}_URL={{effectiveUrl}}
-SAP_{{systemId}}_USER={{effectiveUsername}}
-SAP_{{systemId}}_PASSWORD={{effectivePassword}}
-SAP_{{systemId}}_CLIENT={{client}}
+{{#accounts}}SAP_{{slug}}_URL={{effectiveUrl}}
+SAP_{{slug}}_USER={{effectiveUsername}}
+SAP_{{slug}}_PASSWORD={{effectivePassword}}
 {{/accounts}}"#
                 .to_string(),
         },
@@ -412,10 +429,8 @@ SAP_{{systemId}}_CLIENT={{client}}
 generated_at = {{generatedAt|json}}
 
 {{#accounts}}[[accounts]]
-title = {{title|json}}
-system_id = {{systemId|json}}
-client = {{client|json}}
-language = {{language|json}}
+name = {{title|json}}
+slug = {{slug|json}}
 url = {{effectiveUrl|json}}
 username = {{effectiveUsername|json}}
 password = {{effectivePassword|json}}
@@ -431,8 +446,7 @@ sources = {{linkCount}}
             template: r#"knoxId: {{knoxId|json}}
 generatedAt: {{generatedAt|json}}
 accounts:
-{{#accounts}}  - title: {{title|json}}
-    systemId: {{systemId|json}}
+{{#accounts}}  - name: {{title|json}}
     url: {{effectiveUrl|json}}
     username: {{effectiveUsername|json}}
     password: {{effectivePassword|json}}
@@ -444,9 +458,9 @@ accounts:
         TemplatePreset {
             format: "csv".to_string(),
             label: "CSV".to_string(),
-            description: "系统ID、URL、用户名、密码、关联文件数".to_string(),
-            template: r#"系统ID,标题,URL,用户名,密码,客户端,关联文件数
-{{#accounts}}{{systemId}},{{title}},{{effectiveUrl}},{{effectiveUsername}},{{effectivePassword}},{{client}},{{linkCount}}
+            description: "账号、URL、用户名、密码、关联文件数".to_string(),
+            template: r#"账号,URL,用户名,密码,关联文件数
+{{#accounts}}{{title}},{{effectiveUrl}},{{effectiveUsername}},{{effectivePassword}},{{linkCount}}
 {{/accounts}}"#
                 .to_string(),
         },
@@ -458,7 +472,7 @@ accounts:
 Knox ID：{{knoxId}}
 账号数：{{accountCount}}    来源文件数：{{fileCount}}
 
-{{#accounts}}【{{systemId}} / 客户端 {{client}}】{{title}}
+{{#accounts}}【{{title}}】
   URL：{{effectiveUrl}}
   用户名：{{effectiveUsername}}
   密码：{{effectivePassword}}
@@ -571,12 +585,11 @@ pub fn execute(vault: &Vault, target: &SyncTarget, line_separator: &str) -> AppR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys;
+    use crate::model::{Category, ContentLink, KeyMapping, PasswordRule};
     use std::collections::HashMap;
 
-    use crate::keys;
-    use crate::model::{Category, ContentLink, KeyMapping, PasswordRule, SapAccount};
-
-    fn sap_entry(id: &str, title: &str, sid: &str) -> Entry {
+    fn sap_entry(id: &str, title: &str) -> Entry {
         Entry {
             id: id.to_string(),
             title: title.to_string(),
@@ -584,16 +597,8 @@ mod tests {
             username: "JDOE".to_string(),
             use_knox_id: false,
             password: "S3cret!".to_string(),
-            url: String::new(),
             notes: String::new(),
             favorite: false,
-            sap: Some(SapAccount {
-                system_id: sid.to_string(),
-                client: "100".to_string(),
-                language: "ZH".to_string(),
-                hosts: vec!["prd.sap.corp.example".to_string()],
-                ..Default::default()
-            }),
             rule: Some(PasswordRule::default()),
             history_cycle: 5,
             password_history: Vec::new(),
@@ -616,7 +621,7 @@ mod tests {
             knox_id: "KNOX01".to_string(),
             ..Vault::default()
         };
-        let mut first = sap_entry("e1", "生产系统", "PRD");
+        let mut first = sap_entry("e1", "SAP PRD");
         first.links.push(analyzed_link(
             "C:/demo/sap.json",
             "{\"url\":\"https://prd.corp.example\",\"username\":\"FILEUSER\",\"password\":\"FILEPASS\"}",
@@ -624,10 +629,9 @@ mod tests {
         ));
         vault.entries.push(first);
 
-        let mut second = sap_entry("e2", "Knox 账号", "DEV");
+        let mut second = sap_entry("e2", "SAP DEV");
         second.use_knox_id = true;
         second.username = "ignored".to_string();
-        second.url = String::new();
         second.password = String::new();
         second.links.push(analyzed_link(
             "C:/demo/.env",
@@ -645,8 +649,8 @@ mod tests {
         assert_eq!(render("{{knoxId|lower}}", &context).unwrap(), "knox01");
         assert_eq!(render("{{knoxId|json}}", &context).unwrap(), "\"KNOX01\"");
         assert_eq!(
-            render("{{#accounts}}{{systemId}};{{/accounts}}", &context).unwrap(),
-            "PRD;DEV;"
+            render("{{#accounts}}{{title}};{{/accounts}}", &context).unwrap(),
+            "SAP PRD;SAP DEV;"
         );
         assert_eq!(
             render("{{^missing}}none{{/missing}}", &context).unwrap(),
@@ -659,11 +663,25 @@ mod tests {
     }
 
     #[test]
+    fn slugs_are_template_friendly() {
+        let context = build_context(&sample_vault(), "\r\n").unwrap();
+        assert_eq!(
+            render("{{#accounts}}{{slug}};{{/accounts}}", &context).unwrap(),
+            "SAP_PRD;SAP_DEV;"
+        );
+        assert_eq!(slug("生产机", 2), "ACC3");
+        assert_eq!(slug("sap 生产 prd", 0), "SAP_PRD");
+    }
+
+    #[test]
     fn account_values_fall_back_to_the_parsed_files() {
         let context = build_context(&sample_vault(), "\r\n").unwrap();
         assert_eq!(
-            render("{{#entries}}{{effectiveUrl}}|{{effectiveUsername}}|{{effectivePassword}};{{/entries}}", &context)
-                .unwrap(),
+            render(
+                "{{#accounts}}{{effectiveUrl}}|{{effectiveUsername}}|{{effectivePassword}};{{/accounts}}",
+                &context
+            )
+            .unwrap(),
             "https://prd.corp.example|JDOE|S3cret!;https://dev.corp.example|KNOX01|ENVPASS;"
         );
     }
@@ -672,8 +690,11 @@ mod tests {
     fn per_file_sources_are_exposed() {
         let context = build_context(&sample_vault(), "\r\n").unwrap();
         assert_eq!(
-            render("{{#accounts}}{{#sources}}{{format}}:{{username}}/{{password}};{{/sources}}{{/accounts}}", &context)
-                .unwrap(),
+            render(
+                "{{#accounts}}{{#sources}}{{format}}:{{username}}/{{password}};{{/sources}}{{/accounts}}",
+                &context
+            )
+            .unwrap(),
             "json:FILEUSER/FILEPASS;env:ENVUSER/ENVPASS;"
         );
     }
@@ -696,8 +717,9 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{} 渲染失败: {err}", preset.format));
             assert!(!output.is_empty(), "{} 输出为空", preset.format);
             if preset.format.ends_with("Json") {
-                let parsed: Value = serde_json::from_str(&output)
-                    .unwrap_or_else(|err| panic!("{} 不是合法 JSON: {err}\n{output}", preset.format));
+                let parsed: Value = serde_json::from_str(&output).unwrap_or_else(|err| {
+                    panic!("{} 不是合法 JSON: {err}\n{output}", preset.format)
+                });
                 assert!(parsed.is_object());
             }
         }

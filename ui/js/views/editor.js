@@ -5,7 +5,6 @@ import {
   state,
   saveEntry,
   deleteEntry,
-  loadLandscape,
   addHistory,
   removeHistory,
   clearHistory,
@@ -13,15 +12,28 @@ import {
 } from "../state.js";
 import { confirmModal, openModal } from "../modal.js";
 import { toast } from "../toast.js";
-import { formatTime, mask } from "../format.js";
+import { formatTime, mask, ruleSummary } from "../format.js";
 
-const LANGUAGES = [
-  ["", "默认"],
-  ["ZH", "ZH 中文"],
-  ["EN", "EN 英文"],
-  ["DE", "DE 德文"],
-  ["JA", "JA 日文"],
-];
+function defaultRule() {
+  return {
+    enabled: true,
+    description: "",
+    minLength: 8,
+    maxLength: 40,
+    lower: true,
+    upper: true,
+    digits: true,
+    symbols: false,
+    symbolsSet: "!@#$%^&*()-_=+[]{};:,.?",
+    forbidden: "",
+    startWithLetter: false,
+    avoidAmbiguous: false,
+  };
+}
+
+function describeRule(rule) {
+  return ruleSummary(rule, { includeDescription: false });
+}
 
 function field(label, control, hint) {
   return h(
@@ -30,6 +42,24 @@ function field(label, control, hint) {
     h("label", { class: "form__label" }, label),
     control,
     hint ? h("p", { class: "form__hint" }, hint) : null,
+  );
+}
+
+function section(title, iconName, hint, ...children) {
+  return h(
+    "section",
+    { class: "card card--flat" },
+    h(
+      "div",
+      { class: "card__head" },
+      h(
+        "div",
+        null,
+        h("h3", { class: "card__title" }, icon(iconName, { size: 15 }), title),
+        hint ? h("p", { class: "card__hint" }, hint) : null,
+      ),
+    ),
+    ...children,
   );
 }
 
@@ -64,65 +94,102 @@ function updateMeter(meter, password) {
     .catch(() => {});
 }
 
-/** Password rule editor. A rule is optional: `null` means "no policy". */
-function ruleSection(draft, onChange, getPassword) {
-  const container = h("div", { class: "stack stack--tight" });
+/** Password rule block. The mode switch is a segmented control so "不使用规则"
+ *  is always reachable, and `repaint` lets the caller re-sync it after loading
+ *  the entry (or the default rule) asynchronously. */
+function ruleSection(draft, onChange) {
+  const node = h("div", { class: "stack stack--tight" });
+  const feedback = h("div", { class: "stack stack--tight" });
+  let validationTimer = null;
 
-  function paint() {
+  function validate(password) {
+    if (validationTimer) clearTimeout(validationTimer);
+    if (!draft.rule || !password) {
+      mount(feedback);
+      return;
+    }
+    validationTimer = setTimeout(() => {
+      api
+        .validatePassword(password, draft.rule)
+        .then((problems) => {
+          mount(
+            feedback,
+            problems.length
+              ? h(
+                  "div",
+                  { class: "banner banner--warn" },
+                  h("span", { class: "banner__icon" }, icon("alert", { size: 15 })),
+                  h(
+                    "div",
+                    { class: "banner__body" },
+                    h("span", { class: "banner__title" }, "密码不符合当前规则"),
+                    ...problems.map((problem) => h("span", null, problem)),
+                  ),
+                )
+              : h(
+                  "div",
+                  { class: "banner" },
+                  h("span", { class: "banner__icon" }, icon("checkCircle", { size: 15 })),
+                  h("span", null, "密码符合当前规则"),
+                ),
+          );
+        })
+        .catch(() => {});
+    }, 250);
+  }
+
+  function repaint() {
     const rule = draft.rule;
     mount(
-      container,
+      node,
       h(
         "div",
-        { class: "card__head" },
+        { class: "form__row" },
+        h("label", { class: "form__label" }, "是否启用规则"),
         h(
           "div",
-          null,
+          { class: "segmented" },
           h(
-            "h3",
-            { class: "card__title" },
-            icon("sliders", { size: 15 }),
-            "密码规则",
+            "button",
+            {
+              class: `segmented__item${rule ? "" : " is-active"}`,
+              type: "button",
+              onClick: () => {
+                draft.rule = null;
+                onChange();
+                repaint();
+              },
+            },
+            "不使用规则",
           ),
           h(
-            "p",
-            { class: "card__hint" },
-            rule
-              ? "保存时会按此规则校验密码，并可一键生成合规密码。"
-              : "当前未设置规则，任何密码都会被接受。",
+            "button",
+            {
+              class: `segmented__item${rule ? " is-active" : ""}`,
+              type: "button",
+              onClick: () => {
+                draft.rule = { ...defaultRule(), ...(draft.rule ?? {}) };
+                onChange();
+                repaint();
+              },
+            },
+            "使用规则",
           ),
         ),
         h(
-          "label",
-          { class: "checkbox" },
-          h("input", {
-            type: "checkbox",
-            checked: Boolean(rule),
-            onChange: (event) => {
-              draft.rule = event.target.checked ? defaultRule() : null;
-              onChange();
-              paint();
-            },
-          }),
-          h("span", null, "使用规则"),
+          "p",
+          { class: "form__hint" },
+          rule
+            ? "保存时会按此规则校验密码，并可一键生成合规密码。"
+            : "当前不校验密码，任何密码都可以保存。",
         ),
       ),
     );
 
-    if (!rule) return;
-
-    const numberInput = (value, key, min, max) =>
-      h("input", {
-        class: "input input--mono",
-        type: "number",
-        min: String(min),
-        max: String(max),
-        value: String(value),
-        onChange: (event) => {
-          rule[key] = Number(event.target.value);
-          onChange();
-        },
-      });
+    if (!rule) {
+      mount(feedback);
+      return;
+    }
 
     const toggle = (key, label) =>
       h(
@@ -139,13 +206,25 @@ function ruleSection(draft, onChange, getPassword) {
         h("span", null, label),
       );
 
-    mount(
-      container,
+    const numberInput = (key, min, max) =>
+      h("input", {
+        class: "input input--mono",
+        type: "number",
+        min: String(min),
+        max: String(max),
+        value: String(rule[key]),
+        onChange: (event) => {
+          rule[key] = Number(event.target.value);
+          onChange();
+        },
+      });
+
+    node.append(
       h(
         "div",
         { class: "form__grid" },
         field(
-          "规则名称 / 备注",
+          "规则名称",
           h("input", {
             class: "input",
             value: rule.description,
@@ -156,17 +235,17 @@ function ruleSection(draft, onChange, getPassword) {
             },
           }),
         ),
-        field("最小长度", numberInput(rule.minLength, "minLength", 4, 128)),
-        field("最大长度", numberInput(rule.maxLength, "maxLength", 4, 128)),
+        field("最小长度", numberInput("minLength", 4, 128)),
+        field("最大长度", numberInput("maxLength", 4, 128)),
       ),
       h(
         "div",
-        { style: { display: "flex", flexWrap: "wrap", gap: "12px" } },
+        { style: { display: "flex", flexWrap: "wrap", gap: "var(--s-4)" } },
         toggle("lower", "小写字母"),
         toggle("upper", "大写字母"),
         toggle("digits", "数字"),
         toggle("symbols", "符号"),
-        toggle("startWithLetter", "首字符必须是字母"),
+        toggle("startWithLetter", "首字符为字母"),
         toggle("avoidAmbiguous", "排除易混淆字符"),
       ),
       h(
@@ -198,15 +277,16 @@ function ruleSection(draft, onChange, getPassword) {
       ),
       h(
         "div",
-        { style: { display: "flex", gap: "8px", alignItems: "center" } },
+        { style: { display: "flex", alignItems: "center", gap: "var(--s-3)", flexWrap: "wrap" } },
         h(
           "button",
           {
             class: "btn btn--soft btn--sm",
             type: "button",
             onClick: guard(async () => {
-              const generated = await api.generateRulePassword(rule);
+              const generated = await api.generateRulePassword(draft.rule);
               onChange(generated);
+              validate(generated);
               toast("已按规则生成密码", "success");
             }),
           },
@@ -215,255 +295,208 @@ function ruleSection(draft, onChange, getPassword) {
         ),
         h("span", { class: "form__hint" }, `当前规则：${describeRule(rule)}`),
       ),
+      feedback,
     );
   }
 
-  paint();
-  void getPassword;
-  return container;
+  repaint();
+  return { node, repaint, validate };
 }
 
-function defaultRule() {
-  return {
-    enabled: true,
-    description: "",
-    minLength: 8,
-    maxLength: 40,
-    lower: true,
-    upper: true,
-    digits: true,
-    symbols: false,
-    symbolsSet: "!@#$%^&*()-_=+[]{};:,.?",
-    forbidden: "",
-    startWithLetter: false,
-    avoidAmbiguous: false,
-  };
-}
-
-function describeRule(rule) {
-  const classes = [];
-  if (rule.lower) classes.push("小写");
-  if (rule.upper) classes.push("大写");
-  if (rule.digits) classes.push("数字");
-  if (rule.symbols) classes.push("符号");
-  return `${rule.minLength}-${rule.maxLength} 位 · ${classes.join("+") || "无字符集"}`;
-}
-
-/** SAP password history: the system remembers the last N passwords and refuses
- *  to accept a repeat, so the list is what the user needs when rotating. */
-function historySection(draft, repaint) {
-  const container = h("div", { class: "stack stack--tight" });
-  let revealed = new Set();
+/** Password history: the target system remembers the last N passwords, so the
+ *  list is what the user needs when rotating. */
+function historySection(draft, repaintEditor) {
+  const node = h("div", { class: "stack stack--tight" });
+  const revealed = new Set();
   const newPassword = { value: "" };
   const newNote = { value: "" };
 
   function paint() {
     const entryId = draft.id;
     mount(
-      container,
+      node,
       h(
         "div",
-        { class: "card__head" },
-        h(
-          "div",
-          null,
-          h("h3", { class: "card__title" }, icon("clock", { size: 15 }), "密码循环与历史"),
-          h(
-            "p",
-            { class: "card__hint" },
-            "系统会记住最近若干个密码并拒绝重复，这里保留历史密码方便对照。",
-          ),
-        ),
-        h(
-          "div",
-          { style: { display: "flex", alignItems: "center", gap: "8px" } },
-          h("span", { class: "form__label" }, "循环周期"),
+        { class: "form__grid" },
+        field(
+          "循环周期",
           h("input", {
             class: "input input--mono",
             type: "number",
             min: "0",
             max: "50",
-            style: { width: "76px" },
             value: String(draft.historyCycle ?? 0),
             onChange: (event) => {
               draft.historyCycle = Number(event.target.value) || 0;
             },
           }),
         ),
+        field(
+          "已记录",
+          h(
+            "div",
+            { style: { display: "flex", alignItems: "center", gap: "var(--s-2)" } },
+            h("span", { class: "tag tag--mono" }, `${draft.history.length} 个历史密码`),
+            draft.history.length && entryId
+              ? h(
+                  "button",
+                  {
+                    class: "btn btn--ghost btn--sm",
+                    type: "button",
+                    onClick: () =>
+                      confirmModal({
+                        title: "清空历史密码",
+                        message: "确定删除该条目的全部历史密码吗？",
+                        detail: "密码循环校验将不再有参考对象。",
+                        confirmLabel: "清空",
+                        danger: true,
+                        onConfirm: guard(async () => {
+                          const updated = await clearHistory(entryId);
+                          draft.history = updated.passwordHistory ?? [];
+                          repaintEditor?.();
+                          paint();
+                        }),
+                      }),
+                  },
+                  "清空",
+                )
+              : null,
+          ),
+          draft.historyCycle > 0
+            ? `保存时检查新密码是否与最近 ${draft.historyCycle} 个密码重复。`
+            : "循环周期为 0：不做重复校验。",
+        ),
       ),
-      h(
-        "p",
-        { class: "form__hint" },
-        draft.historyCycle > 0
-          ? `保存时会检查新密码是否与最近 ${draft.historyCycle} 个密码重复（0 表示不检查）。`
-          : "循环周期为 0：不会做重复校验。",
-      ),
-      entryId
+      draft.history.length
         ? h(
             "div",
             { class: "stack stack--tight" },
-            h(
-              "div",
-              { class: "detail__section-head" },
+            draft.history.map((item, index) =>
               h(
-                "span",
-                { class: "section-title" },
-                `已记录 ${draft.history.length} 个历史密码`,
-              ),
-              draft.history.length
-                ? h(
-                    "button",
-                    {
-                      class: "btn btn--ghost btn--sm",
-                      type: "button",
-                      onClick: () =>
-                        confirmModal({
-                          title: "清空历史密码",
-                          message: "确定删除该条目的全部历史密码吗？",
-                          detail: "密码循环校验将不再有参考对象。",
-                          confirmLabel: "清空",
-                          danger: true,
-                          onConfirm: guard(async () => {
-                            const entry = await clearHistory(entryId);
-                            draft.history = entry.passwordHistory ?? [];
-                            repaint?.();
-                            paint();
-                          }),
-                        }),
+                "div",
+                { class: "assoc__file" },
+                h(
+                  "span",
+                  { class: "tag tag--mono" },
+                  draft.historyCycle > 0 && index < draft.historyCycle ? "循环内" : "更早",
+                ),
+                h(
+                  "span",
+                  { class: "field__text", style: { flex: "1" } },
+                  revealed.has(item.id) ? item.password : mask(item.password, false),
+                ),
+                h("span", { class: "subtle nowrap" }, item.note || formatTime(item.recordedAt)),
+                h(
+                  "button",
+                  {
+                    class: "btn btn--icon btn--sm",
+                    type: "button",
+                    title: "显示 / 隐藏",
+                    onClick: () => {
+                      if (revealed.has(item.id)) revealed.delete(item.id);
+                      else revealed.add(item.id);
+                      paint();
                     },
-                    icon("trash", { size: 12 }),
-                    "清空",
-                  )
-                : null,
-            ),
-            draft.history.length
-              ? h(
-                  "div",
-                  { class: "stack stack--tight" },
-                  draft.history.map((item, index) =>
-                    h(
-                      "div",
-                      { class: "assoc__file" },
-                      h(
-                        "span",
-                        { class: "tag tag--mono" },
-                        draft.historyCycle > 0 && index < draft.historyCycle ? "循环内" : "更早",
-                      ),
-                      h(
-                        "span",
-                        { class: "field__text", style: { flex: "1" } },
-                        revealed.has(item.id) ? item.password : mask(item.password, false),
-                      ),
-                      item.note
-                        ? h("span", { class: "subtle" }, item.note)
-                        : h("span", { class: "subtle" }, formatTime(item.recordedAt)),
-                      h(
-                        "button",
-                        {
-                          class: "btn btn--icon btn--sm",
-                          type: "button",
-                          title: "显示 / 隐藏",
-                          onClick: () => {
-                            if (revealed.has(item.id)) revealed.delete(item.id);
-                            else revealed.add(item.id);
-                            paint();
-                          },
-                        },
-                        icon(revealed.has(item.id) ? "eyeOff" : "eye", { size: 13 }),
-                      ),
-                      h(
-                        "button",
-                        {
-                          class: "btn btn--icon btn--sm",
-                          type: "button",
-                          title: "复制该历史密码",
-                          onClick: guard(() => copyText(item.password, "历史密码")),
-                        },
-                        icon("copy", { size: 13 }),
-                      ),
-                      h(
-                        "button",
-                        {
-                          class: "btn btn--icon btn--sm",
-                          type: "button",
-                          title: "删除",
-                          onClick: guard(async () => {
-                            const entry = await removeHistory(entryId, item.id);
-                            draft.history = entry.passwordHistory ?? [];
-                            repaint?.();
-                            paint();
-                          }),
-                        },
-                        icon("x", { size: 13 }),
-                      ),
-                    ),
-                  ),
-                )
-              : h("p", { class: "form__hint" }, "还没有历史密码；修改密码时会自动记录。"),
-            h(
-              "div",
-              { class: "form__grid" },
-              field(
-                "手动补录历史密码",
-                h("div", { class: "input-group" }, h("input", {
-                  class: "input input--mono",
-                  type: "text",
-                  placeholder: "以前用过的密码",
-                  onInput: (event) => {
-                    newPassword.value = event.target.value;
                   },
-                })),
-              ),
-              field(
-                "备注",
-                h("input", {
-                  class: "input",
-                  placeholder: "例如：2024Q1 使用",
-                  onInput: (event) => {
-                    newNote.value = event.target.value;
+                  icon(revealed.has(item.id) ? "eyeOff" : "eye", { size: 13 }),
+                ),
+                h(
+                  "button",
+                  {
+                    class: "btn btn--icon btn--sm",
+                    type: "button",
+                    title: "复制",
+                    onClick: guard(() => copyText(item.password, "历史密码")),
                   },
-                }),
+                  icon("copy", { size: 13 }),
+                ),
+                h(
+                  "button",
+                  {
+                    class: "btn btn--icon btn--sm",
+                    type: "button",
+                    title: "删除",
+                    onClick: guard(async () => {
+                      const updated = await removeHistory(entryId, item.id);
+                      draft.history = updated.passwordHistory ?? [];
+                      repaintEditor?.();
+                      paint();
+                    }),
+                  },
+                  icon("x", { size: 13 }),
+                ),
               ),
-            ),
-            h(
-              "button",
-              {
-                class: "btn btn--sm",
-                type: "button",
-                onClick: guard(async () => {
-                  if (!newPassword.value) {
-                    toast("请先填写历史密码", "error");
-                    return;
-                  }
-                  const entry = await addHistory(entryId, newPassword.value, newNote.value);
-                  draft.history = entry.passwordHistory ?? [];
-                  newPassword.value = "";
-                  newNote.value = "";
-                  repaint?.();
-                  paint();
-                  toast("已补录历史密码", "success");
-                }),
-              },
-              icon("plus", { size: 13 }),
-              "添加历史密码",
             ),
           )
         : h(
             "p",
             { class: "form__hint" },
-            "保存条目后即可记录历史密码。",
+            entryId
+              ? "还没有历史密码；修改密码时会自动记录，也可以在下面手动补录。"
+              : "保存条目后即可记录历史密码。",
           ),
+      entryId
+        ? h(
+            "div",
+            { class: "form__grid" },
+            field(
+              "手动补录",
+              h("input", {
+                class: "input input--mono",
+                placeholder: "以前用过的密码",
+                onInput: (event) => {
+                  newPassword.value = event.target.value;
+                },
+              }),
+            ),
+            field(
+              "备注",
+              h("input", {
+                class: "input",
+                placeholder: "例如：2024Q1 使用",
+                onInput: (event) => {
+                  newNote.value = event.target.value;
+                },
+              }),
+            ),
+            h(
+              "div",
+              { class: "form__row" },
+              h("label", { class: "form__label" }, " "),
+              h(
+                "button",
+                {
+                  class: "btn btn--sm",
+                  type: "button",
+                  onClick: guard(async () => {
+                    if (!newPassword.value) {
+                      toast("请先填写历史密码", "error");
+                      return;
+                    }
+                    const updated = await addHistory(entryId, newPassword.value, newNote.value);
+                    draft.history = updated.passwordHistory ?? [];
+                    newPassword.value = "";
+                    newNote.value = "";
+                    paint();
+                    toast("已补录历史密码", "success");
+                  }),
+                },
+                icon("plus", { size: 13 }),
+                "添加",
+              ),
+            ),
+          )
+        : null,
     );
   }
 
   paint();
-  return container;
+  return { node, repaint: paint };
 }
 
 /** Modal editor for one entry. `entry` may be null to create a new record. */
 export function openEntryEditor({ entry, defaultCategory, onSaved }) {
   const editing = Boolean(entry?.id);
-  const isSapCategory = (categoryId) => categoryId === "sap";
 
   const draft = {
     id: entry?.id ?? null,
@@ -471,41 +504,41 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     categoryId: entry?.categoryId ?? defaultCategory ?? "sap",
     username: entry?.username ?? "",
     useKnoxId: entry?.useKnoxId ?? false,
-    url: entry?.url ?? "",
     notes: entry?.notes ?? "",
     favorite: entry?.favorite ?? false,
     rule: entry?.rule ? { ...entry.rule } : null,
     historyCycle: entry?.historyCycle ?? 0,
     history: [...(entry?.passwordHistory ?? [])],
-    sap: {
-      systemId: entry?.sap?.systemId ?? "",
-      client: entry?.sap?.client ?? "",
-      language: entry?.sap?.language ?? "",
-      systemName: entry?.sap?.systemName ?? "",
-      hosts: [...(entry?.sap?.hosts ?? [])],
-      landscapeSource: entry?.sap?.landscapeSource ?? "",
-    },
   };
   const password = { value: "" };
 
   const passwordMeter = strengthMeter();
-  const ruleFeedback = h("div", { class: "stack stack--tight" });
-  const systemSelect = h("select", { class: "select" });
-  const hostList = h("div", { class: "token-list" });
-  const systemHint = h("p", { class: "form__hint" });
-
-  const systemInput = h("input", {
-    id: "editor-system",
+  const passwordInput = h("input", {
+    id: "editor-password",
     class: "input input--mono",
-    value: draft.sap.systemId,
-    maxlength: "8",
-    placeholder: "例如 PRD",
+    type: "password",
+    placeholder: editing ? "留空表示保留原密码" : "密码",
     onInput: (event) => {
-      draft.sap.systemId = event.target.value.toUpperCase();
-      event.target.value = draft.sap.systemId;
+      password.value = event.target.value;
+      updateMeter(passwordMeter, password.value);
+      rule.validate(password.value);
     },
-    onChange: (event) => resolveSystem(event.target.value),
   });
+
+  const revealButton = h(
+    "button",
+    {
+      class: "btn btn--icon",
+      type: "button",
+      "aria-label": "显示密码",
+      onClick: () => {
+        const showing = passwordInput.type === "text";
+        passwordInput.type = showing ? "password" : "text";
+        mount(revealButton, icon(showing ? "eye" : "eyeOff", { size: 15 }));
+      },
+    },
+    icon("eye", { size: 15 }),
+  );
 
   const usernameInput = h("input", {
     id: "editor-username",
@@ -532,130 +565,10 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     },
   });
 
-  const passwordInput = h("input", {
-    id: "editor-password",
-    class: "input input--mono",
-    type: "password",
-    placeholder: editing ? "留空表示保留原密码" : "密码",
-    onInput: (event) => {
-      password.value = event.target.value;
-      updateMeter(passwordMeter, password.value);
-      scheduleValidation();
-    },
-  });
-
-  const revealButton = h(
-    "button",
-    {
-      class: "btn btn--icon",
-      type: "button",
-      "aria-label": "显示密码",
-      onClick: () => {
-        const showing = passwordInput.type === "text";
-        passwordInput.type = showing ? "password" : "text";
-        mount(revealButton, icon(showing ? "eye" : "eyeOff", { size: 15 }));
-      },
-    },
-    icon("eye", { size: 15 }),
-  );
-
-  let validationTimer = null;
-  function scheduleValidation() {
-    if (validationTimer) clearTimeout(validationTimer);
-    validationTimer = setTimeout(() => {
-      validationTimer = null;
-      runValidation();
-    }, 220);
-  }
-
-  function runValidation() {
-    const value = password.value;
-    if (!draft.rule || !value) {
-      mount(ruleFeedback);
-      return;
-    }
-    api
-      .validatePassword(value, draft.rule)
-      .then((problems) => {
-        mount(
-          ruleFeedback,
-          problems.length
-            ? h(
-                "div",
-                { class: "banner banner--warn" },
-                h("span", { class: "banner__icon" }, icon("alert", { size: 15 })),
-                h(
-                  "div",
-                  { class: "banner__body" },
-                  h("span", { class: "banner__title" }, "密码不符合当前规则"),
-                  ...problems.map((problem) => h("span", null, problem)),
-                ),
-              )
-            : h(
-                "div",
-                { class: "banner" },
-                h("span", { class: "banner__icon" }, icon("checkCircle", { size: 15 })),
-                h("span", null, "密码符合当前规则"),
-              ),
-        );
-      })
-      .catch(() => {});
-  }
-
-  const sapSection = h(
-    "div",
-    { class: "stack", hidden: !isSapCategory(draft.categoryId) },
-    h("div", { class: "section-title" }, icon("server", { size: 13 }), "SAP 系统信息"),
-    h(
-      "div",
-      { class: "form__grid" },
-      field("系统 ID", systemInput),
-      field(
-        "客户端",
-        h("input", {
-          class: "input input--mono",
-          value: draft.sap.client,
-          placeholder: "例如 100",
-          onInput: (event) => {
-            draft.sap.client = event.target.value;
-          },
-        }),
-      ),
-      field(
-        "登录语言",
-        h(
-          "select",
-          {
-            class: "select",
-            onChange: (event) => {
-              draft.sap.language = event.target.value;
-            },
-          },
-          LANGUAGES.map(([value, label]) =>
-            h("option", { value, selected: value === draft.sap.language }, label),
-          ),
-        ),
-      ),
-      field(
-        "从登录配置选择",
-        systemSelect,
-        "依据 SAPUILandscape.xml 解析；同一系统 ID 的多个连接会全部合并",
-      ),
-    ),
-    h(
-      "div",
-      { class: "form__row" },
-      h("label", { class: "form__label" }, "登录配置中的主机名"),
-      hostList,
-      systemHint,
-    ),
-  );
-
   const categorySelect = h("select", {
     class: "select",
     onChange: (event) => {
       draft.categoryId = event.target.value;
-      sapSection.hidden = !isSapCategory(draft.categoryId);
     },
   });
   mount(
@@ -666,73 +579,96 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
   );
   categorySelect.value = draft.categoryId;
 
-  function paintSystems() {
-    const bySid = new Map();
-    for (const system of state.landscape?.systems ?? []) {
-      if (!system.systemId) continue;
-      if (!bySid.has(system.systemId)) bySid.set(system.systemId, []);
-      bySid.get(system.systemId).push(system);
+  const history = historySection(draft, () => onSaved?.());
+  const rule = ruleSection(draft, (generated) => {
+    if (typeof generated === "string") {
+      password.value = generated;
+      passwordInput.value = generated;
+      passwordInput.type = "text";
+      updateMeter(passwordMeter, generated);
     }
-    const options = [h("option", { value: "" }, "（从登录配置中选择）")];
-    for (const sid of [...bySid.keys()].sort()) {
-      const systems = bySid.get(sid);
-      options.push(
-        h(
-          "option",
-          { value: sid },
-          `${sid} · ${systems[0].name || systems[0].systemId}${systems.length > 1 ? ` (+${systems.length - 1})` : ""}`,
+  });
+
+  const body = h(
+    "div",
+    { class: "form" },
+    section(
+      "基本信息",
+      "key",
+      null,
+      h(
+        "div",
+        { class: "form__grid" },
+        field(
+          "标题",
+          h("input", {
+            id: "editor-title",
+            class: "input",
+            value: draft.title,
+            placeholder: "例如 生产机 PRD",
+            onInput: (event) => {
+              draft.title = event.target.value;
+            },
+          }),
         ),
-      );
-    }
-    mount(systemSelect, options);
-    systemSelect.value = draft.sap.systemId;
-  }
-
-  function paintHosts() {
-    mount(
-      hostList,
-      draft.sap.hosts.length
-        ? draft.sap.hosts.map((host) => h("span", { class: "token" }, host))
-        : h("span", { class: "form__hint" }, "登录配置中没有该系统的记录"),
-    );
-  }
-
-  const resolveSystem = guard(async (sid) => {
-    const value = (sid ?? "").trim().toUpperCase();
-    draft.sap.systemId = value;
-    if (!value) {
-      draft.sap.hosts = [];
-      systemHint.textContent = "";
-      paintHosts();
-      return;
-    }
-    const systems = await api.sapResolve(value);
-    if (!systems.length) {
-      draft.sap.hosts = [];
-      systemHint.textContent = "登录配置中没有该系统 ID，仍可保存";
-      paintHosts();
-      return;
-    }
-    const hosts = new Set();
-    for (const system of systems) {
-      for (const host of system.hosts ?? []) hosts.add(host);
-    }
-    draft.sap.hosts = [...hosts];
-    draft.sap.systemName = systems[0].name || systems[0].description || "";
-    draft.sap.landscapeSource = systems[0].sourceFile || "";
-    if (!draft.sap.client && systems[0].client) draft.sap.client = systems[0].client;
-    systemHint.textContent =
-      systems.length > 1
-        ? `系统 ID ${value} 出现 ${systems.length} 次，已合并全部主机名`
-        : `解析到 ${draft.sap.hosts.length} 个主机名`;
-    paintHosts();
-  });
-
-  systemSelect.addEventListener("change", () => {
-    if (!systemSelect.value) return;
-    systemInput.value = systemSelect.value;
-    resolveSystem(systemSelect.value);
-  });
+        field("分类", categorySelect, "SAP 分类的账号会参与全局配置同步"),
+      ),
+    ),
+    section(
+      "凭据",
+      "user",
+      null,
+      h(
+        "div",
+        { class: "form__grid" },
+        field(
+          "用户名",
+          h(
+            "div",
+            { class: "stack stack--tight" },
+            usernameInput,
+            h(
+              "label",
+              { class: "checkbox" },
+              knoxToggle,
+              h("span", null, `使用全局 Knox ID（${state.vault?.knoxId || "未设置"}）`),
+            ),
+          ),
+        ),
+        field(
+          "密码",
+          h("div", { class: "input-group" }, passwordInput, revealButton),
+          editing ? "留空表示保留原密码" : null,
+        ),
+      ),
+      passwordMeter,
+    ),
+    section(
+      "密码规则",
+      "sliders",
+      "可以选择使用规则，也可以完全不加规则。",
+      rule.node,
+    ),
+    section(
+      "密码循环与历史",
+      "clock",
+      "SAP 系统会记住最近若干个密码并拒绝重复，这里保留历史密码方便对照。",
+      history.node,
+    ),
+    section(
+      "备注",
+      "file",
+      null,
+      h("textarea", {
+        class: "textarea",
+        value: draft.notes,
+        placeholder: "可选",
+        onInput: (event) => {
+          draft.notes = event.target.value;
+        },
+      }),
+    ),
+  );
 
   function buildInput(force) {
     return {
@@ -742,22 +678,11 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
       username: draft.username,
       useKnoxId: draft.useKnoxId,
       password: password.value,
-      url: draft.url,
       notes: draft.notes,
       favorite: draft.favorite,
       rule: draft.rule,
       historyCycle: draft.historyCycle,
       force: Boolean(force),
-      sap: isSapCategory(draft.categoryId)
-        ? {
-            systemId: draft.sap.systemId,
-            client: draft.sap.client,
-            language: draft.sap.language,
-            systemName: draft.sap.systemName,
-            hosts: draft.sap.hosts,
-            landscapeSource: draft.sap.landscapeSource,
-          }
-        : null,
     };
   }
 
@@ -794,89 +719,6 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     }
   }
 
-  const body = h(
-    "div",
-    { class: "form" },
-    h(
-      "div",
-      { class: "form__grid" },
-      field(
-        "标题",
-        h("input", {
-          id: "editor-title",
-          class: "input",
-          value: draft.title,
-          placeholder: "例如 生产机 PRD",
-          onInput: (event) => {
-            draft.title = event.target.value;
-          },
-        }),
-      ),
-      field("分类", categorySelect, "SAP 账号会参与全局配置同步"),
-    ),
-    h(
-      "div",
-      { class: "form__grid" },
-      field(
-        "用户名",
-        h(
-          "div",
-          { class: "stack stack--tight" },
-          usernameInput,
-          h(
-            "label",
-            { class: "checkbox" },
-            knoxToggle,
-            h("span", null, `使用全局 Knox ID（${state.vault?.knoxId || "未设置"}）`),
-          ),
-        ),
-      ),
-      field(
-        "密码",
-        h("div", { class: "input-group" }, passwordInput, revealButton),
-        editing ? "留空表示保留原密码" : null,
-      ),
-    ),
-    passwordMeter,
-    ruleFeedback,
-    ruleSection(draft, (generated) => {
-      if (typeof generated === "string") {
-        password.value = generated;
-        passwordInput.value = generated;
-        passwordInput.type = "text";
-        updateMeter(passwordMeter, generated);
-      }
-      runValidation();
-    }),
-    sapSection,
-    historySection(draft, () => onSaved?.()),
-    h(
-      "div",
-      { class: "form__grid" },
-      field(
-        "链接 / URL",
-        h("input", {
-          class: "input",
-          value: draft.url,
-          placeholder: "可选；留空时同步会使用关联文件中解析到的 URL",
-          onInput: (event) => {
-            draft.url = event.target.value;
-          },
-        }),
-      ),
-      field(
-        "备注",
-        h("textarea", {
-          class: "textarea",
-          value: draft.notes,
-          onInput: (event) => {
-            draft.notes = event.target.value;
-          },
-        }),
-      ),
-    ),
-  );
-
   async function prepare() {
     if (editing) {
       const full = await api.entryGet(draft.id);
@@ -898,12 +740,11 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
       password.value = generated;
       passwordInput.value = generated;
       draft.rule = state.settings?.defaultRule ? { ...state.settings.defaultRule } : null;
-      updateMeter(passwordMeter, generated);
+      updateMeter(passwordMeter, password.value);
     }
-    if (state.landscape) paintSystems();
-    else loadLandscape(false).then(paintSystems).catch(() => {});
-    paintHosts();
-    if (draft.sap.systemId) resolveSystem(draft.sap.systemId);
+    // The loaded rule / history may differ from what was rendered first.
+    rule.repaint();
+    history.repaint();
   }
 
   prepare().catch(() => {});
@@ -915,7 +756,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     footer: (close) =>
       h(
         "div",
-        { style: { display: "flex", gap: "8px", width: "100%", alignItems: "center" } },
+        { style: { display: "flex", gap: "var(--s-2)", width: "100%", alignItems: "center" } },
         editing
           ? h(
               "button",
@@ -946,11 +787,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
         h("button", { class: "btn btn--ghost", type: "button", onClick: close }, "取消"),
         h(
           "button",
-          {
-            class: "btn btn--primary",
-            type: "button",
-            onClick: () => submit(close),
-          },
+          { class: "btn btn--primary", type: "button", onClick: () => submit(close) },
           icon("check", { size: 15 }),
           "保存",
         ),

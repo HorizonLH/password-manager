@@ -6,7 +6,6 @@ use zeroize::Zeroize;
 use crate::crypto::{KdfParams, KEY_LEN};
 use crate::error::{AppError, AppResult};
 use crate::model::{now_string, Vault};
-use crate::sap::LandscapeReport;
 use crate::store::{self, Settings, VaultEnvelope, VaultMode};
 
 /// Everything that only exists while the vault is open. The derived key and the
@@ -41,7 +40,6 @@ pub struct AppState {
     unlocked: Mutex<Option<Unlocked>>,
     envelope: Mutex<Option<VaultEnvelope>>,
     settings: Mutex<Settings>,
-    landscape: Mutex<Option<LandscapeReport>>,
     last_activity: Mutex<Instant>,
     /// Set when the vault file exists but could not be read: the UI shows this
     /// instead of pretending there is no vault yet.
@@ -58,7 +56,6 @@ impl AppState {
             unlocked: Mutex::new(None),
             envelope: Mutex::new(envelope),
             settings: Mutex::new(settings),
-            landscape: Mutex::new(None),
             last_activity: Mutex::new(Instant::now()),
             startup_error,
         }
@@ -140,16 +137,6 @@ impl AppState {
             .lock()
             .map(|mut guard| guard.take().is_some())
             .unwrap_or(false)
-    }
-
-    pub fn landscape_snapshot(&self) -> Option<LandscapeReport> {
-        self.landscape.lock().ok().and_then(|guard| guard.clone())
-    }
-
-    pub fn set_landscape(&self, report: LandscapeReport) {
-        if let Ok(mut guard) = self.landscape.lock() {
-            *guard = Some(report);
-        }
     }
 
     /// Read-only access to the decrypted vault.

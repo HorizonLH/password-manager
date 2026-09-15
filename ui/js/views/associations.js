@@ -7,19 +7,13 @@ import {
   FIELD_ORDER,
   formatBytes,
   formatLabel,
+  initials,
   mask,
-  shortSid,
 } from "../format.js";
 import { openKeyEditor } from "./linkkeys.js";
 
-function parsedValue(link, kind) {
-  const hit = (link.parse?.fields ?? []).find((field) => field.kind === kind);
-  return hit?.value ?? "";
-}
-
-function parsedKey(link, kind) {
-  const hit = (link.parse?.fields ?? []).find((field) => field.kind === kind);
-  return hit?.key ?? "";
+function hitOf(link, kind) {
+  return (link.parse?.fields ?? []).find((field) => field.kind === kind) ?? null;
 }
 
 function accountCard(association) {
@@ -32,36 +26,20 @@ function accountCard(association) {
     h(
       "div",
       { class: "assoc__head" },
-      h(
-        "span",
-        { class: "assoc__avatar" },
-        shortSid(association.systemId || association.entryTitle),
-      ),
+      h("span", { class: "assoc__avatar" }, initials(association.entryTitle)),
       h(
         "span",
         { class: "assoc__title" },
-        h(
-          "span",
-          { class: "assoc__name" },
-          association.entryTitle,
-          association.systemId
-            ? h(
-                "span",
-                { class: "tag tag--accent tag--mono", style: { marginLeft: "8px" } },
-                association.systemId,
-              )
-            : null,
-        ),
+        h("span", { class: "assoc__name" }, association.entryTitle),
         h(
           "span",
           { class: "assoc__meta" },
-          association.username ? `用户 ${association.username}` : "未设置用户名",
-          association.hosts?.length ? ` · 主机 ${association.hosts.join(", ")}` : "",
+          association.username ? `用户名 ${association.username}` : "未设置用户名",
+          files.length ? ` · ${files.length} 个同步文件` : "",
         ),
       ),
-      h("span", { class: "tag" }, icon("link", { size: 11 }), `${files.length} 个文件`),
       incomplete
-        ? h("span", { class: "tag tag--warn" }, `${incomplete} 个字段不完整`)
+        ? h("span", { class: "tag tag--warn" }, `${incomplete} 个文件字段不完整`)
         : files.length
           ? h("span", { class: "tag tag--success" }, "字段完整")
           : null,
@@ -121,27 +99,27 @@ function accountCard(association) {
                 "div",
                 { class: "evidence" },
                 ...FIELD_ORDER.map((kind) => {
-                  const value = parsedValue(link, kind);
+                  const hit = hitOf(link, kind);
                   return h(
                     "div",
                     { class: "evidence__row" },
                     h("span", { class: "field__label" }, FIELD_LABELS[kind]),
-                    value
+                    hit
                       ? h(
                           "span",
-                          { class: "field__text" },
-                          kind === "password" ? mask(value, false) : value,
+                          { class: "field__text", title: hit.value },
+                          kind === "password" ? mask(hit.value, false) : hit.value,
                         )
                       : h("span", { class: "tag tag--warn" }, "未识别"),
-                    value ? h("span", { class: "tag tag--mono" }, `键 ${parsedKey(link, kind)}`) : null,
-                    value
+                    hit ? h("span", { class: "tag tag--mono" }, `键 ${hit.key}`) : null,
+                    hit
                       ? h(
                           "button",
                           {
                             class: "btn btn--icon btn--sm",
                             type: "button",
                             title: `复制${FIELD_LABELS[kind]}`,
-                            onClick: guard(() => copyText(value, FIELD_LABELS[kind])),
+                            onClick: guard(() => copyText(hit.value, FIELD_LABELS[kind])),
                           },
                           icon("copy", { size: 12 }),
                         )
@@ -155,7 +133,7 @@ function accountCard(association) {
       : h(
           "p",
           { class: "assoc__empty" },
-          "尚未关联文件。在账号详情里点击「添加文件」，选择 JSON、.env、TOML、YAML、XML 或纯文本文件即可。",
+          "尚未添加同步文件。打开该账号，在详情里点击「添加文件」即可。",
         ),
   );
 }
@@ -166,25 +144,23 @@ function tableView(rows) {
     { class: "table" },
     h(
       "div",
-      { class: "table__row table__head", style: { "--table-cols": "100px 1.3fr 1fr 1.3fr 90px" } },
-      h("span", { class: "table__cell" }, "系统 ID"),
+      {
+        class: "table__row table__head",
+        style: { "--table-cols": "1.2fr 1fr 1.6fr 90px" },
+      },
       h("span", { class: "table__cell" }, "账号"),
       h("span", { class: "table__cell" }, "用户名"),
-      h("span", { class: "table__cell" }, "URL（来自关联文件）"),
+      h("span", { class: "table__cell" }, "URL（来自同步文件）"),
       h("span", { class: "table__cell" }, "文件"),
     ),
     rows.map((association) => {
       const files = association.links ?? [];
-      const url = files.map((link) => parsedValue(link, "url")).find(Boolean) ?? "";
-      const complete = files.length > 0 && files.every((link) => (link.parse?.missing ?? []).length === 0);
+      const url = files.map((link) => hitOf(link, "url")?.value).find(Boolean) ?? "";
+      const complete =
+        files.length > 0 && files.every((link) => (link.parse?.missing ?? []).length === 0);
       return h(
         "div",
-        { class: "table__row", style: { "--table-cols": "100px 1.3fr 1fr 1.3fr 90px" } },
-        h(
-          "span",
-          { class: "table__cell" },
-          h("span", { class: "tag tag--accent tag--mono" }, association.systemId || "—"),
-        ),
+        { class: "table__row", style: { "--table-cols": "1.2fr 1fr 1.6fr 90px" } },
         h("span", { class: "table__cell" }, association.entryTitle),
         h("span", { class: "table__cell table__cell--mono" }, association.username || "—"),
         h(
@@ -219,9 +195,7 @@ export function renderAssociations(container) {
     if (!term) return true;
     return [
       association.entryTitle,
-      association.systemId,
       association.username,
-      ...(association.hosts ?? []),
       ...(association.links ?? []).map((link) => link.path),
       ...(association.links ?? []).flatMap((link) =>
         (link.parse?.fields ?? []).map((field) => field.value),
@@ -252,7 +226,7 @@ export function renderAssociations(container) {
       h("input", {
         id: "assoc-filter",
         class: "search__input",
-        placeholder: "按账号、系统 ID、用户名、文件名或解析出的内容筛选",
+        placeholder: "按账号、用户名、文件名或解析出的内容筛选",
         value: state.assocFilter ?? "",
         onInput: (event) => setState({ assocFilter: event.target.value }),
       }),
@@ -309,18 +283,16 @@ export function renderAssociations(container) {
             "div",
             { class: "token-list" },
             h("span", { class: "tag tag--mono" }, `${all.length} 个 SAP 账号`),
-            h("span", { class: "tag tag--mono" }, `${totalLinks} 个关联文件`),
-            incomplete
-              ? h("span", { class: "tag tag--warn tag--mono" }, `${incomplete} 个字段不完整`)
-              : null,
+            h("span", { class: "tag tag--mono" }, `${totalLinks} 个同步文件`),
+            incomplete ? h("span", { class: "tag tag--warn" }, `${incomplete} 个字段不完整`) : null,
             missingFiles
-              ? h("span", { class: "tag tag--danger tag--mono" }, `${missingFiles} 个文件已不存在`)
+              ? h("span", { class: "tag tag--danger" }, `${missingFiles} 个文件已不存在`)
               : null,
           ),
           h(
             "p",
             { class: "form__hint" },
-            "这里展示每个 SAP 账号与「需要同步的内容」之间的关联：文件由你手动选择，SapVault 会从 JSON、.env、TOML、YAML、XML 或纯文本中解析出 URL、用户名与密码，并显示所用的关键词。缺失字段可点击「关键词」手动指定。",
+            "这里展示每个 SAP 账号与同步文件之间的关联：文件由你手动选择，SapVault 会从 JSON、.env、TOML、YAML、XML 或纯文本中解析出 URL、用户名与密码，并显示所用的关键词。缺失字段可点击「关键词」手动指定。",
           ),
           rows.length
             ? state.assocMode === "table"
@@ -336,7 +308,7 @@ export function renderAssociations(container) {
                   { class: "empty__text" },
                   all.length
                     ? "试试清空筛选条件，或取消「只看已关联」。"
-                    : "先在「账号」页创建 SAP 账号，然后在详情里添加需要同步的内容文件。",
+                    : "先在「账号」页创建 SAP 账号，然后在详情里添加同步文件。",
                 ),
               ),
         ),

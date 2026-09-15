@@ -138,12 +138,17 @@ impl PasswordRule {
         if self.symbols {
             classes.push("符号");
         }
-        let mut text = format!("{}-{} 位 / {}", self.min_length, self.max_length, classes.join("+"));
+        let mut text = format!(
+            "{}-{} 位 · {}",
+            self.min_length,
+            self.max_length,
+            classes.join("+")
+        );
         if !self.forbidden.is_empty() {
-            text.push_str(&format!(" / 禁用 {}", self.forbidden));
+            text.push_str(&format!(" · 禁用 {}", self.forbidden));
         }
         if self.start_with_letter {
-            text.push_str(" / 首字符为字母");
+            text.push_str(" · 首字符字母");
         }
         text
     }
@@ -227,7 +232,9 @@ impl Default for KeyMapping {
 impl KeyMapping {
     pub fn normalize(&mut self) {
         let clean = |values: &mut Vec<String>| {
-            values.iter_mut().for_each(|value| *value = value.trim().to_string());
+            values
+                .iter_mut()
+                .for_each(|value| *value = value.trim().to_string());
             values.retain(|value| !value.is_empty());
             values.dedup();
         };
@@ -280,7 +287,9 @@ impl LinkParse {
     }
 
     pub fn value_of(&self, kind: &str) -> String {
-        self.hit(kind).map(|hit| hit.value.clone()).unwrap_or_default()
+        self.hit(kind)
+            .map(|hit| hit.value.clone())
+            .unwrap_or_default()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -345,29 +354,13 @@ impl ContentLink {
             }
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Accounts
-// ---------------------------------------------------------------------------
-
-/// SAP specific metadata. The system id is mandatory for SAP entries; hosts are
-/// resolved from the SAP GUI landscape for display.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SapAccount {
-    #[serde(default)]
-    pub system_id: String,
-    #[serde(default)]
-    pub client: String,
-    #[serde(default)]
-    pub language: String,
-    #[serde(default)]
-    pub system_name: String,
-    #[serde(default)]
-    pub hosts: Vec<String>,
-    #[serde(default)]
-    pub landscape_source: String,
+    pub fn value_of(&self, kind: &str) -> String {
+        self.parse
+            .as_ref()
+            .map(|parse| parse.value_of(kind))
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,13 +378,9 @@ pub struct Entry {
     #[serde(default)]
     pub password: String,
     #[serde(default)]
-    pub url: String,
-    #[serde(default)]
     pub notes: String,
     #[serde(default)]
     pub favorite: bool,
-    #[serde(default)]
-    pub sap: Option<SapAccount>,
     /// Optional password policy for this entry. `None` means "no rule".
     #[serde(default)]
     pub rule: Option<PasswordRule>,
@@ -419,11 +408,17 @@ impl Entry {
         }
     }
 
-    pub fn system_id(&self) -> String {
-        self.sap
-            .as_ref()
-            .map(|sap| sap.system_id.trim().to_uppercase())
-            .unwrap_or_default()
+    /// First value of the given kind found across the linked files. The files are
+    /// the source of truth for URLs and credentials, so this is what the UI shows
+    /// and what the sync output falls back to.
+    pub fn link_value(&self, kind: &str) -> String {
+        for link in &self.links {
+            let value = link.value_of(kind);
+            if !value.is_empty() {
+                return value;
+            }
+        }
+        String::new()
     }
 
     /// Passwords that the target system would still remember, newest first.
@@ -445,7 +440,6 @@ impl Entry {
         list.truncate(cycle);
         list
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,24 +535,20 @@ pub struct EntrySummary {
     pub username: String,
     pub use_knox_id: bool,
     pub has_password: bool,
-    pub url: String,
     pub favorite: bool,
-    pub system_id: String,
-    pub client: String,
-    pub language: String,
-    pub hosts: Vec<String>,
     pub link_count: usize,
     pub has_rule: bool,
     pub rule_summary: String,
     pub history_cycle: u32,
     pub history_count: usize,
+    /// First URL recovered from the linked files, used as the list subtitle.
+    pub primary_url: String,
     pub updated_at: String,
     pub last_used_at: Option<String>,
 }
 
 impl EntrySummary {
     pub fn from(entry: &Entry, knox_id: &str) -> Self {
-        let sap = entry.sap.clone().unwrap_or_default();
         Self {
             id: entry.id.clone(),
             title: entry.title.clone(),
@@ -566,12 +556,7 @@ impl EntrySummary {
             username: entry.effective_username(knox_id),
             use_knox_id: entry.use_knox_id,
             has_password: !entry.password.is_empty(),
-            url: entry.url.clone(),
             favorite: entry.favorite,
-            system_id: sap.system_id,
-            client: sap.client,
-            language: sap.language,
-            hosts: sap.hosts,
             link_count: entry.links.len(),
             has_rule: entry.rule.as_ref().map(|rule| rule.enabled).unwrap_or(false),
             rule_summary: entry
@@ -581,6 +566,7 @@ impl EntrySummary {
                 .unwrap_or_else(|| "未设置规则".to_string()),
             history_cycle: entry.history_cycle,
             history_count: entry.password_history.len(),
+            primary_url: entry.link_value("url"),
             updated_at: entry.updated_at.clone(),
             last_used_at: entry.last_used_at.clone(),
         }
@@ -594,9 +580,7 @@ impl EntrySummary {
 pub struct Association {
     pub entry_id: String,
     pub entry_title: String,
-    pub system_id: String,
     pub username: String,
-    pub hosts: Vec<String>,
     pub links: Vec<ContentLink>,
 }
 
@@ -618,9 +602,7 @@ impl VaultView {
             .map(|entry| Association {
                 entry_id: entry.id.clone(),
                 entry_title: entry.title.clone(),
-                system_id: entry.system_id(),
                 username: entry.effective_username(&vault.knox_id),
-                hosts: entry.sap.clone().unwrap_or_default().hosts,
                 links: entry.links.clone(),
             })
             .collect();

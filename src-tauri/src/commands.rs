@@ -9,11 +9,10 @@ use crate::error::{AppError, AppResult};
 use crate::keys;
 use crate::model::{
     now_string, Category, ContentLink, Entry, EntrySummary, HistoryEntry, KeyMapping, LinkParse,
-    PasswordRule, SapAccount, SyncTarget, Vault, VaultView, DEFAULT_CATEGORY_ID,
-    MAX_PASSWORD_HISTORY, SAP_CATEGORY_ID,
+    PasswordRule, SyncTarget, Vault, VaultView, DEFAULT_CATEGORY_ID, MAX_PASSWORD_HISTORY,
+    SAP_CATEGORY_ID,
 };
 use crate::rules;
-use crate::sap::{self, LandscapeReport, SapSystem};
 use crate::state::{AppState, Unlocked};
 use crate::store::{self, Settings, VaultMode};
 use crate::sync::{self, SyncOutcome, TemplatePreset};
@@ -54,8 +53,6 @@ pub struct Bootstrap {
     pub data_dir: String,
     pub vault_path: String,
     pub portable: bool,
-    pub landscape_defaults: Vec<String>,
-    pub landscape_paths: Vec<String>,
     pub presets: Vec<TemplatePreset>,
     pub supported_formats: Vec<String>,
     pub version: String,
@@ -77,12 +74,10 @@ pub fn app_bootstrap(state: State<'_, AppState>) -> AppResult<Bootstrap> {
             .map(|envelope| envelope.hint.clone())
             .unwrap_or_default(),
         unlocked: state.is_unlocked(),
-        landscape_paths: resolved_landscape_paths(&settings),
         settings,
         data_dir: store::data_dir().to_string_lossy().to_string(),
         vault_path: store::vault_path().to_string_lossy().to_string(),
         portable: store::is_portable(),
-        landscape_defaults: sap::default_landscape_paths(),
         presets: sync::presets(),
         supported_formats: vec![
             "JSON".to_string(),
@@ -106,20 +101,6 @@ pub fn settings_get(state: State<'_, AppState>) -> Settings {
 pub fn settings_save(state: State<'_, AppState>, settings: Settings) -> AppResult<Settings> {
     state.update_settings(|current| *current = settings)?;
     Ok(state.settings_snapshot())
-}
-
-fn resolved_landscape_paths(settings: &Settings) -> Vec<String> {
-    let custom: Vec<String> = settings
-        .landscape_paths
-        .iter()
-        .map(|path| path.trim().to_string())
-        .filter(|path| !path.is_empty())
-        .collect();
-    if custom.is_empty() {
-        sap::default_landscape_paths()
-    } else {
-        custom
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,13 +351,9 @@ pub struct EntryInput {
     #[serde(default)]
     pub password: String,
     #[serde(default)]
-    pub url: String,
-    #[serde(default)]
     pub notes: String,
     #[serde(default)]
     pub favorite: bool,
-    #[serde(default)]
-    pub sap: Option<SapAccount>,
     /// `None` removes the rule from the entry.
     #[serde(default)]
     pub rule: Option<PasswordRule>,
@@ -399,32 +376,6 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
     if title.is_empty() {
         return Err(AppError::Msg("标题不能为空".to_string()));
     }
-    let is_sap = input.category_id == SAP_CATEGORY_ID;
-    let mut sap_block = input.sap.clone().unwrap_or_default();
-    if is_sap {
-        sap_block.system_id = sap_block.system_id.trim().to_ascii_uppercase();
-        if sap_block.system_id.is_empty() {
-            return Err(AppError::Msg("SAP 账号必须填写系统 ID".to_string()));
-        }
-        if sap_block.hosts.is_empty() {
-            if let Ok(report) = ensure_landscape(&state, false) {
-                let hosts = report.hosts_for(&sap_block.system_id);
-                if !hosts.is_empty() {
-                    sap_block.hosts = hosts;
-                }
-                if let Some(matched) = report.resolve(&sap_block.system_id).first() {
-                    if sap_block.system_name.is_empty() {
-                        sap_block.system_name = matched.name.clone();
-                    }
-                    if sap_block.client.is_empty() {
-                        sap_block.client = matched.client.clone();
-                    }
-                    sap_block.landscape_source = matched.source_file.clone();
-                }
-            }
-        }
-    }
-
     let id = input.id.clone().filter(|value| !value.is_empty());
     let mut rule = input.rule.clone();
     if let Some(rule) = rule.as_mut() {
@@ -487,8 +438,7 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
             Some(id) => {
                 let entry = vault.entry_mut(&id)?;
                 let previous = entry.password.clone();
-                let changed = previous != new_password;
-                if changed && !previous.is_empty() {
+                if previous != new_password && !previous.is_empty() {
                     entry.password_history.insert(
                         0,
                         HistoryEntry {
@@ -506,14 +456,10 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                 entry.username = input.username.clone();
                 entry.use_knox_id = input.use_knox_id;
                 entry.password = new_password;
-                entry.url = input.url.clone();
                 entry.notes = input.notes.clone();
                 entry.favorite = input.favorite;
                 entry.rule = rule.clone();
                 entry.history_cycle = cycle;
-                // Moving out of the SAP category drops the SAP block, moving
-                // into it (re)installs the one we just resolved.
-                entry.sap = if is_sap { Some(sap_block.clone()) } else { None };
                 entry.updated_at = now_string();
                 Ok(entry.clone())
             }
@@ -525,10 +471,8 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                     username: input.username.clone(),
                     use_knox_id: input.use_knox_id,
                     password: new_password,
-                    url: input.url.clone(),
                     notes: input.notes.clone(),
                     favorite: input.favorite,
-                    sap: if is_sap { Some(sap_block.clone()) } else { None },
                     rule,
                     history_cycle: cycle,
                     password_history: Vec::new(),
@@ -761,42 +705,6 @@ pub fn clipboard_clear() -> AppResult<()> {
         .clear()
         .map_err(|err| AppError::Msg(format!("清空剪贴板失败：{err}")))?;
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// SAP landscape
-// ---------------------------------------------------------------------------
-
-fn ensure_landscape(state: &State<'_, AppState>, refresh: bool) -> AppResult<LandscapeReport> {
-    if !refresh {
-        if let Some(report) = state.landscape_snapshot() {
-            return Ok(report);
-        }
-    }
-    let settings = state.settings_snapshot();
-    let report = sap::parse_files(&resolved_landscape_paths(&settings))?;
-    state.set_landscape(report.clone());
-    Ok(report)
-}
-
-#[tauri::command]
-pub fn sap_systems(
-    state: State<'_, AppState>,
-    refresh: Option<bool>,
-) -> AppResult<LandscapeReport> {
-    state.touch();
-    ensure_landscape(&state, refresh.unwrap_or(false))
-}
-
-#[tauri::command]
-pub fn sap_resolve(state: State<'_, AppState>, system_id: String) -> AppResult<Vec<SapSystem>> {
-    let report = ensure_landscape(&state, false)?;
-    Ok(report.resolve(&system_id))
-}
-
-#[tauri::command]
-pub fn sap_default_paths() -> Vec<String> {
-    sap::default_landscape_paths()
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,7 +1180,6 @@ pub fn app_paths() -> serde_json::Value {
         "settingsPath": store::settings_path().to_string_lossy(),
         "backupDir": store::backup_dir().to_string_lossy(),
         "portable": store::is_portable(),
-        "landscapeDefaults": sap::default_landscape_paths(),
         "supportedFormats": ["json", ".env", "toml", "yaml", "xml", "text"],
     })
 }

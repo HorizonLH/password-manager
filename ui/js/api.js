@@ -60,9 +60,6 @@ export const api = {
   copyText: (text, label) => invoke("copy_text", { text, label }),
   clipboardClear: () => invoke("clipboard_clear"),
 
-  sapSystems: (refresh = false) => invoke("sap_systems", { refresh }),
-  sapResolve: (systemId) => invoke("sap_resolve", { systemId }),
-  sapDefaultPaths: () => invoke("sap_default_paths"),
 
   linkInspect: (paths, keys) => invoke("link_inspect", { paths, keys: keys ?? null }),
   linkAdd: (entryId, drafts) => invoke("link_add", { entryId, drafts }),

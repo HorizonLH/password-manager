@@ -428,5 +428,10 @@ function editorPane() {
 /** Sync view: targets on the left, template editor and preview on the right. */
 export function renderSync(container) {
   if (!state.vault) return;
+  const targets = state.vault.syncTargets ?? [];
+  // Show the first target immediately instead of an empty editor pane.
+  if (!state.syncDraft && targets.length) {
+    selectSyncTarget(targets[0].id);
+  }
   mount(container, h("div", { class: "sync-layout" }, targetList(), editorPane()));
 }

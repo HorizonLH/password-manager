@@ -6,7 +6,6 @@ mod error;
 mod keys;
 mod model;
 mod rules;
-mod sap;
 mod state;
 mod store;
 mod sync;
@@ -77,9 +76,6 @@ pub fn run() {
             commands::copy_sap_credentials,
             commands::copy_text,
             commands::clipboard_clear,
-            commands::sap_systems,
-            commands::sap_resolve,
-            commands::sap_default_paths,
             commands::link_inspect,
             commands::link_add,
             commands::link_update_keys,

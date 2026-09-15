@@ -58,8 +58,6 @@ pub struct Settings {
     pub sap_line_separator: String,
     pub mask_passwords: bool,
     pub confirm_delete: bool,
-    /// Empty means "auto-detect the standard SAP GUI locations".
-    pub landscape_paths: Vec<String>,
     /// Default key words used when a content file is attached. Each file keeps
     /// its own copy so an override never changes other files.
     pub key_mapping: KeyMapping,
@@ -80,7 +78,6 @@ impl Default for Settings {
             sap_line_separator: "\r\n".to_string(),
             mask_passwords: true,
             confirm_delete: true,
-            landscape_paths: Vec::new(),
             key_mapping: KeyMapping::default(),
             default_rule: None,
             last_category: SAP_CATEGORY_ID.to_string(),
@@ -255,8 +252,8 @@ pub fn save_settings(settings: &Settings) -> AppResult<()> {
 // ---------------------------------------------------------------------------
 
 /// Normalizes a vault loaded from disk: guarantees the built-in categories
-/// exist, that SAP entries carry a SAP block, that rules and key mappings are
-/// valid, and that no password history grows past the cap.
+/// exist, that rules and key mappings are valid, and that no password history
+/// grows past the cap.
 pub fn normalize_vault(vault: &mut Vault) {
     if vault.schema == 0 {
         vault.schema = 1;
@@ -271,9 +268,6 @@ pub fn normalize_vault(vault: &mut Vault) {
     for entry in vault.entries.iter_mut() {
         if !known.contains(&entry.category_id) {
             entry.category_id = DEFAULT_CATEGORY_ID.to_string();
-        }
-        if entry.category_id == SAP_CATEGORY_ID && entry.sap.is_none() {
-            entry.sap = Some(Default::default());
         }
         if let Some(rule) = entry.rule.as_mut() {
             rule.normalize();
@@ -382,10 +376,8 @@ mod tests {
             username: String::new(),
             use_knox_id: false,
             password: String::new(),
-            url: String::new(),
             notes: String::new(),
             favorite: false,
-            sap: None,
             rule: None,
             history_cycle: 0,
             password_history: Vec::new(),
@@ -439,13 +431,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_repairs_category_and_missing_sap_block() {
+    fn normalize_repairs_an_unknown_category() {
         let mut vault = Vault::default();
         vault.entries.push(blank_entry("orphan", "deleted-category"));
         vault.entries.push(blank_entry("sap-entry", SAP_CATEGORY_ID));
         normalize_vault(&mut vault);
         assert_eq!(vault.entries[0].category_id, DEFAULT_CATEGORY_ID);
-        assert!(vault.entries[1].sap.is_some());
+        assert_eq!(vault.entries[1].category_id, SAP_CATEGORY_ID);
     }
 
     #[test]

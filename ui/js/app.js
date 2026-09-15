@@ -10,14 +10,13 @@ import {
   lock,
   handleLocked,
   refreshVault,
-  loadLandscape,
   saveSettings,
 } from "./state.js";
 import { toast } from "./toast.js";
 import { currentTheme, setTheme } from "./theme.js";
 import { renderLock } from "./views/lock.js";
 import { renderAccounts } from "./views/accounts.js";
-import { renderSap } from "./views/sap.js";
+
 
 import { renderSync } from "./views/sync.js";
 import { renderSettings } from "./views/settings.js";
@@ -28,16 +27,14 @@ const root = document.getElementById("app");
 
 const VIEW_META = {
   accounts: { title: "账号", subtitle: "本地加密保存的账号与密码" },
-  sap: { title: "SAP 系统", subtitle: "来自 SAP GUI 登录配置的系统与主机" },
-  associations: { title: "关联关系", subtitle: "SAP 账号与需要同步的内容文件" },
+  associations: { title: "关联关系", subtitle: "账号与需要同步的内容文件" },
 
   sync: { title: "同步配置", subtitle: "把 SAP 账号写入全局配置文件（如 MCP）" },
   settings: { title: "设置", subtitle: "外观、安全、SAP 与数据" },
 };
 
-const TOOL_VIEWS = ["sap", "associations", "sync", "settings"];
+const TOOL_VIEWS = ["associations", "sync", "settings"];
 const TOOL_ICONS = {
-  sap: "server",
   associations: "link",
   sync: "refresh",
   settings: "sliders",
@@ -182,7 +179,7 @@ function categoryNav() {
   const item = (id, name, builtin, count) =>
     h(
       "div",
-      { style: { display: "flex", alignItems: "center", gap: "2px" } },
+      { class: "nav__row" },
       h(
         "button",
         {
@@ -385,12 +382,7 @@ function sidebar() {
             {
               class: `nav__item${state.view === view ? " is-active" : ""}`,
               type: "button",
-              onClick: () => {
-                navigate(view);
-                if (view === "sap") {
-                  loadLandscape(false).catch(() => {});
-                }
-              },
+              onClick: () => navigate(view),
             },
             iconPair(TOOL_ICONS[view], 15),
             h("span", { class: "nav__label" }, VIEW_META[view].title),
@@ -478,9 +470,8 @@ function subtitle() {
   const vault = state.vault;
   if (!vault) return VIEW_META[state.view].subtitle;
   if (state.view === "accounts") {
-    const sap = vault.entries.filter((entry) => entry.categoryId === "sap").length;
     const links = vault.entries.reduce((sum, entry) => sum + entry.linkCount, 0);
-    return `${vault.entries.length} 个账号 · SAP ${sap} 个 · 关联文件 ${links} 个`;
+    return `${vault.entries.length} 个账号 · 关联文件 ${links} 个`;
   }
   if (state.view === "sync") {
     return `${vault.syncTargets.length} 个同步目标 · 写入 SAP 账号与关联文件清单`;
@@ -497,8 +488,7 @@ function viewContent() {
     return node;
   }
   const host = h("div", { class: "content" });
-  if (state.view === "sap") renderSap(host);
-  else if (state.view === "sync") renderSync(host);
+  if (state.view === "sync") renderSync(host);
   else if (state.view === "associations") renderAssociations(host);
   else if (state.view === "settings") {
     const scroll = h("div", { class: "content content--scroll" });

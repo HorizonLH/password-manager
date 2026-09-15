@@ -23,9 +23,7 @@ export const state = {
   paths: null,
   selectedEntryId: null,
   selectedEntry: null,
-  landscape: null,
-  landscapeLoading: false,
-  sapFilter: "",
+
   assocFilter: "",
   assocOnlyLinked: false,
   assocMode: "cards",
@@ -74,8 +72,7 @@ export async function bootstrap() {
     paths: {
       dataDir: info.dataDir,
       vaultPath: info.vaultPath,
-      landscapeDefaults: info.landscapeDefaults,
-      landscapePaths: info.landscapePaths,
+      supportedFormats: info.supportedFormats,
       supportedFormats: info.supportedFormats,
     },
   });
@@ -206,20 +203,6 @@ export async function saveSettings(patch) {
   return saved;
 }
 
-// --------------------------------------------------------------- landscape --
-
-export async function loadLandscape(refresh = false) {
-  if (state.landscapeLoading) return state.landscape;
-  setState({ landscapeLoading: true });
-  try {
-    const report = await api.sapSystems(refresh);
-    setState({ landscape: report, landscapeLoading: false });
-    return report;
-  } catch (error) {
-    setState({ landscapeLoading: false });
-    throw error;
-  }
-}
 
 // ------------------------------------------------------------------- links --
 
