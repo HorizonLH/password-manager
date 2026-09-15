@@ -1,18 +1,42 @@
 import { h, guard, mount } from "../dom.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
-import { state, setState, selectEntry, navigate } from "../state.js";
-import { formatBytes, formatTime, originLabel, shortSid } from "../format.js";
+import { state, setState, selectEntry, navigate, copyText } from "../state.js";
+import {
+  FIELD_LABELS,
+  FIELD_ORDER,
+  formatBytes,
+  formatLabel,
+  mask,
+  shortSid,
+} from "../format.js";
+import { openKeyEditor } from "./linkkeys.js";
+
+function parsedValue(link, kind) {
+  const hit = (link.parse?.fields ?? []).find((field) => field.kind === kind);
+  return hit?.value ?? "";
+}
+
+function parsedKey(link, kind) {
+  const hit = (link.parse?.fields ?? []).find((field) => field.kind === kind);
+  return hit?.key ?? "";
+}
 
 function accountCard(association) {
   const files = association.links ?? [];
+  const incomplete = files.filter((link) => (link.parse?.missing ?? []).length > 0).length;
+
   return h(
     "article",
     { class: "assoc" },
     h(
       "div",
       { class: "assoc__head" },
-      h("span", { class: "assoc__avatar" }, shortSid(association.systemId || association.entryTitle)),
+      h(
+        "span",
+        { class: "assoc__avatar" },
+        shortSid(association.systemId || association.entryTitle),
+      ),
       h(
         "span",
         { class: "assoc__title" },
@@ -21,7 +45,11 @@ function accountCard(association) {
           { class: "assoc__name" },
           association.entryTitle,
           association.systemId
-            ? h("span", { class: "tag tag--accent tag--mono", style: { marginLeft: "8px" } }, association.systemId)
+            ? h(
+                "span",
+                { class: "tag tag--accent tag--mono", style: { marginLeft: "8px" } },
+                association.systemId,
+              )
             : null,
         ),
         h(
@@ -31,12 +59,12 @@ function accountCard(association) {
           association.hosts?.length ? ` · 主机 ${association.hosts.join(", ")}` : "",
         ),
       ),
-      h(
-        "span",
-        { class: "tag" },
-        icon("link", { size: 11 }),
-        `${files.length} 个文件`,
-      ),
+      h("span", { class: "tag" }, icon("link", { size: 11 }), `${files.length} 个文件`),
+      incomplete
+        ? h("span", { class: "tag tag--warn" }, `${incomplete} 个字段不完整`)
+        : files.length
+          ? h("span", { class: "tag tag--success" }, "字段完整")
+          : null,
       h(
         "button",
         {
@@ -58,27 +86,68 @@ function accountCard(association) {
           files.map((link) =>
             h(
               "div",
-              { class: "assoc__file" },
-              icon(link.exists ? "file" : "alert", { size: 13 }),
-              h("span", { class: "assoc__file-path", title: link.path }, link.path),
+              { class: "stack stack--tight" },
               h(
-                "span",
-                { class: `tag${link.origin === "scan" ? " tag--accent" : ""}` },
-                originLabel(link.origin),
+                "div",
+                { class: "assoc__file" },
+                icon(link.exists ? "file" : "alert", { size: 13 }),
+                h("span", { class: "assoc__file-path", title: link.path }, link.path),
+                h("span", { class: "tag tag--accent" }, formatLabel(link.parse?.format)),
+                link.exists
+                  ? h("span", { class: "tag tag--mono" }, formatBytes(link.size))
+                  : h("span", { class: "tag tag--danger" }, "文件不存在"),
+                h(
+                  "button",
+                  {
+                    class: "btn btn--icon btn--sm",
+                    type: "button",
+                    title: "关键词 / 重新检测",
+                    onClick: () => openKeyEditor({ entry: { id: association.entryId }, link }),
+                  },
+                  icon("sliders", { size: 12 }),
+                ),
+                h(
+                  "button",
+                  {
+                    class: "btn btn--icon btn--sm",
+                    type: "button",
+                    title: "在资源管理器中显示",
+                    onClick: guard(() => api.openInExplorer(link.path)),
+                  },
+                  icon("external", { size: 12 }),
+                ),
               ),
-              h("span", { class: "tag tag--mono" }, formatBytes(link.size)),
-              link.modifiedAt
-                ? h("span", { class: "subtle", style: { fontSize: "11.5px" } }, formatTime(link.modifiedAt))
-                : null,
               h(
-                "button",
-                {
-                  class: "btn btn--icon btn--sm",
-                  type: "button",
-                  title: "在资源管理器中显示",
-                  onClick: guard(() => api.openInExplorer(link.path)),
-                },
-                icon("external", { size: 12 }),
+                "div",
+                { class: "evidence" },
+                ...FIELD_ORDER.map((kind) => {
+                  const value = parsedValue(link, kind);
+                  return h(
+                    "div",
+                    { class: "evidence__row" },
+                    h("span", { class: "field__label" }, FIELD_LABELS[kind]),
+                    value
+                      ? h(
+                          "span",
+                          { class: "field__text" },
+                          kind === "password" ? mask(value, false) : value,
+                        )
+                      : h("span", { class: "tag tag--warn" }, "未识别"),
+                    value ? h("span", { class: "tag tag--mono" }, `键 ${parsedKey(link, kind)}`) : null,
+                    value
+                      ? h(
+                          "button",
+                          {
+                            class: "btn btn--icon btn--sm",
+                            type: "button",
+                            title: `复制${FIELD_LABELS[kind]}`,
+                            onClick: guard(() => copyText(value, FIELD_LABELS[kind])),
+                          },
+                          icon("copy", { size: 12 }),
+                        )
+                      : null,
+                  );
+                }),
               ),
             ),
           ),
@@ -86,7 +155,7 @@ function accountCard(association) {
       : h(
           "p",
           { class: "assoc__empty" },
-          "尚未关联文件。可以在账号详情里手动添加，或到“扫描文件”页按系统 ID 与用户名自动查找。",
+          "尚未关联文件。在账号详情里点击「添加文件」，选择 JSON、.env、TOML、YAML、XML 或纯文本文件即可。",
         ),
   );
 }
@@ -97,20 +166,20 @@ function tableView(rows) {
     { class: "table" },
     h(
       "div",
-      { class: "table__row table__head", style: { "--table-cols": "120px 1.4fr 1fr 1.4fr 90px" } },
+      { class: "table__row table__head", style: { "--table-cols": "100px 1.3fr 1fr 1.3fr 90px" } },
       h("span", { class: "table__cell" }, "系统 ID"),
       h("span", { class: "table__cell" }, "账号"),
       h("span", { class: "table__cell" }, "用户名"),
-      h("span", { class: "table__cell" }, "关联文件"),
-      h("span", { class: "table__cell" }, "来源"),
+      h("span", { class: "table__cell" }, "URL（来自关联文件）"),
+      h("span", { class: "table__cell" }, "文件"),
     ),
-    rows.map((association) =>
-      h(
+    rows.map((association) => {
+      const files = association.links ?? [];
+      const url = files.map((link) => parsedValue(link, "url")).find(Boolean) ?? "";
+      const complete = files.length > 0 && files.every((link) => (link.parse?.missing ?? []).length === 0);
+      return h(
         "div",
-        {
-          class: "table__row",
-          style: { "--table-cols": "120px 1.4fr 1fr 1.4fr 90px" },
-        },
+        { class: "table__row", style: { "--table-cols": "100px 1.3fr 1fr 1.3fr 90px" } },
         h(
           "span",
           { class: "table__cell" },
@@ -120,26 +189,27 @@ function tableView(rows) {
         h("span", { class: "table__cell table__cell--mono" }, association.username || "—"),
         h(
           "span",
-          { class: "table__cell" },
-          (association.links ?? []).length
-            ? (association.links ?? []).map((link) => link.label).join("、")
-            : h("span", { class: "subtle" }, "未关联"),
+          { class: "table__cell table__cell--mono" },
+          url || h("span", { class: "subtle" }, "—"),
         ),
         h(
           "span",
           { class: "table__cell" },
-          (association.links ?? []).some((link) => link.origin === "scan")
-            ? h("span", { class: "tag tag--accent" }, "含扫描结果")
-            : (association.links ?? []).length
-              ? h("span", { class: "tag" }, "手动")
-              : h("span", { class: "subtle" }, "—"),
+          files.length
+            ? h(
+                "span",
+                { class: `tag${complete ? " tag--success" : " tag--warn"}` },
+                `${files.length} 个`,
+              )
+            : h("span", { class: "subtle" }, "未关联"),
         ),
-      ),
-    ),
+      );
+    }),
   );
 }
 
-/** Requirement 5.3: the account ↔ content-file relationship rendered as UI. */
+/** Requirement 5.3: the account ↔ content-file relationship rendered as UI,
+ *  including which fields were recovered from each file. */
 export function renderAssociations(container) {
   if (!state.vault) return;
   const term = state.assocFilter?.trim().toLowerCase() ?? "";
@@ -153,17 +223,21 @@ export function renderAssociations(container) {
       association.username,
       ...(association.hosts ?? []),
       ...(association.links ?? []).map((link) => link.path),
+      ...(association.links ?? []).flatMap((link) =>
+        (link.parse?.fields ?? []).map((field) => field.value),
+      ),
     ]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(term));
   });
 
   const totalLinks = all.reduce((sum, item) => sum + (item.links ?? []).length, 0);
-  const scannedLinks = all.reduce(
-    (sum, item) => sum + (item.links ?? []).filter((link) => link.origin === "scan").length,
+  const incomplete = all.reduce(
+    (sum, item) =>
+      sum + (item.links ?? []).filter((link) => (link.parse?.missing ?? []).length > 0).length,
     0,
   );
-  const missing = all.reduce(
+  const missingFiles = all.reduce(
     (sum, item) => sum + (item.links ?? []).filter((link) => !link.exists).length,
     0,
   );
@@ -178,7 +252,7 @@ export function renderAssociations(container) {
       h("input", {
         id: "assoc-filter",
         class: "search__input",
-        placeholder: "按账号、系统 ID、用户名或文件名筛选",
+        placeholder: "按账号、系统 ID、用户名、文件名或解析出的内容筛选",
         value: state.assocFilter ?? "",
         onInput: (event) => setState({ assocFilter: event.target.value }),
       }),
@@ -217,17 +291,6 @@ export function renderAssociations(container) {
         "表格",
       ),
     ),
-    h("div", { class: "modal__footer-spacer" }),
-    h(
-      "button",
-      {
-        class: "btn btn--soft btn--sm",
-        type: "button",
-        onClick: () => navigate("scan"),
-      },
-      icon("radar", { size: 13 }),
-      "去扫描新内容",
-    ),
   );
 
   mount(
@@ -247,17 +310,17 @@ export function renderAssociations(container) {
             { class: "token-list" },
             h("span", { class: "tag tag--mono" }, `${all.length} 个 SAP 账号`),
             h("span", { class: "tag tag--mono" }, `${totalLinks} 个关联文件`),
-            scannedLinks
-              ? h("span", { class: "tag tag--accent tag--mono" }, `其中 ${scannedLinks} 个来自扫描`)
+            incomplete
+              ? h("span", { class: "tag tag--warn tag--mono" }, `${incomplete} 个字段不完整`)
               : null,
-            missing
-              ? h("span", { class: "tag tag--warn tag--mono" }, `${missing} 个文件已不存在`)
+            missingFiles
+              ? h("span", { class: "tag tag--danger tag--mono" }, `${missingFiles} 个文件已不存在`)
               : null,
           ),
           h(
             "p",
             { class: "form__hint" },
-            "这里展示每个 SAP 账号与「需要同步的内容」之间的关联：手动添加的文件标记为“手动”，由扫描按系统 ID 与用户名命中的标记为“扫描”。同步目标会把账号信息与这些文件清单一起写入全局配置。",
+            "这里展示每个 SAP 账号与「需要同步的内容」之间的关联：文件由你手动选择，SapVault 会从 JSON、.env、TOML、YAML、XML 或纯文本中解析出 URL、用户名与密码，并显示所用的关键词。缺失字段可点击「关键词」手动指定。",
           ),
           rows.length
             ? state.assocMode === "table"
@@ -272,8 +335,8 @@ export function renderAssociations(container) {
                   "p",
                   { class: "empty__text" },
                   all.length
-                    ? "试试清空筛选条件，或取消“只看已关联”。"
-                    : "先在“账号”页创建 SAP 账号，然后手动添加文件或运行一次扫描。",
+                    ? "试试清空筛选条件，或取消「只看已关联」。"
+                    : "先在「账号」页创建 SAP 账号，然后在详情里添加需要同步的内容文件。",
                 ),
               ),
         ),

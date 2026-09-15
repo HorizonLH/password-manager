@@ -1,5 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use zeroize::Zeroize;
@@ -22,6 +21,18 @@ impl Drop for Unlocked {
         self.key.zeroize();
         for entry in self.vault.entries.iter_mut() {
             entry.password.zeroize();
+            for recorded in entry.password_history.iter_mut() {
+                recorded.password.zeroize();
+            }
+            for link in entry.links.iter_mut() {
+                if let Some(parse) = link.parse.as_mut() {
+                    for field in parse.fields.iter_mut() {
+                        if field.kind == "password" {
+                            field.value.zeroize();
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -35,8 +46,6 @@ pub struct AppState {
     /// Set when the vault file exists but could not be read: the UI shows this
     /// instead of pretending there is no vault yet.
     startup_error: Option<String>,
-    pub scan_cancel: Arc<AtomicBool>,
-    pub scan_running: AtomicBool,
 }
 
 impl AppState {
@@ -52,8 +61,6 @@ impl AppState {
             landscape: Mutex::new(None),
             last_activity: Mutex::new(Instant::now()),
             startup_error,
-            scan_cancel: Arc::new(AtomicBool::new(false)),
-            scan_running: AtomicBool::new(false),
         }
     }
 
@@ -239,8 +246,39 @@ impl AppState {
         }
         self.idle_seconds() >= u64::from(minutes) * 60
     }
+}
 
-    pub fn cancel_scan(&self) {
-        self.scan_cancel.store(true, Ordering::Relaxed);
+// ---------------------------------------------------------------------------
+// Windows session state
+// ---------------------------------------------------------------------------
+
+/// `true` when the interactive session is locked (Win+L, screen-saver lock, or
+/// the UAC secure desktop).
+///
+/// While the workstation is locked the input desktop belongs to Winlogon, so
+/// `OpenInputDesktop` fails for a normal process. That is the documented
+/// side-effect this check relies on, and it needs no extra permissions.
+#[cfg(windows)]
+pub fn workstation_locked() -> bool {
+    const DESKTOP_READOBJECTS: u32 = 0x0001;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenInputDesktop(dw_flags: u32, f_inherit: i32, dw_desired_access: u32) -> *mut core::ffi::c_void;
+        fn CloseDesktop(h_desktop: *mut core::ffi::c_void) -> i32;
     }
+
+    unsafe {
+        let handle = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+        if handle.is_null() {
+            return true;
+        }
+        CloseDesktop(handle);
+        false
+    }
+}
+
+#[cfg(not(windows))]
+pub fn workstation_locked() -> bool {
+    false
 }

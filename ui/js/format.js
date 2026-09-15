@@ -28,12 +28,6 @@ export function formatTime(iso) {
   });
 }
 
-export function formatDuration(ms) {
-  if (ms < 1000) return `${ms} 毫秒`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)} 秒`;
-  return `${Math.floor(ms / 60000)} 分 ${Math.round((ms % 60000) / 1000)} 秒`;
-}
-
 export function fileName(path) {
   if (!path) return "";
   const parts = path.split(/[\\/]/);
@@ -46,12 +40,29 @@ export function mask(value, visible) {
   return length ? "•".repeat(Math.min(length, 18)) : "";
 }
 
-export function originLabel(origin) {
-  return origin === "scan" ? "扫描" : "手动";
-}
-
 export function shortSid(sid) {
   const value = (sid || "").trim();
   if (!value) return "····";
   return value.slice(0, 4).toUpperCase();
 }
+
+const FORMAT_LABELS = {
+  json: "JSON",
+  env: ".env",
+  toml: "TOML",
+  yaml: "YAML",
+  xml: "XML",
+  text: "文本",
+};
+
+export function formatLabel(format) {
+  return FORMAT_LABELS[format] ?? format ?? "文本";
+}
+
+export const FIELD_LABELS = {
+  url: "URL",
+  username: "用户名",
+  password: "密码",
+};
+
+export const FIELD_ORDER = ["url", "username", "password"];

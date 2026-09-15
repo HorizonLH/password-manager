@@ -1,4 +1,4 @@
-import { api } from "./api.js";
+import { api, describeError } from "./api.js";
 import { toast } from "./toast.js";
 import { setTheme } from "./theme.js";
 
@@ -11,7 +11,9 @@ export const state = {
   hasVault: false,
   mode: null,
   hint: "",
+  portable: false,
   locked: true,
+  lockedReason: "",
   view: "accounts",
   categoryId: "sap",
   search: "",
@@ -27,11 +29,6 @@ export const state = {
   assocFilter: "",
   assocOnlyLinked: false,
   assocMode: "cards",
-  scanOptions: null,
-  scanReport: null,
-  scanPicked: new Set(),
-  scanRunning: false,
-  scanProgress: { scanned: 0, path: "" },
   syncSelectedId: null,
   syncDraft: null,
   syncPreview: null,
@@ -70,6 +67,7 @@ export async function bootstrap() {
     hasVault: info.hasVault,
     mode: info.mode,
     hint: info.hint,
+    portable: info.portable,
     locked: true,
     settings: info.settings,
     presets: info.presets,
@@ -78,67 +76,50 @@ export async function bootstrap() {
       vaultPath: info.vaultPath,
       landscapeDefaults: info.landscapeDefaults,
       landscapePaths: info.landscapePaths,
-      scanRootDefault: info.scanRootDefault,
+      supportedFormats: info.supportedFormats,
     },
-    scanOptions: buildScanDefaults(info.settings, info.scanRootDefault),
   });
-}
-
-export function buildScanDefaults(settings, scanRootDefault) {
-  const roots =
-    settings?.scanRoots && settings.scanRoots.length
-      ? [...settings.scanRoots]
-      : [scanRootDefault ?? "C:\\"];
-  return {
-    roots,
-    hosts: [],
-    systemIds: [],
-    usernames: [],
-    strict: settings?.scanStrict ?? true,
-    maxFileBytes: settings?.scanMaxFileBytes ?? 2097152,
-    maxFiles: settings?.scanMaxFiles ?? 30000,
-    maxDepth: settings?.scanMaxDepth ?? 10,
-    followLinks: false,
-    onlyExtensions: settings?.scanOnlyExtensions ?? [],
-    extraSkipPaths: settings?.scanExtraSkips ?? [],
-    label: "",
-    targetEntryId: "",
-  };
 }
 
 export async function createVault(mode, password, hint) {
   await api.vaultCreate(mode, password || null, hint || "");
-  setState({ hasVault: true, mode, hint: hint || "", locked: false, startupError: null });
+  setState({
+    hasVault: true,
+    mode,
+    hint: hint || "",
+    locked: false,
+    lockedReason: "",
+    startupError: null,
+  });
   await refreshVault();
   toast("保险库已创建，可以开始添加账号", "success");
 }
 
 export async function unlock(password) {
   const view = await api.vaultUnlock(password || null);
-  setState({ locked: false, vault: view });
+  setState({ locked: false, lockedReason: "", vault: view });
   toast("保险库已解锁", "success");
 }
 
-export async function lock() {
+export async function lock(reason = "") {
   if (state.locked) return;
   await api.vaultLock();
-  applyLockedState();
+  applyLockedState(reason);
 }
 
-export function handleLocked() {
+export function handleLocked(reason) {
   if (state.locked) return;
-  applyLockedState();
-  toast("已自动锁定", "info");
+  applyLockedState(reason);
+  toast(reason === "session" ? "检测到系统锁屏，已自动锁定" : "已自动锁定", "info");
 }
 
-function applyLockedState() {
+function applyLockedState(reason) {
   setState({
     locked: true,
+    lockedReason: reason ?? "",
     vault: null,
     selectedEntry: null,
     selectedEntryId: null,
-    scanReport: null,
-    scanPicked: new Set(),
     syncDraft: null,
     syncPreview: null,
     syncSelectedId: null,
@@ -173,17 +154,13 @@ export async function selectEntry(id) {
   if (state.selectedEntryId === id) setState({ selectedEntry: entry });
 }
 
-export async function reloadSelected() {
-  if (!state.selectedEntryId) return;
-  const entry = await api.entryGet(state.selectedEntryId);
-  setState({ selectedEntry: entry });
-}
-
 export async function setKnoxId(value) {
   const vault = await api.knoxSet(value);
   setState({ vault });
 }
 
+/** Saves an entry. Validation problems (rule / cycle) are re-thrown with their
+ *  details so the editor can offer an explicit override. */
 export async function saveEntry(input) {
   const saved = await api.entrySave(input);
   await refreshVault();
@@ -215,6 +192,10 @@ export async function copySap(id) {
   toast(await api.copySap(id), "success");
 }
 
+export async function copyText(value, label) {
+  toast(await api.copyText(value, label), "success");
+}
+
 // ---------------------------------------------------------------- settings --
 
 export async function saveSettings(patch) {
@@ -242,11 +223,18 @@ export async function loadLandscape(refresh = false) {
 
 // ------------------------------------------------------------------- links --
 
-export async function addLinks(entryId, paths) {
-  const entry = await api.linkAdd(entryId, paths);
+export async function updateLinkKeys(entryId, linkId, keys) {
+  const entry = await api.linkUpdateKeys(entryId, linkId, keys);
   await refreshVault();
   if (state.selectedEntryId === entryId) setState({ selectedEntry: entry });
-  toast(`已关联 ${paths.length} 个文件`, "success");
+  toast("关键词已更新并重新检测", "success");
+  return entry;
+}
+
+export async function reanalyzeLink(entryId, linkId) {
+  const entry = await api.linkReanalyze(entryId, linkId);
+  await refreshVault();
+  if (state.selectedEntryId === entryId) setState({ selectedEntry: entry });
   return entry;
 }
 
@@ -257,43 +245,25 @@ export async function removeLink(entryId, linkId) {
   return entry;
 }
 
-// -------------------------------------------------------------------- scan --
+// ----------------------------------------------------------------- history --
 
-export async function runScan() {
-  setState({
-    scanRunning: true,
-    scanReport: null,
-    scanPicked: new Set(),
-    scanProgress: { scanned: 0, path: "" },
-  });
-  try {
-    const report = await api.scanRun(state.scanOptions);
-    setState({
-      scanReport: report,
-      scanRunning: false,
-      scanPicked: new Set(report.hits.map((hit) => hit.path)),
-    });
-    return report;
-  } catch (error) {
-    setState({ scanRunning: false });
-    throw error;
-  }
-}
-
-export async function cancelScan() {
-  await api.scanCancel();
-  toast("正在停止扫描…", "info");
-}
-
-export async function attachScan(entryId, hits, replace) {
-  const entry = await api.scanAttach(entryId, hits, replace);
+async function withEntry(entryId, promise) {
+  const entry = await promise;
   await refreshVault();
   if (state.selectedEntryId === entryId) setState({ selectedEntry: entry });
-  toast(`已关联 ${hits.length} 个扫描结果`, "success");
+  return entry;
 }
 
-export function handleScanProgress(payload) {
-  setState({ scanProgress: payload });
+export function addHistory(entryId, password, note) {
+  return withEntry(entryId, api.historyAdd(entryId, password, note));
+}
+
+export function removeHistory(entryId, historyId) {
+  return withEntry(entryId, api.historyRemove(entryId, historyId));
+}
+
+export function clearHistory(entryId) {
+  return withEntry(entryId, api.historyClear(entryId));
 }
 
 // -------------------------------------------------------------------- sync --
@@ -317,3 +287,5 @@ export async function selectSyncTarget(id) {
 export function navigate(view, patch = {}) {
   setState({ view, ...patch });
 }
+
+export { describeError };

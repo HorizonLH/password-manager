@@ -36,7 +36,7 @@ export const api = {
     invoke("vault_change_password", { currentPassword, newPassword }),
   vaultBackupNow: () => invoke("vault_backup_now"),
   vaultExport: (path) => invoke("vault_export", { path }),
-  vaultImport: (path) => invoke("vault_import", { path }),
+  vaultImport: (path, password) => invoke("vault_import", { path, password }),
 
   knoxSet: (knoxId) => invoke("knox_set", { knoxId }),
 
@@ -50,22 +50,25 @@ export const api = {
   entryFavorite: (id) => invoke("entry_toggle_favorite", { id }),
   entrySummary: (id) => invoke("entry_summary", { id }),
 
+  historyAdd: (entryId, password, note) => invoke("history_add", { entryId, password, note }),
+  historyRemove: (entryId, historyId) => invoke("history_remove", { entryId, historyId }),
+  historyClear: (entryId) => invoke("history_clear", { entryId }),
+
   copyPassword: (id) => invoke("copy_password", { id }),
   copyUsername: (id) => invoke("copy_username", { id }),
   copySap: (id) => invoke("copy_sap_credentials", { id }),
+  copyText: (text, label) => invoke("copy_text", { text, label }),
   clipboardClear: () => invoke("clipboard_clear"),
 
   sapSystems: (refresh = false) => invoke("sap_systems", { refresh }),
   sapResolve: (systemId) => invoke("sap_resolve", { systemId }),
   sapDefaultPaths: () => invoke("sap_default_paths"),
 
-  scanRun: (options) => invoke("scan_run", { options }),
-  scanCancel: () => invoke("scan_cancel"),
-  scanAttach: (entryId, hits, replace = false) =>
-    invoke("scan_attach", { entryId, hits, replace }),
-
-  linkAdd: (entryId, paths) => invoke("link_add", { entryId, paths }),
-  linkPickAndAdd: (entryId) => invoke("link_pick_and_add", { entryId }),
+  linkInspect: (paths, keys) => invoke("link_inspect", { paths, keys: keys ?? null }),
+  linkAdd: (entryId, drafts) => invoke("link_add", { entryId, drafts }),
+  linkUpdateKeys: (entryId, linkId, keys) =>
+    invoke("link_update_keys", { entryId, linkId, keys }),
+  linkReanalyze: (entryId, linkId) => invoke("link_reanalyze", { entryId, linkId }),
   linkRemove: (entryId, linkId) => invoke("link_remove", { entryId, linkId }),
   linkPreview: (path, limit) => invoke("link_preview", { path, limit }),
   openInExplorer: (path) => invoke("open_in_explorer", { path }),
@@ -82,9 +85,27 @@ export const api = {
 
   generatePassword: (options) => invoke("generate_password", { options }),
   strength: (password) => invoke("check_password_strength", { password }),
+  ruleDefault: () => invoke("rule_default"),
+  generateRulePassword: (rule) => invoke("generate_rule_password", { rule }),
+  validatePassword: (password, rule) => invoke("validate_password", { password, rule }),
+  keyMappingDefault: () => invoke("key_mapping_default"),
 
   pickFiles: () => invoke("pick_files"),
   pickFolder: (title) => invoke("pick_folder", { title }),
   pickSaveFile: (defaultName, extension) =>
     invoke("pick_save_file", { defaultName, extension }),
 };
+
+/** Normalizes an IPC rejection: validation errors arrive as a structured object,
+ *  everything else as a plain string. */
+export function describeError(error) {
+  if (typeof error === "string") return { kind: "", message: error, details: [] };
+  if (error && typeof error === "object") {
+    return {
+      kind: error.kind ?? "",
+      message: error.message ?? JSON.stringify(error),
+      details: Array.isArray(error.details) ? error.details : [],
+    };
+  }
+  return { kind: "", message: String(error), details: [] };
+}

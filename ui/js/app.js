@@ -11,7 +11,6 @@ import {
   handleLocked,
   refreshVault,
   loadLandscape,
-  handleScanProgress,
   saveSettings,
 } from "./state.js";
 import { toast } from "./toast.js";
@@ -19,7 +18,7 @@ import { currentTheme, setTheme } from "./theme.js";
 import { renderLock } from "./views/lock.js";
 import { renderAccounts } from "./views/accounts.js";
 import { renderSap } from "./views/sap.js";
-import { renderScan } from "./views/scan.js";
+
 import { renderSync } from "./views/sync.js";
 import { renderSettings } from "./views/settings.js";
 import { renderAssociations } from "./views/associations.js";
@@ -31,16 +30,15 @@ const VIEW_META = {
   accounts: { title: "账号", subtitle: "本地加密保存的账号与密码" },
   sap: { title: "SAP 系统", subtitle: "来自 SAP GUI 登录配置的系统与主机" },
   associations: { title: "关联关系", subtitle: "SAP 账号与需要同步的内容文件" },
-  scan: { title: "扫描文件", subtitle: "按系统 ID 与用户名查找磁盘上的配置" },
+
   sync: { title: "同步配置", subtitle: "把 SAP 账号写入全局配置文件（如 MCP）" },
   settings: { title: "设置", subtitle: "外观、安全、SAP 与数据" },
 };
 
-const TOOL_VIEWS = ["sap", "associations", "scan", "sync", "settings"];
+const TOOL_VIEWS = ["sap", "associations", "sync", "settings"];
 const TOOL_ICONS = {
   sap: "server",
   associations: "link",
-  scan: "radar",
   sync: "refresh",
   settings: "sliders",
 };
@@ -389,7 +387,7 @@ function sidebar() {
               type: "button",
               onClick: () => {
                 navigate(view);
-                if (view === "sap" || view === "scan") {
+                if (view === "sap") {
                   loadLandscape(false).catch(() => {});
                 }
               },
@@ -500,7 +498,6 @@ function viewContent() {
   }
   const host = h("div", { class: "content" });
   if (state.view === "sap") renderSap(host);
-  else if (state.view === "scan") renderScan(host);
   else if (state.view === "sync") renderSync(host);
   else if (state.view === "associations") renderAssociations(host);
   else if (state.view === "settings") {
@@ -562,7 +559,7 @@ function bindShortcuts() {
 async function wireEvents() {
   try {
     await listen("vault:locked", () => handleLocked());
-    await listen("scan:progress", (event) => handleScanProgress(event.payload));
+
     await listen("app:notice", (event) => {
       const { kind, message } = event.payload ?? {};
       toast(message ?? "", kind === "error" ? "error" : kind === "success" ? "success" : "info");

@@ -1719,6 +1719,31 @@ svg {
   font-size: var(--fs-xs);
 }
 
+/* -------------------------------------------------------- parsed fields --- */
+
+.evidence__row {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 2px 0;
+}
+
+.evidence__row .field__label {
+  font-weight: 600;
+}
+
+.evidence__row .field__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Key-word input inside a parsed-field block. */
+.field > .input {
+  margin-top: var(--s-1);
+}
+
 /* --------------------------------------------------------- reduced motion -- */
 
 @media (prefers-reduced-motion: reduce) {

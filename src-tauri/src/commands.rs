@@ -1,5 +1,4 @@
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -7,12 +6,14 @@ use tauri::{AppHandle, Emitter, State};
 use crate::clipboard;
 use crate::crypto::{self, GeneratorOptions, PasswordStrength};
 use crate::error::{AppError, AppResult};
+use crate::keys;
 use crate::model::{
-    now_string, Category, ContentLink, Entry, EntrySummary, LinkOrigin, SapAccount, ScanEvidence,
-    SyncTarget, Vault, VaultView, DEFAULT_CATEGORY_ID, SAP_CATEGORY_ID,
+    now_string, Category, ContentLink, Entry, EntrySummary, HistoryEntry, KeyMapping, LinkParse,
+    PasswordRule, SapAccount, SyncTarget, Vault, VaultView, DEFAULT_CATEGORY_ID,
+    MAX_PASSWORD_HISTORY, SAP_CATEGORY_ID,
 };
+use crate::rules;
 use crate::sap::{self, LandscapeReport, SapSystem};
-use crate::scanner::{self, ScanHit, ScanOptions, ScanReport};
 use crate::state::{AppState, Unlocked};
 use crate::store::{self, Settings, VaultMode};
 use crate::sync::{self, SyncOutcome, TemplatePreset};
@@ -20,13 +21,6 @@ use crate::sync::{self, SyncOutcome, TemplatePreset};
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScanProgress {
-    scanned: usize,
-    path: String,
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,10 +53,11 @@ pub struct Bootstrap {
     pub settings: Settings,
     pub data_dir: String,
     pub vault_path: String,
+    pub portable: bool,
     pub landscape_defaults: Vec<String>,
     pub landscape_paths: Vec<String>,
-    pub scan_root_default: String,
     pub presets: Vec<TemplatePreset>,
+    pub supported_formats: Vec<String>,
     pub version: String,
     pub startup_error: Option<String>,
 }
@@ -86,9 +81,17 @@ pub fn app_bootstrap(state: State<'_, AppState>) -> AppResult<Bootstrap> {
         settings,
         data_dir: store::data_dir().to_string_lossy().to_string(),
         vault_path: store::vault_path().to_string_lossy().to_string(),
+        portable: store::is_portable(),
         landscape_defaults: sap::default_landscape_paths(),
-        scan_root_default: scanner::default_scan_root(),
         presets: sync::presets(),
+        supported_formats: vec![
+            "JSON".to_string(),
+            ".env".to_string(),
+            "TOML".to_string(),
+            "YAML".to_string(),
+            "XML".to_string(),
+            "纯文本".to_string(),
+        ],
         version: env!("CARGO_PKG_VERSION").to_string(),
         startup_error: state.startup_error(),
     })
@@ -185,7 +188,9 @@ pub fn vault_status(state: State<'_, AppState>) -> serde_json::Value {
         "hasVault": state.has_vault(),
         "unlocked": state.is_unlocked(),
         "idleSeconds": state.idle_seconds(),
+        "sessionLocked": crate::state::workstation_locked(),
         "startupError": state.startup_error(),
+        "portable": store::is_portable(),
     })
 }
 
@@ -372,6 +377,14 @@ pub struct EntryInput {
     pub favorite: bool,
     #[serde(default)]
     pub sap: Option<SapAccount>,
+    /// `None` removes the rule from the entry.
+    #[serde(default)]
+    pub rule: Option<PasswordRule>,
+    #[serde(default)]
+    pub history_cycle: u32,
+    /// Set by the UI after the user accepts a rule / cycle warning.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[tauri::command]
@@ -393,8 +406,6 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
         if sap_block.system_id.is_empty() {
             return Err(AppError::Msg("SAP 账号必须填写系统 ID".to_string()));
         }
-        // Resolve host names from the landscape so scanning and sync always
-        // agree with SAP GUI's own configuration.
         if sap_block.hosts.is_empty() {
             if let Ok(report) = ensure_landscape(&state, false) {
                 let hosts = report.hosts_for(&sap_block.system_id);
@@ -415,26 +426,96 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
     }
 
     let id = input.id.clone().filter(|value| !value.is_empty());
-    let saved = state.with_vault_mut(|vault| {
+    let mut rule = input.rule.clone();
+    if let Some(rule) = rule.as_mut() {
+        rule.normalize();
+    }
+    let cycle = input.history_cycle.min(MAX_PASSWORD_HISTORY as u32);
+    let force = input.force;
+    let new_password = input.password.clone();
+
+    state.with_vault_mut(|vault| {
         // Validates the category and gives a clear error for a stale id.
         vault.category(&input.category_id)?;
-        let mut updated: Entry;
+
+        let existing = match &id {
+            Some(id) => Some(vault.entry(id)?.clone()),
+            None => None,
+        };
+
+        // --- policy checks ------------------------------------------------
+        let rule_problems = match rule.as_ref() {
+            Some(rule) if !new_password.is_empty() => rules::validate(&new_password, rule),
+            _ => Vec::new(),
+        };
+        let mut cycle_problems: Vec<String> = Vec::new();
+        if let Some(existing) = existing.as_ref() {
+            if !new_password.is_empty() && new_password != existing.password {
+                let mut probe = existing.clone();
+                probe.history_cycle = cycle;
+                let reused = probe
+                    .forbidden_reuse(&existing.password)
+                    .iter()
+                    .any(|value| value.as_str() == new_password.as_str());
+                if reused {
+                    cycle_problems.push(format!(
+                        "该密码在最近 {} 次维护中使用过，系统通常会拒绝重复",
+                        cycle
+                    ));
+                }
+            }
+        }
+
+        if !force {
+            if !rule_problems.is_empty() {
+                return Err(AppError::validation(
+                    "password-rule",
+                    "密码不符合该条目的规则",
+                    rule_problems,
+                ));
+            }
+            if !cycle_problems.is_empty() {
+                return Err(AppError::validation(
+                    "password-cycle",
+                    "密码与历史密码重复",
+                    cycle_problems,
+                ));
+            }
+        }
+
         match id {
             Some(id) => {
                 let entry = vault.entry_mut(&id)?;
+                let previous = entry.password.clone();
+                let changed = previous != new_password;
+                if changed && !previous.is_empty() {
+                    entry.password_history.insert(
+                        0,
+                        HistoryEntry {
+                            id: crate::model::new_id(),
+                            password: previous,
+                            recorded_at: now_string(),
+                            note: "密码变更时自动记录".to_string(),
+                            automatic: true,
+                        },
+                    );
+                    entry.password_history.truncate(MAX_PASSWORD_HISTORY);
+                }
                 entry.title = title;
                 entry.category_id = input.category_id.clone();
                 entry.username = input.username.clone();
                 entry.use_knox_id = input.use_knox_id;
-                entry.password = input.password.clone();
+                entry.password = new_password;
                 entry.url = input.url.clone();
                 entry.notes = input.notes.clone();
                 entry.favorite = input.favorite;
+                entry.rule = rule.clone();
+                entry.history_cycle = cycle;
                 // Moving out of the SAP category drops the SAP block, moving
                 // into it (re)installs the one we just resolved.
                 entry.sap = if is_sap { Some(sap_block.clone()) } else { None };
                 entry.updated_at = now_string();
-                updated = entry.clone();
+                Ok(entry.clone())
             }
             None => {
                 let entry = Entry {
@@ -443,24 +524,24 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                     category_id: input.category_id.clone(),
                     username: input.username.clone(),
                     use_knox_id: input.use_knox_id,
-                    password: input.password.clone(),
+                    password: new_password,
                     url: input.url.clone(),
                     notes: input.notes.clone(),
                     favorite: input.favorite,
                     sap: if is_sap { Some(sap_block.clone()) } else { None },
+                    rule,
+                    history_cycle: cycle,
+                    password_history: Vec::new(),
                     links: Vec::new(),
                     created_at: now_string(),
                     updated_at: now_string(),
                     last_used_at: None,
                 };
                 vault.entries.push(entry.clone());
-                updated = entry;
+                Ok(entry)
             }
         }
-        let _ = &mut updated;
-        Ok(updated)
-    })?;
-    Ok(saved)
+    })
 }
 
 #[tauri::command]
@@ -495,6 +576,66 @@ pub fn entry_summary(state: State<'_, AppState>, id: String) -> AppResult<EntryS
 }
 
 // ---------------------------------------------------------------------------
+// Password history
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn history_add(
+    state: State<'_, AppState>,
+    entry_id: String,
+    password: String,
+    note: Option<String>,
+) -> AppResult<Entry> {
+    if password.is_empty() {
+        return Err(AppError::Msg("历史密码不能为空".to_string()));
+    }
+    state.with_vault_mut(|vault| {
+        let entry = vault.entry_mut(&entry_id)?;
+        entry.password_history.insert(
+            0,
+            HistoryEntry {
+                id: crate::model::new_id(),
+                password,
+                recorded_at: now_string(),
+                note: note.unwrap_or_default(),
+                automatic: false,
+            },
+        );
+        entry.password_history.truncate(MAX_PASSWORD_HISTORY);
+        entry.updated_at = now_string();
+        Ok(entry.clone())
+    })
+}
+
+#[tauri::command]
+pub fn history_remove(
+    state: State<'_, AppState>,
+    entry_id: String,
+    history_id: String,
+) -> AppResult<Entry> {
+    state.with_vault_mut(|vault| {
+        let entry = vault.entry_mut(&entry_id)?;
+        let before = entry.password_history.len();
+        entry.password_history.retain(|item| item.id != history_id);
+        if entry.password_history.len() == before {
+            return Err(AppError::NotFound(format!("历史密码 {history_id}")));
+        }
+        entry.updated_at = now_string();
+        Ok(entry.clone())
+    })
+}
+
+#[tauri::command]
+pub fn history_clear(state: State<'_, AppState>, entry_id: String) -> AppResult<Entry> {
+    state.with_vault_mut(|vault| {
+        let entry = vault.entry_mut(&entry_id)?;
+        entry.password_history.clear();
+        entry.updated_at = now_string();
+        Ok(entry.clone())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Clipboard
 // ---------------------------------------------------------------------------
 
@@ -515,19 +656,15 @@ fn copy_with_notice(
     let settings = state.settings_snapshot();
     clipboard::set_text(&text)?;
     let handle = app.clone();
-    clipboard::schedule_auto_clear(
-        text,
-        settings.clipboard_clear_seconds as u64,
-        move || {
-            let _ = handle.emit(
-                "app:notice",
-                Notice {
-                    kind: "info".to_string(),
-                    message: "剪贴板已自动清空".to_string(),
-                },
-            );
-        },
-    );
+    clipboard::schedule_auto_clear(text, settings.clipboard_clear_seconds as u64, move || {
+        let _ = handle.emit(
+            "app:notice",
+            Notice {
+                kind: "info".to_string(),
+                message: "剪贴板已自动清空".to_string(),
+            },
+        );
+    });
     let seconds = settings.clipboard_clear_seconds;
     let suffix = if seconds == 0 {
         String::new()
@@ -600,6 +737,22 @@ pub fn copy_sap_credentials(
     )
 }
 
+/// Copies arbitrary text (a historical password, a parsed field value) using
+/// the same auto-clear policy as the credential copies.
+#[tauri::command]
+pub fn copy_text(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    text: String,
+    label: Option<String>,
+) -> AppResult<String> {
+    if text.is_empty() {
+        return Err(AppError::Msg("没有可复制的内容".to_string()));
+    }
+    let label = label.unwrap_or_else(|| "内容".to_string());
+    copy_with_notice(&app, &state, text, format!("{label}已复制"))
+}
+
 #[tauri::command]
 pub fn clipboard_clear() -> AppResult<()> {
     let mut clipboard =
@@ -647,138 +800,97 @@ pub fn sap_default_paths() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Scanning
+// Content files
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkDraft {
+    pub path: String,
+    /// Omit to use the global default key words.
+    #[serde(default)]
+    pub keys: Option<KeyMapping>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkInspection {
+    pub path: String,
+    pub label: String,
+    pub format: String,
+    pub supported: bool,
+    pub exists: bool,
+    pub size: u64,
+    pub keys: KeyMapping,
+    pub parse: LinkParse,
+}
+
+fn inspect(path: &str, keys: KeyMapping) -> LinkInspection {
+    let target = PathBuf::from(path.trim());
+    let mut keys = keys;
+    keys.normalize();
+    let parse = keys::analyze_file(&target, &keys);
+    let metadata = std::fs::metadata(&target).ok();
+    LinkInspection {
+        path: target.to_string_lossy().to_string(),
+        label: target
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string()),
+        format: parse.format.clone(),
+        supported: keys::is_supported(&target),
+        exists: metadata.is_some(),
+        size: metadata.map(|meta| meta.len()).unwrap_or(0),
+        keys,
+        parse,
+    }
+}
+
+/// Analyses files without attaching them, so the UI can show what was found and
+/// ask the user for different key words when a field is missing.
 #[tauri::command]
-pub async fn scan_run(
-    app: AppHandle,
+pub fn link_inspect(
     state: State<'_, AppState>,
-    options: ScanOptions,
-) -> AppResult<ScanReport> {
-    if state.scan_running.swap(true, Ordering::SeqCst) {
-        return Err(AppError::Msg("已有扫描任务在进行中".to_string()));
-    }
-    state.scan_cancel.store(false, Ordering::Relaxed);
-    let cancel = state.scan_cancel.clone();
-
-    let settings = state.settings_snapshot();
-    let mut effective = options;
-    if effective.roots.is_empty() {
-        effective.roots = settings.scan_roots.clone();
-    }
-    effective.max_files = effective.max_files.max(1);
-    effective
-        .extra_skip_paths
-        .push(store::data_dir().to_string_lossy().to_string());
-
-    let progress_app = app.clone();
-    let handle = tauri::async_runtime::spawn_blocking(move || {
-        scanner::run_scan(&effective, &cancel, |scanned, path| {
-            let _ = progress_app.emit(
-                "scan:progress",
-                ScanProgress {
-                    scanned,
-                    path: path.to_string(),
-                },
-            );
-        })
-    });
-
-    let joined = handle
-        .await
-        .map_err(|err| AppError::Msg(format!("扫描任务异常结束：{err}")));
-    state.scan_running.store(false, Ordering::SeqCst);
-    let report = joined??;
-    state.touch();
-    notice(
-        &app,
-        "info",
-        format!(
-            "扫描完成：检查 {} 个文件，命中 {} 个",
-            report.scanned_files,
-            report.hits.len()
-        ),
-    );
-    Ok(report)
-}
-
-#[tauri::command]
-pub fn scan_cancel(state: State<'_, AppState>) {
-    state.cancel_scan();
-}
-
-#[tauri::command]
-pub fn scan_attach(
-    state: State<'_, AppState>,
-    entry_id: String,
-    hits: Vec<ScanHit>,
-    replace: Option<bool>,
-) -> AppResult<Entry> {
-    let replace = replace.unwrap_or(false);
-    state.with_vault_mut(|vault| {
-        let entry = vault.entry_mut(&entry_id)?;
-        if replace {
-            entry.links.retain(|link| link.origin != LinkOrigin::Scan);
-        }
-        for hit in &hits {
-            if entry.links.iter().any(|link| link.path == hit.path) {
-                continue;
-            }
-            let evidence = ScanEvidence {
-                host: hit.matched_hosts.first().cloned().unwrap_or_default(),
-                system_id: hit.matched_system_ids.first().cloned().unwrap_or_default(),
-                username: hit.matched_usernames.first().cloned().unwrap_or_default(),
-                matched: hit
-                    .matched_hosts
-                    .iter()
-                    .chain(hit.matched_system_ids.iter())
-                    .chain(hit.matched_usernames.iter())
-                    .cloned()
-                    .collect(),
-                first_line: hit.first_line,
-                excerpt: hit.excerpt.clone(),
-            };
-            entry.links.push(ContentLink::from_path(
-                &hit.path,
-                LinkOrigin::Scan,
-                Some(evidence),
-            ));
-        }
-        entry.updated_at = now_string();
-        Ok(entry.clone())
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Linked content files
-// ---------------------------------------------------------------------------
-
-fn attach_paths(entry: &mut Entry, paths: &[String]) -> usize {
-    let mut added = 0usize;
-    for path in paths {
-        let trimmed = path.trim();
-        if trimmed.is_empty() || entry.links.iter().any(|link| link.path == trimmed) {
-            continue;
-        }
-        entry
-            .links
-            .push(ContentLink::from_path(trimmed, LinkOrigin::Manual, None));
-        added += 1;
-    }
-    added
+    paths: Vec<String>,
+    keys: Option<KeyMapping>,
+) -> AppResult<Vec<LinkInspection>> {
+    let mapping = keys.unwrap_or_else(|| state.settings_snapshot().key_mapping);
+    Ok(paths
+        .iter()
+        .map(|path| inspect(path, mapping.clone()))
+        .collect())
 }
 
 #[tauri::command]
 pub fn link_add(
     state: State<'_, AppState>,
     entry_id: String,
-    paths: Vec<String>,
+    drafts: Vec<LinkDraft>,
 ) -> AppResult<Entry> {
+    let fallback = state.settings_snapshot().key_mapping;
+    let mut prepared: Vec<ContentLink> = Vec::new();
+    for draft in &drafts {
+        let trimmed = draft.path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut keys = draft.keys.clone().unwrap_or_else(|| fallback.clone());
+        keys.normalize();
+        let parse = keys::analyze_file(Path::new(trimmed), &keys);
+        prepared.push(ContentLink::from_path(trimmed, keys, Some(parse)));
+    }
+
     state.with_vault_mut(|vault| {
         let entry = vault.entry_mut(&entry_id)?;
-        let added = attach_paths(entry, &paths);
-        if added == 0 && !paths.is_empty() {
+        let mut added = 0usize;
+        for link in prepared {
+            if entry.links.iter().any(|existing| existing.path == link.path) {
+                continue;
+            }
+            entry.links.push(link);
+            added += 1;
+        }
+        if added == 0 && !drafts.is_empty() {
             return Err(AppError::Msg("所选文件已全部关联".to_string()));
         }
         entry.updated_at = now_string();
@@ -787,15 +899,46 @@ pub fn link_add(
 }
 
 #[tauri::command]
-pub async fn link_pick_and_add(
+pub fn link_update_keys(
     state: State<'_, AppState>,
     entry_id: String,
-) -> AppResult<Option<Entry>> {
-    let picked = pick_files_inner().await?;
-    if picked.is_empty() {
-        return Ok(None);
-    }
-    link_add(state, entry_id, picked).map(Some)
+    link_id: String,
+    keys: KeyMapping,
+) -> AppResult<Entry> {
+    state.with_vault_mut(|vault| {
+        let entry = vault.entry_mut(&entry_id)?;
+        let link = entry
+            .links
+            .iter_mut()
+            .find(|link| link.id == link_id)
+            .ok_or_else(|| AppError::NotFound(format!("关联文件 {link_id}")))?;
+        let mut keys = keys;
+        keys.normalize();
+        link.keys = keys;
+        link.parse = Some(keys::analyze_file(Path::new(&link.path), &link.keys));
+        link.refresh_stat();
+        entry.updated_at = now_string();
+        Ok(entry.clone())
+    })
+}
+
+#[tauri::command]
+pub fn link_reanalyze(
+    state: State<'_, AppState>,
+    entry_id: String,
+    link_id: String,
+) -> AppResult<Entry> {
+    state.with_vault_mut(|vault| {
+        let entry = vault.entry_mut(&entry_id)?;
+        for link in entry.links.iter_mut() {
+            if link.id == link_id {
+                link.parse = Some(keys::analyze_file(Path::new(&link.path), &link.keys));
+                link.refresh_stat();
+            }
+        }
+        entry.updated_at = now_string();
+        Ok(entry.clone())
+    })
 }
 
 #[tauri::command]
@@ -972,7 +1115,7 @@ pub fn sync_preview_template(
 }
 
 #[tauri::command]
-pub fn sync_run(state: State<'_, AppState>, id: String) -> AppResult<SyncOutcome> {
+pub fn sync_run(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<SyncOutcome> {
     let settings = state.settings_snapshot();
     let target = state.with_vault(|vault| find_target(vault, &id))?;
     let outcome =
@@ -989,11 +1132,12 @@ pub fn sync_run(state: State<'_, AppState>, id: String) -> AppResult<SyncOutcome
         }
         Ok(())
     })?;
+    notice(&app, "success", format!("已写入 {}", outcome.path));
     Ok(outcome)
 }
 
 #[tauri::command]
-pub fn sync_run_all(state: State<'_, AppState>) -> AppResult<Vec<SyncOutcome>> {
+pub fn sync_run_all(app: AppHandle, state: State<'_, AppState>) -> AppResult<Vec<SyncOutcome>> {
     let settings = state.settings_snapshot();
     let targets: Vec<SyncTarget> = state.with_vault(|vault| {
         Ok(vault
@@ -1031,6 +1175,7 @@ pub fn sync_run_all(state: State<'_, AppState>) -> AppResult<Vec<SyncOutcome>> {
             outcomes.push(outcome);
         }
     }
+    notice(&app, "success", format!("已同步 {} 个目标", outcomes.len()));
     Ok(outcomes)
 }
 
@@ -1046,6 +1191,26 @@ pub fn generate_password(options: GeneratorOptions) -> AppResult<String> {
 #[tauri::command]
 pub fn check_password_strength(password: String) -> PasswordStrength {
     crypto::password_strength(&password)
+}
+
+#[tauri::command]
+pub fn rule_default() -> PasswordRule {
+    PasswordRule::default()
+}
+
+#[tauri::command]
+pub fn generate_rule_password(rule: PasswordRule) -> AppResult<String> {
+    rules::generate(&rule)
+}
+
+#[tauri::command]
+pub fn validate_password(password: String, rule: PasswordRule) -> Vec<String> {
+    rules::validate(&password, &rule)
+}
+
+#[tauri::command]
+pub fn key_mapping_default() -> KeyMapping {
+    KeyMapping::default()
 }
 
 async fn pick_files_inner() -> AppResult<Vec<String>> {
@@ -1106,8 +1271,9 @@ pub fn app_paths() -> serde_json::Value {
         "vaultPath": store::vault_path().to_string_lossy(),
         "settingsPath": store::settings_path().to_string_lossy(),
         "backupDir": store::backup_dir().to_string_lossy(),
-        "scanRootDefault": scanner::default_scan_root(),
+        "portable": store::is_portable(),
         "landscapeDefaults": sap::default_landscape_paths(),
+        "supportedFormats": ["json", ".env", "toml", "yaml", "xml", "text"],
     })
 }
 

@@ -1,17 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{self, KdfParams, KEY_LEN};
 use crate::error::{AppError, AppResult};
-use crate::model::{Vault, DEFAULT_CATEGORY_ID, SAP_CATEGORY_ID};
-use crate::scanner;
+use crate::model::{
+    KeyMapping, PasswordRule, Vault, DEFAULT_CATEGORY_ID, MAX_PASSWORD_HISTORY, SAP_CATEGORY_ID,
+};
 
 pub const ENVELOPE_FILE: &str = "vault.sapvault";
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const ENVELOPE_FORMAT: &str = "sapvault";
 pub const ENVELOPE_VERSION: u32 = 1;
 pub const MAX_VAULT_BACKUPS: usize = 10;
+
+/// Marker file that switches SapVault into portable ("绿色") mode.
+pub const PORTABLE_MARKER: &str = "portable.txt";
+/// Folder used for the vault when running in portable mode.
+pub const PORTABLE_DATA_DIR: &str = "SapVaultData";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +51,8 @@ pub struct Settings {
     pub theme: String,
     pub clipboard_clear_seconds: u32,
     pub auto_lock_minutes: u32,
+    /// Lock the vault as soon as the Windows session is locked (Win+L).
+    pub lock_on_session_lock: bool,
     /// SAP GUI fills successive fields when a multi-line text is pasted, so the
     /// user name and password pair is joined with this separator.
     pub sap_line_separator: String,
@@ -52,13 +60,11 @@ pub struct Settings {
     pub confirm_delete: bool,
     /// Empty means "auto-detect the standard SAP GUI locations".
     pub landscape_paths: Vec<String>,
-    pub scan_roots: Vec<String>,
-    pub scan_strict: bool,
-    pub scan_max_file_bytes: u64,
-    pub scan_max_files: usize,
-    pub scan_max_depth: usize,
-    pub scan_only_extensions: Vec<String>,
-    pub scan_extra_skips: Vec<String>,
+    /// Default key words used when a content file is attached. Each file keeps
+    /// its own copy so an override never changes other files.
+    pub key_mapping: KeyMapping,
+    /// Password policy offered for new entries. `None` means "no rule".
+    pub default_rule: Option<PasswordRule>,
     /// Remembers the last category filter so the window reopens where the user
     /// left off.
     pub last_category: String,
@@ -70,17 +76,13 @@ impl Default for Settings {
             theme: "system".to_string(),
             clipboard_clear_seconds: 30,
             auto_lock_minutes: 10,
+            lock_on_session_lock: true,
             sap_line_separator: "\r\n".to_string(),
             mask_passwords: true,
             confirm_delete: true,
             landscape_paths: Vec::new(),
-            scan_roots: vec![scanner::default_scan_root()],
-            scan_strict: true,
-            scan_max_file_bytes: 2 * 1024 * 1024,
-            scan_max_files: 30_000,
-            scan_max_depth: 10,
-            scan_only_extensions: Vec::new(),
-            scan_extra_skips: Vec::new(),
+            key_mapping: KeyMapping::default(),
+            default_rule: None,
             last_category: SAP_CATEGORY_ID.to_string(),
         }
     }
@@ -96,11 +98,9 @@ impl Settings {
         }
         self.clipboard_clear_seconds = self.clipboard_clear_seconds.min(600);
         self.auto_lock_minutes = self.auto_lock_minutes.min(240);
-        self.scan_max_files = self.scan_max_files.clamp(100, 500_000);
-        self.scan_max_depth = self.scan_max_depth.clamp(1, 64);
-        self.scan_max_file_bytes = self.scan_max_file_bytes.clamp(1024, 64 * 1024 * 1024);
-        if self.scan_roots.is_empty() {
-            self.scan_roots = vec![scanner::default_scan_root()];
+        self.key_mapping.normalize();
+        if let Some(rule) = self.default_rule.as_mut() {
+            rule.normalize();
         }
         if self.last_category.is_empty() {
             self.last_category = DEFAULT_CATEGORY_ID.to_string();
@@ -108,11 +108,42 @@ impl Settings {
     }
 }
 
-pub fn data_dir() -> PathBuf {
-    let base = dirs::data_dir()
+// ---------------------------------------------------------------------------
+// Locations
+// ---------------------------------------------------------------------------
+
+fn roaming_dir() -> PathBuf {
+    dirs::data_dir()
         .or_else(dirs::config_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("SapVault")
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("SapVault")
+}
+
+/// Portable ("绿色免安装") mode: a `portable.txt` marker next to the executable —
+/// or an existing `SapVaultData` folder — keeps every file beside the app
+/// instead of inside the user profile.
+pub fn portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    portable_dir_in(exe.parent()?)
+}
+
+/// The actual rule, split out so it can be unit tested without moving the
+/// executable around.
+pub fn portable_dir_in(exe_dir: &Path) -> Option<PathBuf> {
+    let data = exe_dir.join(PORTABLE_DATA_DIR);
+    if exe_dir.join(PORTABLE_MARKER).exists() || data.is_dir() {
+        Some(data)
+    } else {
+        None
+    }
+}
+
+pub fn is_portable() -> bool {
+    portable_dir().is_some()
+}
+
+pub fn data_dir() -> PathBuf {
+    portable_dir().unwrap_or_else(roaming_dir)
 }
 
 pub fn backup_dir() -> PathBuf {
@@ -132,6 +163,10 @@ pub fn ensure_dirs() -> AppResult<()> {
     std::fs::create_dir_all(backup_dir())?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Vault envelope
+// ---------------------------------------------------------------------------
 
 pub fn load_envelope() -> AppResult<Option<VaultEnvelope>> {
     let path = vault_path();
@@ -215,8 +250,13 @@ pub fn save_settings(settings: &Settings) -> AppResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Vault normalization
+// ---------------------------------------------------------------------------
+
 /// Normalizes a vault loaded from disk: guarantees the built-in categories
-/// exist and that SAP entries always carry a SAP block.
+/// exist, that SAP entries carry a SAP block, that rules and key mappings are
+/// valid, and that no password history grows past the cap.
 pub fn normalize_vault(vault: &mut Vault) {
     if vault.schema == 0 {
         vault.schema = 1;
@@ -235,12 +275,26 @@ pub fn normalize_vault(vault: &mut Vault) {
         if entry.category_id == SAP_CATEGORY_ID && entry.sap.is_none() {
             entry.sap = Some(Default::default());
         }
+        if let Some(rule) = entry.rule.as_mut() {
+            rule.normalize();
+        }
+        entry.password_history.truncate(MAX_PASSWORD_HISTORY);
+        for recorded in entry.password_history.iter_mut() {
+            if recorded.recorded_at.is_empty() {
+                recorded.recorded_at = crate::model::now_string();
+            }
+        }
         for link in entry.links.iter_mut() {
+            link.keys.normalize();
             link.refresh_stat();
         }
     }
     vault.categories.sort_by_key(|category| category.sort);
 }
+
+// ---------------------------------------------------------------------------
+// Envelope creation / unlocking
+// ---------------------------------------------------------------------------
 
 /// Creates a brand new envelope. The same `KdfParams` instance is used for the
 /// derivation and stored in the envelope, otherwise the salt would not match and
@@ -318,7 +372,7 @@ pub fn decrypt_vault(envelope: &VaultEnvelope, key: &[u8; KEY_LEN]) -> AppResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Entry;
+    use crate::model::{ContentLink, Entry, HistoryEntry, KeyMapping};
 
     fn blank_entry(id: &str, category: &str) -> Entry {
         Entry {
@@ -332,6 +386,9 @@ mod tests {
             notes: String::new(),
             favorite: false,
             sap: None,
+            rule: None,
+            history_cycle: 0,
+            password_history: Vec::new(),
             links: Vec::new(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -348,14 +405,15 @@ mod tests {
         let restored = decrypt_vault(&envelope, &key).unwrap();
         assert_eq!(restored.categories.len(), 2);
         assert_eq!(restored.schema, 1);
-        let wrong = unlock_key(&envelope, Some("wrong password")).unwrap(); assert!(decrypt_vault(&envelope, &wrong).is_err());
+        let wrong = unlock_key(&envelope, Some("wrong password")).unwrap();
+        assert!(decrypt_vault(&envelope, &wrong).is_err());
     }
 
     #[test]
     fn password_mode_matches_its_stored_salt() {
         let vault = Vault::default();
-        let envelope = create_envelope(VaultMode::Password, Some("a-long-password"), "", &vault)
-            .unwrap();
+        let envelope =
+            create_envelope(VaultMode::Password, Some("a-long-password"), "", &vault).unwrap();
         let params = envelope.kdf.as_ref().unwrap();
         let rederived = crypto::derive_key("a-long-password", params).unwrap();
         let from_unlock = unlock_key(&envelope, Some("a-long-password")).unwrap();
@@ -391,16 +449,61 @@ mod tests {
     }
 
     #[test]
+    fn normalize_caps_history_and_fills_timestamps() {
+        let mut vault = Vault::default();
+        let mut entry = blank_entry("sap", SAP_CATEGORY_ID);
+        for index in 0..(MAX_PASSWORD_HISTORY + 20) {
+            entry.password_history.push(HistoryEntry {
+                id: format!("h{index}"),
+                password: format!("pw{index}"),
+                recorded_at: String::new(),
+                note: String::new(),
+                automatic: true,
+            });
+        }
+        vault.entries.push(entry);
+        normalize_vault(&mut vault);
+        assert_eq!(
+            vault.entries[0].password_history.len(),
+            MAX_PASSWORD_HISTORY
+        );
+        assert!(!vault.entries[0].password_history[0].recorded_at.is_empty());
+    }
+
+    #[test]
+    fn normalize_repairs_link_key_mappings() {
+        let mut vault = Vault::default();
+        let mut entry = blank_entry("sap", SAP_CATEGORY_ID);
+        let mut link = ContentLink::from_path("C:/demo/a.json", KeyMapping::default(), None);
+        link.keys.username = vec!["  ".to_string(), "  ".to_string()];
+        entry.links.push(link);
+        vault.entries.push(entry);
+        normalize_vault(&mut vault);
+        assert_eq!(
+            vault.entries[0].links[0].keys.username,
+            KeyMapping::default().username
+        );
+    }
+
+    #[test]
     fn settings_normalize_clamps_values() {
         let mut settings = Settings {
             theme: "neon".into(),
             sap_line_separator: "\t".into(),
             clipboard_clear_seconds: 100_000,
             auto_lock_minutes: 100_000,
-            scan_max_files: 1,
-            scan_max_depth: 0,
-            scan_max_file_bytes: 1,
-            scan_roots: Vec::new(),
+            key_mapping: KeyMapping {
+                url: Vec::new(),
+                username: Vec::new(),
+                password: Vec::new(),
+                ignore_case: true,
+                exact: false,
+            },
+            default_rule: Some(PasswordRule {
+                min_length: 99,
+                max_length: 4,
+                ..PasswordRule::default()
+            }),
             ..Settings::default()
         };
         settings.normalize();
@@ -408,8 +511,39 @@ mod tests {
         assert_eq!(settings.sap_line_separator, "\r\n");
         assert_eq!(settings.clipboard_clear_seconds, 600);
         assert_eq!(settings.auto_lock_minutes, 240);
-        assert_eq!(settings.scan_max_files, 100);
-        assert_eq!(settings.scan_max_depth, 1);
-        assert!(!settings.scan_roots.is_empty());
+        assert!(!settings.key_mapping.url.is_empty());
+        let rule = settings.default_rule.unwrap();
+        assert!(rule.max_length >= rule.min_length);
+    }
+
+    #[test]
+    fn portable_marker_switches_the_data_directory() {
+        let dir = std::env::temp_dir().join(format!("sapvault-portable-{}", crate::model::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(portable_dir_in(&dir).is_none());
+
+        std::fs::write(dir.join(PORTABLE_MARKER), "portable").unwrap();
+        assert_eq!(portable_dir_in(&dir).unwrap(), dir.join(PORTABLE_DATA_DIR));
+
+        // An existing data folder is a marker on its own.
+        std::fs::remove_file(dir.join(PORTABLE_MARKER)).unwrap();
+        std::fs::create_dir_all(dir.join(PORTABLE_DATA_DIR)).unwrap();
+        assert_eq!(portable_dir_in(&dir).unwrap(), dir.join(PORTABLE_DATA_DIR));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_dir_lives_under_an_expected_folder_name() {
+        let dir = data_dir();
+        let name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            name == "SapVault" || name == PORTABLE_DATA_DIR,
+            "unexpected data directory: {dir:?}"
+        );
     }
 }

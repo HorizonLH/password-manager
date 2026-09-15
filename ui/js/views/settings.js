@@ -1,7 +1,7 @@
 import { h, guard, mount } from "../dom.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
-import { state, setState, saveSettings, loadLandscape, buildScanDefaults } from "../state.js";
+import { state, setState, saveSettings, loadLandscape } from "../state.js";
 import { confirmModal, openModal } from "../modal.js";
 import { toast } from "../toast.js";
 
@@ -41,6 +41,24 @@ function numberField(label, value, { min, max, step, hint, onChange }) {
   );
 }
 
+function checkbox(label, checked, onChange, hint) {
+  return h(
+    "div",
+    { class: "form__row" },
+    h(
+      "label",
+      { class: "checkbox" },
+      h("input", {
+        type: "checkbox",
+        checked,
+        onChange: (event) => onChange(event.target.checked),
+      }),
+      h("span", null, label),
+    ),
+    hint ? h("p", { class: "form__hint" }, hint) : null,
+  );
+}
+
 function appearanceCard() {
   const theme = state.settings.theme;
   const option = (value, label, iconName) =>
@@ -72,28 +90,30 @@ function appearanceCard() {
 function securityCard() {
   const settings = state.settings;
   return card(
-    "安全与剪贴板",
+    "安全、锁定与剪贴板",
     "shield",
-    "复制后的内容会在指定时间后自动清空，避免残留在剪贴板历史里。",
+    "锁屏或重启后都需要重新解锁；解锁前所有密码都不会出现在内存里。",
     h(
       "div",
       { class: "form__grid" },
-      numberField(
-        "剪贴板自动清空（秒，0 = 关闭）",
-        settings.clipboardClearSeconds,
-        {
-          min: 0,
-          max: 600,
-          step: 5,
-          onChange: guard((value) => saveSettings({ clipboardClearSeconds: value })),
-        },
-      ),
+      numberField("剪贴板自动清空（秒，0 = 关闭）", settings.clipboardClearSeconds, {
+        min: 0,
+        max: 600,
+        step: 5,
+        onChange: guard((value) => saveSettings({ clipboardClearSeconds: value })),
+      }),
       numberField("空闲自动锁定（分钟，0 = 关闭）", settings.autoLockMinutes, {
         min: 0,
         max: 240,
         step: 1,
         onChange: guard((value) => saveSettings({ autoLockMinutes: value })),
       }),
+    ),
+    checkbox(
+      "系统锁屏（Win+L）时立即锁定保险库",
+      settings.lockOnSessionLock,
+      guard((value) => saveSettings({ lockOnSessionLock: value })),
+      "锁屏后每 5 秒检测一次，回到桌面时必须重新解锁。",
     ),
     h(
       "div",
@@ -121,7 +141,7 @@ function securityCard() {
     ),
     h(
       "div",
-      { style: { display: "flex", gap: "8px" } },
+      { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
       h(
         "button",
         {
@@ -151,12 +171,12 @@ function securityCard() {
     h(
       "div",
       { class: "form__row" },
-      h("label", { class: "form__label" }, "修改主密码"),
+      h("label", { class: "form__label" }, "主密码"),
       h(
         "p",
         { class: "form__hint" },
         state.mode === "windows"
-          ? "当前保险库使用 Windows 账户密钥。设置主密码后会切换为 Argon2id 派生密钥。"
+          ? "当前使用 Windows 账户密钥（DPAPI），解锁时不需要输入密码。若希望「锁屏/重启后必须输入密码」，请设置主密码。"
           : "修改后请牢记新密码，SapVault 无法找回。",
       ),
       h(
@@ -177,13 +197,7 @@ function changePasswordModal() {
     title: state.mode === "windows" ? "设置主密码" : "修改主密码",
     size: "narrow",
     render: () =>
-      h(
-        "div",
-        { class: "form" },
-        state.mode === "windows" ? null : current,
-        next,
-        confirm,
-      ),
+      h("div", { class: "form" }, state.mode === "windows" ? null : current, next, confirm),
     footer: (close) =>
       h(
         "div",
@@ -203,7 +217,6 @@ function changePasswordModal() {
                 state.mode === "windows" ? null : current.value,
                 next.value,
               );
-              await api.settingsSave(state.settings);
               close();
               setState({ mode: "password" });
               toast("主密码已更新", "success");
@@ -234,8 +247,7 @@ function sapCard() {
           type: "button",
           title: "移除",
           onClick: guard(async () => {
-            const next = paths.filter((item) => item !== path);
-            await saveSettings({ landscapePaths: next });
+            await saveSettings({ landscapePaths: paths.filter((item) => item !== path) });
           }),
         },
         icon("x", { size: 12 }),
@@ -246,30 +258,26 @@ function sapCard() {
   return card(
     "SAP 与 Knox ID",
     "server",
-    "系统 ID 会先在登录配置中查出域名或 IP，再用于扫描与同步。",
+    "系统 ID 会在登录配置中解析出系统名称与主机名，用于展示与同步输出。",
     h(
       "div",
       { class: "form__row" },
       h("label", { class: "form__label" }, "全局 Knox ID"),
-      h(
-        "div",
-        { class: "input-group" },
-        h("input", {
-          id: "settings-knox",
-          class: "input input--mono",
-          value: state.vault?.knoxId ?? "",
-          placeholder: "例如 K1234567",
-          onChange: guard(async (event) => {
-            const vault = await api.knoxSet(event.target.value);
-            setState({ vault });
-            toast("Knox ID 已更新", "success");
-          }),
+      h("input", {
+        id: "settings-knox",
+        class: "input input--mono",
+        value: state.vault?.knoxId ?? "",
+        placeholder: "例如 K1234567",
+        onChange: guard(async (event) => {
+          const vault = await api.knoxSet(event.target.value);
+          setState({ vault });
+          toast("Knox ID 已更新", "success");
         }),
-      ),
+      }),
       h(
         "p",
         { class: "form__hint" },
-        "维护条目时勾选“使用全局 Knox ID”，该条目就会以这个值作为用户名，同步与复制时同样生效。",
+        "条目里勾选「使用全局 Knox ID」后，该条目就以这个值作为用户名，复制与同步时同样生效。",
       ),
     ),
     h(
@@ -300,8 +308,7 @@ function sapCard() {
             class: "btn btn--sm btn--ghost",
             type: "button",
             onClick: guard(async () => {
-              const defaults = await api.sapDefaultPaths();
-              await saveSettings({ landscapePaths: defaults });
+              await saveSettings({ landscapePaths: await api.sapDefaultPaths() });
               toast("已恢复默认路径", "success");
             }),
           },
@@ -345,112 +352,230 @@ function sapCard() {
   );
 }
 
-function scanCard() {
-  const settings = state.settings;
-  const roots = settings.scanRoots ?? [];
-  return card(
-    "扫描默认值",
-    "radar",
-    "扫描范围越大耗时越长。默认只读取文本类文件，并跳过缓存与依赖目录。",
+/** Default password policy offered when creating a new entry. */
+function ruleCard() {
+  const rule = state.settings.defaultRule;
+  const container = h("div", { class: "stack stack--tight" });
+
+  function patch(values) {
+    const next = { ...(state.settings.defaultRule ?? defaultRule()), ...values };
+    saveSettings({ defaultRule: next }).then(paint).catch(() => {});
+  }
+
+  const numberInput = (value, key, min, max) =>
+    h("input", {
+      class: "input input--mono",
+      type: "number",
+      min: String(min),
+      max: String(max),
+      value: String(value),
+      onChange: (event) => patch({ [key]: Number(event.target.value) }),
+    });
+
+  const toggle = (key, label) =>
     h(
-      "div",
-      { class: "form__row" },
-      h("label", { class: "form__label" }, "默认扫描目录"),
+      "label",
+      { class: "checkbox" },
+      h("input", {
+        type: "checkbox",
+        checked: Boolean(state.settings.defaultRule?.[key]),
+        onChange: (event) => patch({ [key]: event.target.checked }),
+      }),
+      h("span", null, label),
+    );
+
+  function paint() {
+    const current = state.settings.defaultRule;
+    mount(
+      container,
       h(
         "div",
-        { class: "path-list" },
-        roots.map((root) =>
-          h(
+        { class: "card__head" },
+        h(
+          "p",
+          { class: "card__hint" },
+          current
+            ? "新建条目时会默认带上这条规则，仍可在条目里单独修改或取消。"
+            : "当前没有默认规则；新建条目时也不会有规则。",
+        ),
+        h(
+          "label",
+          { class: "checkbox" },
+          h("input", {
+            type: "checkbox",
+            checked: Boolean(current),
+            onChange: guard(async (event) => {
+              await saveSettings({ defaultRule: event.target.checked ? defaultRule() : null });
+              paint();
+            }),
+          }),
+          h("span", null, "启用默认规则"),
+        ),
+      ),
+      current
+        ? h(
             "div",
-            { class: "path-row" },
-            icon("folder", { size: 13 }),
-            h("span", { class: "path-row__text", title: root }, root),
+            { class: "stack stack--tight" },
             h(
-              "button",
-              {
-                class: "btn btn--icon btn--sm",
-                type: "button",
-                onClick: guard(async () =>
-                  saveSettings({ scanRoots: roots.filter((item) => item !== root) }),
-                ),
-              },
-              icon("x", { size: 12 }),
+              "div",
+              { class: "form__grid" },
+              h(
+                "div",
+                { class: "form__row" },
+                h("label", { class: "form__label" }, "规则名称 / 备注"),
+                h("input", {
+                  class: "input",
+                  value: current.description,
+                  placeholder: "例如：集团口令策略 2024",
+                  onChange: (event) => patch({ description: event.target.value }),
+                }),
+              ),
+              h(
+                "div",
+                { class: "form__row" },
+                h("label", { class: "form__label" }, "最小长度"),
+                numberInput(current.minLength, "minLength", 4, 128),
+              ),
+              h(
+                "div",
+                { class: "form__row" },
+                h("label", { class: "form__label" }, "最大长度"),
+                numberInput(current.maxLength, "maxLength", 4, 128),
+              ),
             ),
-          ),
-        ),
-      ),
+            h(
+              "div",
+              { style: { display: "flex", flexWrap: "wrap", gap: "12px" } },
+              toggle("lower", "小写"),
+              toggle("upper", "大写"),
+              toggle("digits", "数字"),
+              toggle("symbols", "符号"),
+              toggle("startWithLetter", "首字符为字母"),
+              toggle("avoidAmbiguous", "排除易混淆字符"),
+            ),
+            h(
+              "div",
+              { class: "form__grid" },
+              h(
+                "div",
+                { class: "form__row" },
+                h("label", { class: "form__label" }, "可用符号"),
+                h("input", {
+                  class: "input input--mono",
+                  value: current.symbolsSet,
+                  onChange: (event) => patch({ symbolsSet: event.target.value }),
+                }),
+              ),
+              h(
+                "div",
+                { class: "form__row" },
+                h("label", { class: "form__label" }, "禁用字符"),
+                h("input", {
+                  class: "input input--mono",
+                  value: current.forbidden,
+                  onChange: (event) => patch({ forbidden: event.target.value }),
+                }),
+              ),
+            ),
+          )
+        : null,
+    );
+  }
+
+  paint();
+  return card(
+    "默认密码规则",
+    "sliders",
+    "规则可以校验密码并生成合规密码；不设置规则时任何密码都能保存。",
+    container,
+  );
+}
+
+/** Default key words used when a content file is attached. */
+function keyMapCard() {
+  const container = h("div", { class: "stack stack--tight" });
+
+  function paint() {
+    const mapping = state.settings.keyMapping;
+    const row = (kind, label, hint) =>
       h(
         "div",
-        { style: { display: "flex", gap: "8px" } },
-        h(
-          "button",
-          {
-            class: "btn btn--sm",
-            type: "button",
-            onClick: guard(async () => {
-              const picked = await api.pickFolder("选择默认扫描目录");
-              if (!picked) return;
-              await saveSettings({ scanRoots: [...roots, picked] });
-            }),
-          },
-          icon("plus", { size: 13 }),
-          "添加目录",
-        ),
-        h(
-          "button",
-          {
-            class: "btn btn--sm btn--ghost",
-            type: "button",
-            onClick: guard(async () => {
-              const defaults = buildScanDefaults(
-                { ...settings, scanRoots: [] },
-                state.paths?.scanRootDefault,
-              );
-              await saveSettings({ scanRoots: defaults.roots });
-            }),
-          },
-          "恢复当前用户目录",
-        ),
-      ),
-    ),
-    h(
-      "div",
-      { class: "form__grid" },
-      numberField("最大目录深度", settings.scanMaxDepth, {
-        min: 1,
-        max: 64,
-        onChange: guard((value) => saveSettings({ scanMaxDepth: value })),
-      }),
-      numberField("最多检查文件数", settings.scanMaxFiles, {
-        min: 100,
-        step: 1000,
-        onChange: guard((value) => saveSettings({ scanMaxFiles: value })),
-      }),
-      numberField(
-        "单个文件上限 (MB)",
-        Math.round(settings.scanMaxFileBytes / 1048576),
-        {
-          min: 1,
-          max: 64,
-          onChange: guard((value) => saveSettings({ scanMaxFileBytes: value * 1048576 })),
-        },
-      ),
-    ),
-    h(
-      "div",
-      { style: { display: "flex", flexWrap: "wrap", gap: "16px" } },
-      h(
-        "label",
-        { class: "checkbox" },
+        { class: "form__row" },
+        h("label", { class: "form__label" }, label),
         h("input", {
-          type: "checkbox",
-          checked: settings.scanStrict,
-          onChange: guard((event) => saveSettings({ scanStrict: event.target.checked })),
+          class: "input input--mono",
+          value: (mapping[kind] ?? []).join(", "),
+          onChange: guard(async (event) => {
+            const next = {
+              ...mapping,
+              [kind]: event.target.value
+                .split(/[,;\s]+/)
+                .map((value) => value.trim())
+                .filter(Boolean),
+            };
+            await saveSettings({ keyMapping: next });
+          }),
         }),
-        h("span", null, "默认要求同时匹配 系统 ID + 用户名 + 主机名"),
+        h("p", { class: "form__hint" }, hint),
+      );
+
+    mount(
+      container,
+      row("url", "URL 关键词", "例如 url、server、host、endpoint；文件中出现这些键名时会被当作 URL"),
+      row("username", "用户名关键词", "例如 username、user、login、sap_user"),
+      row("password", "密码关键词", "例如 password、passwd、pwd、secret"),
+      h(
+        "div",
+        { style: { display: "flex", flexWrap: "wrap", gap: "16px" } },
+        h(
+          "label",
+          { class: "checkbox" },
+          h("input", {
+            type: "checkbox",
+            checked: mapping.exact,
+            onChange: guard((event) =>
+              saveSettings({ keyMapping: { ...mapping, exact: event.target.checked } }),
+            ),
+          }),
+          h("span", null, "键名必须完全一致"),
+        ),
+        h(
+          "label",
+          { class: "checkbox" },
+          h("input", {
+            type: "checkbox",
+            checked: mapping.ignoreCase,
+            onChange: guard((event) =>
+              saveSettings({ keyMapping: { ...mapping, ignoreCase: event.target.checked } }),
+            ),
+          }),
+          h("span", null, "忽略大小写"),
+        ),
       ),
-    ),
-  );
+      h(
+        "button",
+        {
+          class: "btn btn--sm btn--ghost",
+          type: "button",
+          onClick: guard(async () => {
+            await saveSettings({ keyMapping: await api.keyMappingDefault() });
+            paint();
+            toast("已恢复默认关键词", "success");
+          }),
+        },
+        icon("refresh", { size: 13 }),
+        "恢复默认关键词",
+      ),
+      h(
+        "p",
+        { class: "form__hint" },
+        "这些是「添加文件」时的初始关键词；每个文件都可以单独覆盖。",
+      ),
+    );
+  }
+
+  paint();
+  return card("文件关键词", "filter", "决定如何在关联文件中识别 URL、用户名与密码。", container);
 }
 
 function dataCard() {
@@ -464,7 +589,9 @@ function dataCard() {
   return card(
     "数据与备份",
     "drive",
-    "全部数据只保存在本机。备份文件同样是加密的。",
+    state.portable
+      ? "便携模式：所有数据都保存在程序目录下的 SapVaultData 文件夹中。"
+      : "全部数据只保存在本机用户目录。备份文件同样是加密的。",
     h(
       "div",
       { class: "path-list" },
@@ -529,12 +656,19 @@ function dataCard() {
             confirmModal({
               title: "导入保险库",
               message: "导入会替换当前保险库，并先自动备份现有文件。",
-              detail: "选择之前导出的 .sapvault 文件。",
+              detail: "选择之前导出的 .sapvault 文件；如果它是主密码模式，导入后需要重新解锁。",
               confirmLabel: "选择文件",
               onConfirm: guard(async () => {
-                const file = await api.pickFiles();
-                if (!file.length) return;
-                await api.vaultImport(file[0]);
+                const files = await api.pickFiles();
+                if (!files.length) return;
+                let password = null;
+                try {
+                  await api.vaultImport(files[0], null);
+                } catch {
+                  password = window.prompt("该保险库需要主密码，请输入：");
+                  if (password === null) return;
+                  await api.vaultImport(files[0], password);
+                }
                 window.location.reload();
               }),
             });
@@ -555,11 +689,12 @@ function aboutCard() {
     h(
       "p",
       { class: "form__hint" },
-      "SapVault 是一个完全本地化的密码管理工具：Tauri + Rust 后端，无远程请求，无遥测。加密使用 AES-256-GCM，主密码模式使用 Argon2id 派生密钥，仅本机账户模式使用 Windows DPAPI 封装随机密钥。",
+      `SapVault v${state.version}${state.portable ? " · 便携模式" : ""}：完全本地运行，无网络请求、无遥测。` +
+        "保险库使用 AES-256-GCM 加密；主密码模式使用 Argon2id 派生密钥，本机账户模式使用 Windows DPAPI 封装随机密钥。",
     ),
     h(
       "div",
-      { style: { display: "flex", gap: "8px" } },
+      { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
       h(
         "button",
         {
@@ -594,6 +729,23 @@ function aboutCard() {
   );
 }
 
+function defaultRule() {
+  return {
+    enabled: true,
+    description: "",
+    minLength: 8,
+    maxLength: 40,
+    lower: true,
+    upper: true,
+    digits: true,
+    symbols: false,
+    symbolsSet: "!@#$%^&*()-_=+[]{};:,.?",
+    forbidden: "",
+    startWithLetter: false,
+    avoidAmbiguous: false,
+  };
+}
+
 /** Settings view. Every control persists immediately on change. */
 export function renderSettings(container) {
   if (!state.settings) return;
@@ -605,7 +757,8 @@ export function renderSettings(container) {
       appearanceCard(),
       securityCard(),
       sapCard(),
-      scanCard(),
+      ruleCard(),
+      keyMapCard(),
       dataCard(),
       aboutCard(),
     ),

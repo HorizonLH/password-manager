@@ -210,7 +210,14 @@ function unlockForm() {
         submit();
       },
     },
-    isWindows ? null : input,
+    isWindows
+      ? null
+      : h(
+          "div",
+          { class: "form__row" },
+          h("label", { class: "form__label" }, "主密码"),
+          input,
+        ),
     state.hint
       ? h(
           "div",

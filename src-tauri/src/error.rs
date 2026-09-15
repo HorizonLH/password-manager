@@ -1,7 +1,8 @@
+use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 /// Every fallible backend operation funnels through this type so the frontend
-/// always receives a plain, human-readable string it can show in a toast.
+/// always receives something it can show.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("文件读写失败：{0}")]
@@ -22,8 +23,31 @@ pub enum AppError {
     InvalidPassword,
     #[error("未找到：{0}")]
     NotFound(String),
+    /// A rejectable-but-overridable problem, e.g. a password that violates its
+    /// rule or repeats one the target system still remembers. The frontend shows
+    /// `details` and can retry with `force`.
+    #[error("{message}")]
+    Validation {
+        kind: String,
+        message: String,
+        details: Vec<String>,
+    },
     #[error("{0}")]
     Msg(String),
+}
+
+impl AppError {
+    pub fn validation(
+        kind: &str,
+        message: impl Into<String>,
+        details: Vec<String>,
+    ) -> Self {
+        AppError::Validation {
+            kind: kind.to_string(),
+            message: message.into(),
+            details,
+        }
+    }
 }
 
 impl From<quick_xml::Error> for AppError {
@@ -38,9 +62,24 @@ impl From<quick_xml::events::attributes::AttrError> for AppError {
     }
 }
 
+/// Plain problems are serialized as a string; validation problems carry a
+/// structured payload the UI can act on.
 impl Serialize for AppError {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        match self {
+            AppError::Validation {
+                kind,
+                message,
+                details,
+            } => {
+                let mut state = serializer.serialize_struct("AppError", 3)?;
+                state.serialize_field("kind", kind)?;
+                state.serialize_field("message", message)?;
+                state.serialize_field("details", details)?;
+                state.end()
+            }
+            other => serializer.serialize_str(&other.to_string()),
+        }
     }
 }
 

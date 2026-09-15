@@ -1,0 +1,8 @@
+# Statically link the MSVC runtime.
+#
+# Without this the executable imports vcruntime140.dll / vcruntime140_1.dll,
+# which are not guaranteed to exist on a clean Windows installation. Linking the
+# CRT statically makes the single .exe self-contained (the WebView2 runtime is
+# the only remaining external dependency, and Windows 11 ships it).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
