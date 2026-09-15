@@ -23,6 +23,9 @@ const GUARD_TICK: Duration = Duration::from_secs(5);
 
 pub fn run() {
     let settings = store::load_settings();
+    // Creating the folder up front makes the data location discoverable, and in
+    // portable mode it is what puts `SapVaultData` next to the executable.
+    let _ = store::ensure_dirs();
     let (envelope, startup_error) = match store::load_envelope() {
         Ok(envelope) => (envelope, None),
         Err(err) => {
