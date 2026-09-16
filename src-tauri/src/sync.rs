@@ -55,7 +55,6 @@ pub struct SyncOutcome {
     pub changed: bool,
     pub updates: usize,
     pub bytes: usize,
-    pub backup_path: Option<String>,
     pub status: String,
 }
 
@@ -208,7 +207,7 @@ fn verify(
     Ok(())
 }
 
-pub fn sync_file(vault: &Vault, file: &SyncFile, backup: bool) -> AppResult<SyncOutcome> {
+pub fn sync_file(vault: &Vault, file: &SyncFile) -> AppResult<SyncOutcome> {
     let path = Path::new(&file.path);
     let loaded = keys::load(path, &file.keys);
     if let Some(error) = &loaded.analysis.error {
@@ -247,7 +246,6 @@ pub fn sync_file(vault: &Vault, file: &SyncFile, backup: bool) -> AppResult<Sync
             changed: false,
             updates: 0,
             bytes: file.size as usize,
-            backup_path: None,
             status: plan.status,
         });
     }
@@ -257,20 +255,7 @@ pub fn sync_file(vault: &Vault, file: &SyncFile, backup: bool) -> AppResult<Sync
     verify(&loaded.analysis, &after, &expected)?;
 
     let bytes = patch::encode(&updated_text, loaded.encoding);
-    let mut backup_path = None;
-    if backup {
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-        let candidate = path.with_extension(format!(
-            "{}bak-{stamp}",
-            path.extension()
-                .map(|value| format!("{}.", value.to_string_lossy()))
-                .unwrap_or_default()
-        ));
-        if std::fs::copy(path, &candidate).is_ok() {
-            backup_path = Some(candidate.to_string_lossy().to_string());
-        }
-    }
-    std::fs::write(path, &bytes)?;
+    replace_contents(path, &bytes)?;
 
     Ok(SyncOutcome {
         file_id: file.id.clone(),
@@ -278,9 +263,28 @@ pub fn sync_file(vault: &Vault, file: &SyncFile, backup: bool) -> AppResult<Sync
         changed: true,
         updates: expected.len(),
         bytes: bytes.len(),
-        backup_path,
         status: format!("已更新 {} 处密码", expected.len()),
     })
+}
+
+/// Replaces a file in one step: the new bytes are written to a sibling
+/// temporary file, which is then renamed over the target. A crash, a full disk
+/// or a power cut can therefore never leave a half-written configuration behind,
+/// which is what makes a second copy of the old passwords (`<file>.bak-*`)
+/// unnecessary.
+fn replace_contents(path: &Path, bytes: &[u8]) -> AppResult<()> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "sapvault".to_string());
+    let temp = directory.join(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&temp, bytes)?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(AppError::from(error));
+    }
+    Ok(())
 }
 
 /// Records the outcome on the file so the UI can show when it last ran.
@@ -366,7 +370,7 @@ mod tests {
         let plan = plan_file(&vault, &file);
         assert_eq!(plan.updates, 2, "{:?}", plan.rows);
 
-        sync_file(&vault, &file, false).unwrap();
+        sync_file(&vault, &file).unwrap();
         let updated = std::fs::read_to_string(&path).unwrap();
         assert!(updated.contains("\"password\": \"new-prd\""), "{updated}");
         assert!(updated.contains("\"password\": \"new-dev\""), "{updated}");
@@ -385,7 +389,7 @@ mod tests {
         let plan = plan_file(&vault, &file);
         assert_eq!(plan.updates, 0);
         assert_eq!(plan.rows[0].action, "missing-key");
-        let outcome = sync_file(&vault, &file, false).unwrap();
+        let outcome = sync_file(&vault, &file).unwrap();
         assert!(!outcome.changed);
     }
 
@@ -398,7 +402,7 @@ mod tests {
         let mut vault = vault;
         vault.entries.push(account("e1", "PRD", "u", "new-pw"));
 
-        sync_file(&vault, &file, false).unwrap();
+        sync_file(&vault, &file).unwrap();
         let updated = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             updated,
@@ -423,7 +427,7 @@ mod tests {
 
         let plan = plan_file(&vault, &file);
         assert_eq!(plan.updates, 2, "{:?}", plan.rows);
-        sync_file(&vault, &file, false).unwrap();
+        sync_file(&vault, &file).unwrap();
         let updated = std::fs::read_to_string(&path).unwrap();
         assert!(updated.contains("password=\"a&amp;b&lt;c\""), "{updated}");
         assert!(updated.contains("<password>text-new</password>"), "{updated}");
@@ -439,7 +443,7 @@ mod tests {
         let mut vault = vault;
         vault.entries.push(account("e1", "PRD", "u", "has space#and=signs"));
 
-        sync_file(&vault, &file, false).unwrap();
+        sync_file(&vault, &file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "# 生产环境\n[prd]\nurl = \"https://prd.example\"\npassword = \"has space#and=signs\" # 每季度轮换\n"
@@ -460,7 +464,7 @@ mod tests {
         let mut vault = vault;
         vault.entries.push(account("e1", "PRD", "u", "p1"));
         vault.entries.push(account("e2", "DEV", "u", "p2"));
-        sync_file(&vault, &file, false).unwrap();
+        sync_file(&vault, &file).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "sap:\n  prd:\n    password: p1\n  dev:\n    password: p2\n"
@@ -468,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_contains_the_original_and_second_sync_is_a_no_op() {
+    fn sync_writes_in_place_and_leaves_no_extra_files_behind() {
         let dir = temp_dir();
         let path = dir.join("b.json");
         let original = "{\"a\":{\"password\":\"old\"}}";
@@ -476,12 +480,24 @@ mod tests {
         let mut vault = vault;
         vault.entries.push(account("e1", "A", "u", "new"));
 
-        let outcome = sync_file(&vault, &file, true).unwrap();
-        let backup = outcome.backup_path.expect("backup");
-        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        let outcome = sync_file(&vault, &file).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"a\":{\"password\":\"new\"}}"
+        );
+
+        // The folder must hold the file and nothing else: no `.bak-*` copy and
+        // no leftover temporary file.
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["b.json".to_string()], "unexpected files: {names:?}");
 
         let after_first = std::fs::read_to_string(&path).unwrap();
-        let second = sync_file(&vault, &file, false).unwrap();
+        let second = sync_file(&vault, &file).unwrap();
         assert!(!second.changed);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
     }
@@ -579,7 +595,7 @@ mod tests {
                 "{format}: 值里混进了注释"
             );
 
-            let outcome = sync_file(&vault, &file, false).unwrap();
+            let outcome = sync_file(&vault, &file).unwrap();
             assert!(outcome.changed, "{format}: 应当写入");
             let updated = std::fs::read_to_string(&path).unwrap();
             assert!(updated.contains("COMMENTED"), "{format}: 注释被删掉了\n{updated}");
@@ -622,7 +638,7 @@ mod tests {
         // A real password containing `#` round-trips without touching the file
         // structure: only the value's own range is replaced.
         vault.entries[0].password = "xy#zw".to_string();
-        sync_file(&vault, &file, false).unwrap();
+        sync_file(&vault, &file).unwrap();
         let updated = std::fs::read_to_string(&path).unwrap();
         assert!(updated.contains("export TOKEN=http://host;db=x"), "{updated}");
         assert_eq!(updated.lines().count(), original.lines().count(), "{updated}");
@@ -642,7 +658,7 @@ mod tests {
         let mut vault = vault;
         vault.entries.push(account("e1", "PRD", "u", "new"));
 
-        let outcome = sync_file(&vault, &file, false).unwrap();
+        let outcome = sync_file(&vault, &file).unwrap();
         assert!(outcome.changed);
         stamp(&mut file, &outcome);
 

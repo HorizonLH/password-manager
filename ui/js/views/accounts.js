@@ -12,10 +12,12 @@ import {
   copyText,
   toggleFavorite,
   bindFile,
+  filesForEntry,
   removeHistory,
   syncFile,
 } from "../state.js";
 import { openModal } from "../modal.js";
+import { openContextMenu } from "../contextmenu.js";
 import { toast } from "../toast.js";
 import {
   categoryIconName,
@@ -34,10 +36,43 @@ function effectiveUsername(entry) {
   return entry.username ?? "";
 }
 
-function filesFor(entryId) {
-  return (state.vault?.files ?? []).filter((file) =>
-    (file.bindings ?? []).some((binding) => binding.entryId === entryId),
+/** What right-clicking an account offers: the same copy actions as the row
+ *  buttons, plus the favourite toggle. */
+function entryMenuItems(entry) {
+  const items = [
+    { label: "复制密码", icon: "copy", onSelect: guard(() => copyPassword(entry.id)) },
+  ];
+  if (entry.categoryId === "sap") {
+    items.push({
+      label: "复制用户名 + 密码",
+      icon: "key",
+      hint: "换行分隔",
+      onSelect: guard(() => copySap(entry.id)),
+    });
+  }
+  items.push(
+    { separator: true },
+    {
+      label: entry.favorite ? "取消收藏" : "收藏",
+      icon: "star",
+      onSelect: guard(() => toggleFavorite(entry.id)),
+    },
   );
+  return items;
+}
+
+function openEntryMenu(event, entry) {
+  event.preventDefault();
+  event.stopPropagation();
+  openContextMenu(event, entryMenuItems(entry));
+}
+
+/** What a person remembers about an account: title, user name and notes. */
+function searchText(entry) {
+  return [entry.title, entry.username, entry.notes]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
 }
 
 function filterEntries() {
@@ -45,9 +80,7 @@ function filterEntries() {
   return (state.vault?.entries ?? []).filter((entry) => {
     if (state.categoryId !== "all" && entry.categoryId !== state.categoryId) return false;
     if (!term) return true;
-    return [entry.title, entry.username]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(term));
+    return searchText(entry).includes(term);
   });
 }
 
@@ -67,6 +100,7 @@ function entryRow(entry) {
           guard(() => selectEntry(entry.id))();
         }
       },
+      onContextMenu: (event) => openEntryMenu(event, entry),
     },
     h(
       "span",
@@ -325,7 +359,7 @@ function historyBlock(entry) {
 function detailPane(entry) {
   let revealed = false;
   const username = effectiveUsername(entry);
-  const files = filesFor(entry.id);
+  const files = filesForEntry(entry.id);
   const passwordValue = h("span", { class: "secret__value" }, mask(entry.password, revealed));
   const revealButton = h(
     "button",
@@ -344,11 +378,12 @@ function detailPane(entry) {
 
   return h(
     "div",
-    { class: "detail" },
+    { class: "detail", onContextMenu: (event) => openEntryMenu(event, entry) },
     h(
       "div",
       { class: "detail__identity" },
       h(
+
         "div",
         { class: "detail__title" },
         h("h2", { class: "detail__name" }, entry.title),

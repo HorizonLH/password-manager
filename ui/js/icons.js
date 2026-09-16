@@ -2,16 +2,23 @@
  *  currentColor, with a filled variant reserved for the active state. */
 
 const PATHS = {
+  // A key that stays readable at 11 px: ring with a hole, straight shaft and
+  // two teeth on the lower edge, drawn on the same 24 px grid as the rest.
   key: {
     outline: [
-      "M15.5 3.5a5 5 0 1 0 4.1 7.9L21 10v-2h-2V6h-2.2",
-      "M14 6 6.5 13.5",
-      "M6.5 13.5a2.5 2.5 0 1 0 3.5 3.5",
+      "M6.6 8.6a3.4 3.4 0 1 0 0 6.8 3.4 3.4 0 0 0 0-6.8z",
+      "M6.6 10.8a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z",
+      "M10.4 12H19a1.2 1.2 0 0 1 1.2 1.2V15",
+      "M16.9 12v2.2",
     ],
     solid: [
-      "M15.5 2.5a6 6 0 0 0-3.4 10.9L5 20.5V22h4v-2h2v-2h2l1.4-1.4A6 6 0 1 0 15.5 2.5Zm1.7 5.6a1.4 1.4 0 1 1 2-2 1.4 1.4 0 0 1-2 2Z",
+      "M6.6 7.9a4.1 4.1 0 1 0 0 8.2 4.1 4.1 0 0 0 0-8.2Zm0 2.6a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3Z",
+      "M10.4 10.9h9.6a1.2 1.2 0 0 1 1.2 1.2v1.3a1.2 1.2 0 0 1-1.2 1.2h-9.6a1.2 1.2 0 0 1-1.2-1.2v-1.3a1.2 1.2 0 0 1 1.2-1.2Z",
+      "M16.1 13.4h1.6v2.1h-1.6z",
+      "M19 13.4h1.6v2.6H19z",
     ],
   },
+
   server: {
     outline: ["M4 4.5h16v5H4z", "M4 14.5h16v5H4z", "M7.5 7h.01", "M7.5 17h.01"],
     solid: [

@@ -475,6 +475,14 @@ svg {
   min-width: 140px;
 }
 
+/* The header search gets a real basis instead of `flex: 1`, so the field is
+   always wide enough for its placeholder (and shrinks before the button does). */
+.search--header {
+  flex: 0 1 260px;
+  min-width: 200px;
+  max-width: 320px;
+}
+
 .search__icon {
   position: absolute;
   top: 50%;
@@ -537,7 +545,16 @@ svg {
 }
 
 .btn:active {
+  background: var(--surface-active);
+  box-shadow: inset 0 1px 3px oklch(0 0 0 / 0.14);
   transform: scale(0.96);
+}
+
+/* A button inside a clickable row must not move while it is pressed: the row is
+   wide, so a scaled icon button slides out from under the cursor and the click
+   ends up on the row instead of the button. */
+.row .btn:active {
+  transform: none;
 }
 
 .btn[disabled] {
@@ -666,7 +683,7 @@ svg {
 }
 
 .row:active {
-  transform: scale(0.96);
+  background: var(--surface-active);
 }
 
 .row.is-selected {
@@ -749,12 +766,14 @@ svg {
   color: var(--text-subtle);
 }
 
+/* Always present, just quieter than the row itself, so the copy / favourite
+   affordances are discoverable without hovering first. */
 .row__actions {
   display: flex;
   align-items: center;
   gap: 2px;
   flex: 0 0 auto;
-  opacity: 0;
+  opacity: 0.65;
   transition: opacity var(--dur-fast) var(--ease-out);
 }
 
@@ -1921,5 +1940,132 @@ svg {
   height: 26px;
   min-height: 26px;
   padding: 0 var(--s-2);
+  font-size: var(--fs-sm);
+}
+
+/* ---------------------------------------------------------- context menu --- */
+
+.menu {
+  position: fixed;
+  z-index: 70;
+  min-width: 208px;
+  max-width: 320px;
+  padding: var(--s-2);
+  border-radius: var(--r-lg);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-3), 0 0 0 1px var(--border);
+  animation: rise-in var(--dur-fast) var(--ease-out);
+}
+
+.menu__item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  min-height: 30px;
+  padding: 0 var(--s-3);
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-md);
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu__item:hover:not([disabled]) {
+  background: var(--surface-hover);
+}
+
+.menu__item:active:not([disabled]) {
+  background: var(--surface-active);
+}
+
+.menu__item[disabled] {
+  color: var(--text-subtle);
+  cursor: default;
+}
+
+.menu__item--danger {
+  color: var(--danger);
+}
+
+.menu__item--danger:hover:not([disabled]) {
+  background: var(--danger-soft);
+}
+
+.menu__icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 16px;
+  color: var(--text-muted);
+}
+
+.menu__item--danger .menu__icon {
+  color: inherit;
+}
+
+.menu__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu__hint {
+  flex: 0 0 auto;
+  color: var(--text-subtle);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}
+
+.menu__separator {
+  height: 1px;
+  margin: var(--s-2) var(--s-3);
+  background: var(--divider);
+}
+
+/* ------------------------------------------------------------ drop zone --- */
+
+.dropzone {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: var(--s-6);
+  background: var(--scrim);
+  animation: fade-in var(--dur-fast) var(--ease-out);
+}
+
+.dropzone__card {
+  display: grid;
+  justify-items: center;
+  gap: var(--s-2);
+  max-width: 460px;
+  padding: var(--s-7) var(--s-8);
+  border: 2px dashed var(--accent-ring);
+  border-radius: var(--r-xl);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-3);
+  text-align: center;
+}
+
+.dropzone__icon {
+  color: var(--accent);
+}
+
+.dropzone__title {
+  margin: 0;
+  font-size: var(--fs-xl);
+  font-weight: 600;
+}
+
+.dropzone__text {
+  margin: 0;
+  color: var(--text-muted);
   font-size: var(--fs-sm);
 }

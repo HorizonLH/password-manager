@@ -531,6 +531,8 @@ pub struct EntrySummary {
     pub title: String,
     pub category_id: String,
     pub username: String,
+    /// Carried into the list so the search box can match notes as well.
+    pub notes: String,
     pub use_knox_id: bool,
     pub has_password: bool,
     pub favorite: bool,
@@ -561,8 +563,10 @@ impl EntrySummary {
             title: entry.title.clone(),
             category_id: entry.category_id.clone(),
             username: entry.effective_username(&vault.knox_id),
+            notes: entry.notes.clone(),
             use_knox_id: entry.use_knox_id,
             has_password: !entry.password.is_empty(),
+
             favorite: entry.favorite,
             file_count: files.len(),
             key_count,

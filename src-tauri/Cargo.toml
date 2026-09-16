@@ -1,6 +1,6 @@
 [package]
 name = "sapvault"
-version = "0.1.0"
+version = "1.0.1"
 description = "Local-only password manager focused on SAP accounts"
 authors = ["SapVault"]
 edition = "2021"

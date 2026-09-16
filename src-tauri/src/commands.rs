@@ -994,10 +994,9 @@ pub fn file_sync(
     file_id: String,
 ) -> AppResult<SyncOutcome> {
     state.touch();
-    let backup = state.settings_snapshot().sync_backup;
     let outcome = state.with_vault(|vault| {
         let file = vault.file(&file_id)?.clone();
-        sync::sync_file(vault, &file, backup)
+        sync::sync_file(vault, &file)
     })?;
     state.with_vault_mut(|vault| {
         if let Some(file) = vault.files.iter_mut().find(|file| file.id == file_id) {
@@ -1011,14 +1010,13 @@ pub fn file_sync(
 
 #[tauri::command]
 pub fn file_sync_all(app: AppHandle, state: State<'_, AppState>) -> AppResult<Vec<SyncOutcome>> {
-    let backup = state.settings_snapshot().sync_backup;
     let ids: Vec<String> =
         state.with_vault(|vault| Ok(vault.files.iter().map(|file| file.id.clone()).collect()))?;
     let mut outcomes: Vec<SyncOutcome> = Vec::new();
     for id in ids {
         let result = state.with_vault(|vault| {
             let file = vault.file(&id)?.clone();
-            sync::sync_file(vault, &file, backup)
+            sync::sync_file(vault, &file)
         });
         match result {
             Ok(outcome) => {

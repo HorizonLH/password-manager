@@ -32,6 +32,8 @@ export const state = {
   /** Which tree branches are open, per file id and key path. */
   treeOpen: {},
   refreshing: false,
+  /** True while files are being dragged over the sync view. */
+  dragActive: false,
 };
 
 const listeners = new Set();
@@ -239,9 +241,22 @@ export async function removeFile(fileId) {
   return vault;
 }
 
+/** Every uploaded file that has at least one key bound to this account. */
+export function filesForEntry(entryId) {
+  return (state.vault?.files ?? []).filter((file) =>
+    (file.bindings ?? []).some((binding) => binding.entryId === entryId),
+  );
+}
+
+/** The keys of one account inside one file. */
+export function bindingsFor(entryId, file) {
+  return (file.bindings ?? []).filter((binding) => binding.entryId === entryId);
+}
+
 /** Plans for every file, keyed by file id (shown in the sync view). */
 export async function loadFilePlans() {
   const plans = await api.filePlans();
+
   const keyed = {};
   for (const plan of plans) keyed[plan.fileId] = plan;
   setState({ filePlans: keyed });
@@ -257,6 +272,24 @@ export async function syncFile(fileId) {
     outcome.changed ? "success" : "info",
   );
   return outcome;
+}
+
+/** Syncs the given files in one go and reports a single summary. */
+export async function syncFiles(fileIds) {
+  const outcomes = [];
+  for (const id of fileIds) {
+    outcomes.push(await api.fileSync(id));
+  }
+  await refreshVault();
+  await loadFilePlans();
+  const updated = outcomes.reduce((sum, outcome) => sum + outcome.updates, 0);
+  toast(
+    outcomes.length
+      ? `同步完成：${outcomes.length} 个文件，更新 ${updated} 处密码`
+      : "没有需要同步的文件",
+    updated ? "success" : "info",
+  );
+  return outcomes;
 }
 
 export async function syncAllFiles() {

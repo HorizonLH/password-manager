@@ -212,6 +212,7 @@
     title: "SAP 生产机",
     categoryId: "sap",
     username: "KNOX01",
+    notes: "每季度轮换，注意不要与最近 5 次重复。",
     useKnoxId: true,
     hasPassword: true,
     favorite: true,
@@ -230,7 +231,9 @@
     title: "SAP 测试机",
     categoryId: "sap",
     username: "QTEST",
+    notes: "测试环境专用账号，仅内部使用。",
     useKnoxId: false,
+
     hasPassword: true,
     favorite: false,
     fileCount: 1,
@@ -334,7 +337,6 @@
     sapLineSeparator: "\r\n",
     maskPasswords: true,
     confirmDelete: true,
-    syncBackup: true,
     keyMapping: { ...keys },
     defaultRule: {
       enabled: true,
@@ -380,7 +382,8 @@
       vaultPath: paths.vaultPath,
       portable: false,
       supportedFormats,
-      version: "0.1.0",
+      version: "1.0.1",
+
       startupError: null,
       settings,
     },
@@ -407,7 +410,6 @@
       changed: true,
       updates: 1,
       bytes: 512,
-      backupPath: null,
       status: "已更新 1 处密码",
     },
     file_sync_all: [
@@ -417,7 +419,6 @@
         changed: true,
         updates: 1,
         bytes: 512,
-        backupPath: null,
         status: "已更新 1 处密码",
       },
     ],
@@ -453,6 +454,19 @@
     return updates;
   };
 
+  /** Minimal event bus, so the audit can replay window events (drag & drop,
+   *  vault:locked) exactly the way the Tauri backend emits them. */
+  const listeners = new Map();
+  const listen = (event, handler) => {
+    const set = listeners.get(event) ?? new Set();
+    set.add(handler);
+    listeners.set(event, set);
+    return () => set.delete(handler);
+  };
+  const emit = (event, payload) => {
+    for (const handler of listeners.get(event) ?? []) handler({ event, id: 0, payload });
+  };
+
   window.__TAURI__ = {
     core: {
       invoke: async (command, args) => {
@@ -467,7 +481,6 @@
             changed: updates > 0,
             updates,
             bytes: jsonFile.size,
-            backupPath: null,
             status: updates ? `已更新 ${updates} 处密码` : "已是最新，未写入",
           };
         }
@@ -488,7 +501,28 @@
             ),
           );
         }
+        if (command === "entry_toggle_favorite") {
+          const target =
+            [summary, testSummary].find((item) => item.id === args?.id) ?? summary;
+          target.favorite = !target.favorite;
+          return structuredClone(vaultView);
+        }
+        if (command === "entry_save") {
+          const input = args?.input ?? {};
+          if (input.title) {
+            entry.title = input.title;
+            summary.title = input.title;
+          }
+          if (typeof input.favorite === "boolean") {
+            entry.favorite = input.favorite;
+            summary.favorite = input.favorite;
+          }
+          if (input.password) entry.password = input.password;
+          entry.updatedAt = "2026-09-16T10:00:00+08:00";
+          return structuredClone(entry);
+        }
         if (command.startsWith("copy_")) return "已复制";
+
         if (command === "pick_files") return [];
         if (command === "pick_folder" || command === "pick_save_file") return "";
         if (command === "open_in_explorer" || command === "open_path") return null;
@@ -496,8 +530,18 @@
         return null;
       },
     },
-    event: { listen: async () => () => {} },
+    event: { listen: async (event, handler) => listen(event, handler) },
   };
 
-  window.__FIXTURES__ = { entry, vaultView, settings, paths, jsonFile, envFile, jsonPlan, envPlan };
+  window.__FIXTURES__ = {
+    entry,
+    vaultView,
+    settings,
+    paths,
+    jsonFile,
+    envFile,
+    jsonPlan,
+    envPlan,
+    emit,
+  };
 })();

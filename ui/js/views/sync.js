@@ -222,6 +222,8 @@ function fileList(files) {
       "div",
       { class: "pane__toolbar" },
       h("span", { class: "section-title" }, icon("file", { size: 13 }), "已上传文件"),
+      h("div", { class: "modal__footer-spacer" }),
+      h("span", { class: "form__hint" }, "也可把文件拖进来"),
     ),
     h(
       "div",
@@ -421,7 +423,8 @@ export function renderSync(container) {
                 h(
                   "p",
                   { class: "empty__text" },
-                  "上传 JSON、.env、TOML/INI、YAML 或 XML 文件，然后在文件内容里点选密码对应的键并绑定账号。",
+                  "上传 JSON、.env、TOML/INI、YAML 或 XML 文件，然后在文件内容里点选密码对应的键并绑定账号；" +
+                    "也可以把文件直接拖进这个窗口。",
                 ),
                 h(
                   "button",

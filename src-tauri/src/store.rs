@@ -58,8 +58,6 @@ pub struct Settings {
     pub sap_line_separator: String,
     pub mask_passwords: bool,
     pub confirm_delete: bool,
-    /// Write a `<file>.bak-<stamp>` copy before changing a synced file.
-    pub sync_backup: bool,
     /// Default key words used when a content file is attached. Each file keeps
     /// its own copy so an override never changes other files.
     pub key_mapping: KeyMapping,
@@ -80,7 +78,6 @@ impl Default for Settings {
             sap_line_separator: "\r\n".to_string(),
             mask_passwords: true,
             confirm_delete: true,
-            sync_backup: true,
             key_mapping: KeyMapping::default(),
             default_rule: None,
             last_category: SAP_CATEGORY_ID.to_string(),

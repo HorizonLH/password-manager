@@ -25,6 +25,8 @@ import { renderSettings } from "./views/settings.js";
 import { renderAssociations } from "./views/associations.js";
 import { openEntryEditor } from "./views/editor.js";
 import { openFileDialog } from "./views/filedialog.js";
+import { installContextMenu } from "./contextmenu.js";
+import { installFileDrop } from "./dragdrop.js";
 
 const root = document.getElementById("app");
 
@@ -91,8 +93,29 @@ function render() {
     return;
   }
 
-  mount(root, h("div", { class: "shell" }, sidebar(), main()));
+  mount(root, h("div", { class: "shell" }, sidebar(), main(), dropOverlay()));
   restoreFocus(snapshot);
+}
+
+/** Shown while files are dragged over the window in the sync view. */
+function dropOverlay() {
+  if (!state.dragActive || state.view !== "sync") return null;
+  return h(
+    "div",
+    { class: "dropzone" },
+    h(
+      "div",
+      { class: "dropzone__card" },
+      h("div", { class: "dropzone__icon" }, icon("upload", { size: 26 })),
+      h("h3", { class: "dropzone__title" }, "松开鼠标即上传同步文件"),
+      h(
+        "p",
+        { class: "dropzone__text" },
+        "支持 JSON、.env、TOML / INI / YAML / XML。松开后会先列出解析到的键，" +
+          "再由你点选密码对应的键并绑定账号——拖进来的文件不会被改写。",
+      ),
+    ),
+  );
 }
 
 function knoxCard() {
@@ -413,12 +436,13 @@ function headerActions() {
       { class: "main__actions" },
       h(
         "div",
-        { class: "search", style: { width: "240px" } },
+        { class: "search search--header" },
         h("span", { class: "search__icon" }, icon("search", { size: 14 })),
         h("input", {
           id: "global-search",
           class: "search__input",
-          placeholder: "搜索标题、用户名、系统 ID、主机",
+          placeholder: "搜索标题、用户名、备注",
+          title: "按标题、用户名或备注筛选",
           value: state.search,
           onInput: (event) => setState({ search: event.target.value }),
         }),
@@ -467,6 +491,7 @@ function headerActions() {
         {
           class: "btn btn--primary",
           type: "button",
+          title: "选择文件上传；也可以把文件直接拖到窗口里",
           onClick: guard(async () => {
             const files = await api.pickFiles();
             if (!files.length) return;
@@ -631,6 +656,11 @@ async function start() {
     );
     return;
   }
+  installContextMenu();
+  installFileDrop({
+    active: () => state.view === "sync" && !state.locked,
+    onDrop: (paths) => openFileDialog({ paths }),
+  });
   render();
   await wireEvents();
 }

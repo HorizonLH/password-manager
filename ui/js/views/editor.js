@@ -9,6 +9,9 @@ import {
   removeHistory,
   clearHistory,
   copyText,
+  bindingsFor,
+  filesForEntry,
+  syncFiles,
 } from "../state.js";
 import { confirmModal, openModal } from "../modal.js";
 import { toast } from "../toast.js";
@@ -494,6 +497,80 @@ function historySection(draft, repaintEditor) {
   return { node, repaint: paint };
 }
 
+/** A rotated password leaves every bound file holding the old one, so the user
+ *  is told right away and can sync from the same dialog. */
+function notifyBoundFiles(entry) {
+  const files = filesForEntry(entry.id);
+  if (!files.length) return;
+  const keys = files.reduce((sum, file) => sum + bindingsFor(entry.id, file).length, 0);
+
+  openModal({
+    title: "文件里的密码还是旧的",
+    render: () =>
+      h(
+        "div",
+        { class: "stack" },
+        h(
+          "div",
+          { class: "banner banner--warn" },
+          h("span", { class: "banner__icon" }, icon("alert", { size: 16 })),
+          h(
+            "div",
+            { class: "banner__body" },
+            h("span", { class: "banner__title" }, `「${entry.title}」的新密码还没写进文件`),
+            h(
+              "span",
+              null,
+              `这个账号绑定了 ${files.length} 个文件里的 ${keys} 个键，它们现在仍然是旧密码。` +
+                "同步只替换这些键的值，其它内容、注释与格式保持不变。",
+            ),
+          ),
+        ),
+        h(
+          "div",
+          { class: "stack stack--tight" },
+          files.map((file) =>
+            h(
+              "div",
+              { class: "assoc__file" },
+              icon(file.exists ? "file" : "alert", { size: 13 }),
+              h("span", { class: "assoc__file-path", title: file.path }, file.path),
+              ...bindingsFor(entry.id, file).map((binding) =>
+                h("span", { class: "tag tag--mono", title: binding.keyPath }, binding.keyPath),
+              ),
+            ),
+          ),
+        ),
+      ),
+    footer: (close) =>
+      h(
+        "div",
+        {
+          style: {
+            display: "flex",
+            gap: "var(--s-2)",
+            width: "100%",
+            justifyContent: "flex-end",
+          },
+        },
+        h("button", { class: "btn btn--ghost", type: "button", onClick: close }, "稍后处理"),
+        h(
+          "button",
+          {
+            class: "btn btn--primary",
+            type: "button",
+            onClick: guard(async () => {
+              close();
+              await syncFiles(files.map((file) => file.id));
+            }),
+          },
+          icon("download", { size: 14 }),
+          "现在同步",
+        ),
+      ),
+  });
+}
+
 /** Modal editor for one entry. `entry` may be null to create a new record. */
 export function openEntryEditor({ entry, defaultCategory, onSaved }) {
   const editing = Boolean(entry?.id);
@@ -511,6 +588,8 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     history: [...(entry?.passwordHistory ?? [])],
   };
   const password = { value: "" };
+  /** The password as loaded, so "did this save rotate it?" is answerable. */
+  let storedPassword = "";
 
   const passwordMeter = strengthMeter();
   const passwordInput = h("input", {
@@ -686,16 +765,24 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     };
   }
 
+  /** Only a real password change is worth telling the files about. */
+  function passwordRotated() {
+    return editing && Boolean(password.value) && password.value !== storedPassword;
+  }
+
   async function submit(close) {
     if (!draft.title.trim()) {
       toast("请先填写标题", "error");
+
       return;
     }
     try {
       const saved = await saveEntry(buildInput(false));
+      const rotated = passwordRotated();
       close();
       toast(editing ? "已保存修改" : "已创建条目", "success");
       onSaved?.(saved);
+      if (rotated) notifyBoundFiles(saved);
     } catch (error) {
       const problem = describeError(error);
       if (problem.kind === "password-rule" || problem.kind === "password-cycle") {
@@ -708,9 +795,11 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
           danger: true,
           onConfirm: guard(async () => {
             const saved = await saveEntry(buildInput(true));
+            const rotated = passwordRotated();
             close();
             toast("已按你的选择保存", "success");
             onSaved?.(saved);
+            if (rotated) notifyBoundFiles(saved);
           }),
         });
         return;
@@ -723,6 +812,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     if (editing) {
       const full = await api.entryGet(draft.id);
       password.value = full.password ?? "";
+      storedPassword = password.value;
       updateMeter(passwordMeter, password.value);
       draft.rule = full.rule ? { ...full.rule } : null;
       draft.historyCycle = full.historyCycle ?? 0;
