@@ -6,6 +6,7 @@ use zeroize::Zeroize;
 use crate::crypto::{KdfParams, KEY_LEN};
 use crate::error::{AppError, AppResult};
 use crate::model::{now_string, Vault};
+use crate::saplogon::{self, Landscape};
 use crate::store::{self, Settings, VaultEnvelope, VaultMode};
 
 /// Everything that only exists while the vault is open. The derived key and the
@@ -41,6 +42,9 @@ pub struct AppState {
     envelope: Mutex<Option<VaultEnvelope>>,
     settings: Mutex<Settings>,
     last_activity: Mutex<Instant>,
+    /// Parsed SAP Logon configuration; read on demand and refreshed from the
+    /// settings view (reading the file is cheap but not free).
+    landscape: Mutex<Option<Landscape>>,
     /// Set when the vault file exists but could not be read: the UI shows this
     /// instead of pretending there is no vault yet.
     startup_error: Option<String>,
@@ -57,8 +61,35 @@ impl AppState {
             envelope: Mutex::new(envelope),
             settings: Mutex::new(settings),
             last_activity: Mutex::new(Instant::now()),
+            landscape: Mutex::new(None),
             startup_error,
         }
+    }
+
+    /// SAP Logon systems, parsed once per session until refreshed.
+    pub fn landscape(&self) -> Landscape {
+        let mut guard = self
+            .landscape
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            let paths = self.settings_snapshot().sap_landscape_paths;
+            *guard = Some(saplogon::load(&paths));
+        }
+        guard.clone().unwrap_or_default()
+    }
+
+    /// Re-reads the landscape files (the user may have added a system in SAP
+    /// Logon while SapVault was open).
+    pub fn refresh_landscape(&self) -> Landscape {
+        let paths = self.settings_snapshot().sap_landscape_paths;
+        let loaded = saplogon::load(&paths);
+        let mut guard = self
+            .landscape
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(loaded.clone());
+        loaded
     }
 
     pub fn startup_error(&self) -> Option<String> {

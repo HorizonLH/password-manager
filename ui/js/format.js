@@ -83,5 +83,43 @@ export function formatLabel(format) {
   return FORMAT_LABELS[format] ?? format ?? "文本";
 }
 
+// ------------------------------------------------------------------- SAP ----
+
+/** How a SAP Logon system reads in a picker: `PRD · 生产机`. */
+export function systemLabel(system) {
+  const id = (system?.systemId ?? "").trim() || "(无系统 ID)";
+  const name = (system?.name ?? "").trim();
+  return name && name !== id ? `${id} · ${name}` : id;
+}
+
+/** Where that system actually lives: host, logon group or URL. */
+export function systemTarget(system) {
+  if (!system) return "";
+  if (system.kind === "serverGroup") {
+    const host = system.messageServer || system.host || "?";
+    const port = system.messageServerPort ? `:${system.messageServerPort}` : "";
+    return `${host}${port} · 组 ${system.group || "SPACE"}`;
+  }
+  if (system.kind === "applicationServer") {
+    return `${system.host || "?"}${system.port ? `:${system.port}` : ""}`;
+  }
+  return system.url || "—";
+}
+
+/** Short description of a stored launch configuration. */
+export function launchSummary(sap) {
+  if (!sap?.systemId && !sap?.guiparm) return "未配置";
+  const parts = [sap.systemId?.trim() || "（无系统 ID）"];
+  if (sap.client?.trim()) parts.push(`客户端 ${sap.client.trim()}`);
+  if (sap.language?.trim()) parts.push(sap.language.trim());
+  if (sap.transaction?.trim()) parts.push(`启动 ${sap.transaction.trim()}`);
+  return parts.join(" · ");
+}
+
+export const PASSWORD_MODE_LABELS = {
+  clipboard: "剪贴板（推荐）",
+  commandLine: "命令行明文",
+};
+
 /** Key names that get flagged as 「疑似密码」 when a file is parsed. */
 export const PASSWORD_KEY_HINT = "password / passwd / pwd / secret / passwort / kennwort / token";

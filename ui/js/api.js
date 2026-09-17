@@ -60,6 +60,11 @@ export const api = {
   copyText: (text, label) => invoke("copy_text", { text, label }),
   clipboardClear: () => invoke("clipboard_clear"),
 
+  sapLandscape: () => invoke("sap_landscape"),
+  sapRefreshLandscape: () => invoke("sap_refresh_landscape"),
+  sapGuiStatus: () => invoke("sap_gui_status"),
+  sapLaunch: (id) => invoke("sap_launch", { id }),
+  sapExportShortcut: (id, path) => invoke("sap_export_shortcut", { id, path }),
 
   fileInspect: (paths, keys) => invoke("file_inspect", { paths, keys: keys ?? null }),
   fileAdd: (drafts) => invoke("file_add", { drafts }),

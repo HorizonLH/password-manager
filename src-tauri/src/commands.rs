@@ -9,10 +9,12 @@ use crate::error::{AppError, AppResult};
 use crate::keys;
 use crate::model::{
     now_string, Category, Entry, EntrySummary, FileAnalysis, HistoryEntry, KeyMapping,
-    PasswordRule, SyncFile, Vault, VaultView, DEFAULT_CATEGORY_ID, MAX_PASSWORD_HISTORY,
-    SAP_CATEGORY_ID,
+    PasswordRule, SapLaunch, SyncFile, Vault, VaultView, DEFAULT_CATEGORY_ID,
+    MAX_PASSWORD_HISTORY, SAP_CATEGORY_ID,
 };
 use crate::rules;
+use crate::saplogon::{self, Landscape};
+use crate::sapgui::{self, LaunchOutcome};
 use crate::state::{AppState, Unlocked};
 use crate::store::{self, Settings, VaultMode};
 use crate::sync::{self, FilePlan, SyncOutcome};
@@ -353,6 +355,9 @@ pub struct EntryInput {
     /// Set by the UI after the user accepts a rule / cycle warning.
     #[serde(default)]
     pub force: bool,
+    /// SAP GUI launch settings; `None` (or an empty value) clears them.
+    #[serde(default)]
+    pub sap: Option<SapLaunch>,
 }
 
 #[tauri::command]
@@ -372,6 +377,18 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
     if let Some(rule) = rule.as_mut() {
         rule.normalize();
     }
+    let sap = input
+        .sap
+        .clone()
+        .map(|mut sap| {
+            sap.system_id = sap.system_id.trim().to_uppercase();
+            sap.client = sap.client.trim().to_string();
+            sap.language = sap.language.trim().to_uppercase();
+            sap.guiparm = sap.guiparm.trim().to_string();
+            sap.transaction = sap.transaction.trim().to_string();
+            sap
+        })
+        .filter(|sap| !sap.is_empty());
     let cycle = input.history_cycle.min(MAX_PASSWORD_HISTORY as u32);
     let force = input.force;
     let new_password = input.password.clone();
@@ -451,6 +468,7 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                 entry.favorite = input.favorite;
                 entry.rule = rule.clone();
                 entry.history_cycle = cycle;
+                entry.sap = sap.clone();
                 entry.updated_at = now_string();
                 Ok(entry.clone())
             }
@@ -470,6 +488,7 @@ pub fn entry_save(state: State<'_, AppState>, input: EntryInput) -> AppResult<En
                     created_at: now_string(),
                     updated_at: now_string(),
                     last_used_at: None,
+                    sap,
                 };
                 vault.entries.push(entry.clone());
                 Ok(entry)
@@ -695,6 +714,197 @@ pub fn clipboard_clear() -> AppResult<()> {
         .clear()
         .map_err(|err| AppError::Msg(format!("清空剪贴板失败：{err}")))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SAP GUI
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SapGuiStatus {
+    /// `sapshcut.exe` we would start, when one was found.
+    pub executable: Option<String>,
+    /// Every path that was probed, so a failed detection can be explained.
+    pub candidates: Vec<String>,
+    pub landscape_files: Vec<String>,
+    pub system_count: usize,
+    pub password_mode: String,
+    /// System IDs that SAP Logon knows more than once — those need the
+    /// connection string to be pinned, otherwise the wrong system could open.
+    pub duplicate_system_ids: Vec<String>,
+}
+
+/// The parsed SAP Logon configuration (cached; refreshed on demand).
+#[tauri::command]
+pub fn sap_landscape(state: State<'_, AppState>) -> Landscape {
+    state.landscape()
+}
+
+#[tauri::command]
+pub fn sap_refresh_landscape(state: State<'_, AppState>) -> Landscape {
+    state.refresh_landscape()
+}
+
+#[tauri::command]
+pub fn sap_gui_status(state: State<'_, AppState>) -> SapGuiStatus {
+    let settings = state.settings_snapshot();
+    let landscape = state.landscape();
+    let mut ids: Vec<String> = landscape
+        .systems
+        .iter()
+        .map(|system| system.system_id.clone())
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let duplicate_system_ids: Vec<String> = ids
+        .into_iter()
+        .filter(|id| saplogon::count_system_id(&landscape.systems, id) > 1)
+        .collect();
+    SapGuiStatus {
+        executable: sapgui::locate(&settings.sapshcut_path)
+            .map(|path| path.to_string_lossy().to_string()),
+        candidates: sapgui::candidate_paths()
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+        landscape_files: landscape.files,
+        system_count: landscape.systems.iter().filter(|s| s.is_launchable()).count(),
+        password_mode: settings.sap_password_mode,
+        duplicate_system_ids,
+    }
+}
+
+/// Fills in whatever the account left open from the SAP Logon configuration.
+fn enrich_from_landscape(state: &State<'_, AppState>, launch: &mut SapLaunch) {
+    if !launch.guiparm.trim().is_empty() {
+        return;
+    }
+    let landscape = state.landscape();
+    let Some(system) = saplogon::find_system(&landscape.systems, &launch.service_uuid, &launch.system_id)
+    else {
+        return;
+    };
+    launch.guiparm = system.guiparm.clone();
+    if launch.client.trim().is_empty() {
+        launch.client = system.client.clone();
+    }
+    if launch.language.trim().is_empty() {
+        launch.language = system.language.clone();
+    }
+}
+
+fn launch_for(state: &State<'_, AppState>, id: &str) -> AppResult<(Entry, SapLaunch)> {
+    let entry = state.with_vault(|vault| vault.entry(id).cloned())?;
+    let mut launch = entry
+        .sap
+        .clone()
+        .filter(SapLaunch::is_usable)
+        .ok_or_else(|| AppError::Msg("这个条目还没有配置 SAP 登录信息".to_string()))?;
+    enrich_from_landscape(state, &mut launch);
+    Ok((entry, launch))
+}
+
+/// Starts SAP GUI for one account.
+///
+/// Two password paths, decided by `settings.sap_password_mode`:
+/// * `commandLine` — pass `-pw=` to `sapshcut.exe` (one click, but the password
+///   is visible in the process command line while SAP GUI starts).
+/// * `clipboard` — start SAP GUI with no user/password so the login prompt is
+///   empty, and put `user + separator + password` into the clipboard so a single
+///   paste fills both fields. This is the default.
+#[tauri::command]
+pub fn sap_launch(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<LaunchOutcome> {
+    state.touch();
+    let settings = state.settings_snapshot();
+    let (entry, launch) = launch_for(&state, &id)?;
+    let executable = sapgui::locate(&settings.sapshcut_path).ok_or_else(|| {
+        AppError::Msg(
+            "没有找到 sapshcut.exe。请确认已安装 SAP GUI for Windows，或在设置里手动指定它的位置。"
+                .to_string(),
+        )
+    })?;
+
+    let username = entry.effective_username(&state.knox_id());
+    // Anything that is not the explicit command-line mode behaves like the
+    // clipboard mode, so an unknown value can never leak the password.
+    let mode = if settings.sap_password_mode == sapgui::PASSWORD_MODE_COMMAND_LINE {
+        sapgui::PASSWORD_MODE_COMMAND_LINE
+    } else {
+        sapgui::PASSWORD_MODE_CLIPBOARD
+    };
+    let command_line_mode = mode == sapgui::PASSWORD_MODE_COMMAND_LINE;
+    let include_password = command_line_mode && !entry.password.is_empty();
+    let argument_user = if command_line_mode { username.as_str() } else { "" };
+    let arguments = sapgui::build_arguments(&launch, argument_user, &entry.password, include_password);
+    sapgui::start(&executable, &arguments)?;
+
+    let mut clipboard_seconds = 0;
+    let mut message = if command_line_mode {
+        "已启动 SAP GUI（密码随命令行传递）".to_string()
+    } else {
+        "已启动 SAP GUI，请在登录界面按 Ctrl+V 填入用户名和密码".to_string()
+    };
+
+    if !command_line_mode && !username.is_empty() && !entry.password.is_empty() {
+        let payload =
+            clipboard::sap_credentials_payload(&username, &entry.password, &settings.sap_line_separator);
+        clipboard::set_text(&payload)?;
+        clipboard_seconds = settings.clipboard_clear_seconds;
+        let handle = app.clone();
+        clipboard::schedule_auto_clear(payload, clipboard_seconds as u64, move || {
+            let _ = handle.emit(
+                "app:notice",
+                Notice {
+                    kind: "info".to_string(),
+                    message: "剪贴板已自动清空".to_string(),
+                },
+            );
+        });
+        message = "已启动 SAP GUI，用户名 + 密码已复制，登录界面出现后按 Ctrl+V 即可".to_string();
+    } else if !command_line_mode && entry.password.is_empty() {
+        message = "已启动 SAP GUI（该条目没有保存密码）".to_string();
+    }
+
+    mark_used(&state, &id)?;
+
+    Ok(LaunchOutcome {
+        mode: mode.to_string(),
+        executable: executable.to_string_lossy().to_string(),
+        arguments: sapgui::mask_password(&arguments),
+        password_on_command_line: include_password,
+        clipboard_seconds,
+        message,
+    })
+}
+
+/// Writes a `.sap` shortcut for this account.
+///
+/// The file never contains the password — SAP GUI asks for it when the shortcut
+/// is opened. `.sap` is the shortcut format of every SAP GUI above 6.20, and
+/// Windows already knows it once `sapshcut -register` has run once.
+#[tauri::command]
+pub fn sap_export_shortcut(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+) -> AppResult<String> {
+    state.touch();
+    let (entry, launch) = launch_for(&state, &id)?;
+    let username = entry.effective_username(&state.knox_id());
+    let mut target = PathBuf::from(path.trim());
+    if target.as_os_str().is_empty() {
+        return Err(AppError::Msg("请选择快捷方式的保存位置".to_string()));
+    }
+    if !target
+        .extension()
+        .map(|ext| ext.eq_ignore_ascii_case("sap"))
+        .unwrap_or(false)
+    {
+        target.set_extension("sap");
+    }
+    sapgui::write_shortcut(&target, &sapgui::shortcut_text(&launch, &username))
 }
 
 // ---------------------------------------------------------------------------

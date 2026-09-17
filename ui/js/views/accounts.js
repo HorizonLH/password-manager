@@ -15,6 +15,8 @@ import {
   filesForEntry,
   removeHistory,
   syncFile,
+  launchSap,
+  exportSapShortcut,
 } from "../state.js";
 import { openModal } from "../modal.js";
 import { openContextMenu } from "../contextmenu.js";
@@ -24,6 +26,7 @@ import {
   formatBytes,
   formatLabel,
   formatTime,
+  launchSummary,
   mask,
   ruleSummary,
 } from "../format.js";
@@ -42,6 +45,14 @@ function entryMenuItems(entry) {
   const items = [
     { label: "复制密码", icon: "copy", onSelect: guard(() => copyPassword(entry.id)) },
   ];
+  if (entry.sap?.systemId || entry.hasSapLogin) {
+    items.push({
+      label: "登录 SAP GUI",
+      icon: "server",
+      hint: entry.sap?.systemId ?? "",
+      onSelect: guard(() => launchSap(entry.id)),
+    });
+  }
   if (entry.categoryId === "sap") {
     items.push({
       label: "复制用户名 + 密码",
@@ -133,6 +144,21 @@ function entryRow(entry) {
     h(
       "span",
       { class: "row__actions" },
+      entry.hasSapLogin
+        ? h(
+            "button",
+            {
+              class: "btn btn--icon btn--sm",
+              type: "button",
+              title: "登录 SAP GUI",
+              onClick: (event) => {
+                event.stopPropagation();
+                guard(() => launchSap(entry.id))();
+              },
+            },
+            icon("server", { size: 14 }),
+          )
+        : null,
       h(
         "button",
         {
@@ -443,6 +469,59 @@ function detailPane(entry) {
             "复制用户名",
           ),
     ),
+    entry.sap?.systemId || entry.sap?.guiparm
+      ? h(
+          "div",
+          { class: "detail__section" },
+          h(
+            "div",
+            { class: "detail__section-head" },
+            h("div", { class: "section-title" }, icon("server", { size: 12 }), "SAP GUI 登录"),
+            h("span", { class: "tag tag--mono" }, launchSummary(entry.sap)),
+          ),
+          h(
+            "div",
+            { class: "copy-row" },
+            h(
+              "button",
+              {
+                class: "btn btn--primary",
+                type: "button",
+                disabled: !state.guiStatus?.executable,
+                title: state.guiStatus?.executable
+                  ? `使用 ${state.guiStatus.executable} 启动`
+                  : "没有检测到 sapshcut.exe",
+                onClick: guard(() => launchSap(entry.id)),
+              },
+              icon("server", { size: 14 }),
+              "登录 SAP GUI",
+            ),
+            h(
+              "button",
+              {
+                class: "btn",
+                type: "button",
+                title: "导出 .sap 快捷方式（可以在资源管理器里双击或发送给别人）",
+                onClick: guard(async () => {
+                  const suggested = `${entry.sap?.systemId || entry.title || "sapvault"}.sap`;
+                  const target = await api.pickSaveFile(suggested, "sap");
+                  if (!target) return;
+                  await exportSapShortcut(entry.id, target);
+                }),
+              },
+              icon("save", { size: 14 }),
+              "导出快捷方式",
+            ),
+          ),
+          h(
+            "p",
+            { class: "form__hint" },
+            state.settings?.sapPasswordMode === "commandLine"
+              ? "当前设置：直接带密码启动（密码会出现在进程命令行里，本机其它程序可能读到）。"
+              : "当前设置：先打开 SAP GUI 登录界面，用户名与密码已放进剪贴板，按 Ctrl+V 即可填入。",
+          ),
+        )
+      : null,
     h(
       "div",
       { class: "detail__section" },

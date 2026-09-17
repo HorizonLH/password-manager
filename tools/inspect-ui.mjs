@@ -92,6 +92,32 @@ class Cdp {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Waits until the shell has actually rendered.
+ *
+ * `audit-ui.ps1` only waits for the DevTools endpoint, which answers before the
+ * page has parsed its HTML — running the audit that early made `#app` null and
+ * every command fail with "Cannot read properties of null". Waiting here keeps
+ * every mode (audit / sizes / click / shot) honest instead of racing the load.
+ */
+async function waitForApp(cdp, { timeoutMs = 20000, query = "#app" } = {}) {
+  const started = Date.now();
+  let lastState = "(unknown)";
+  while (Date.now() - started < timeoutMs) {
+    const state = await cdp.eval(`(() => {
+      const app = document.getElementById("app");
+      if (!app) return "no-app";
+      if (app.querySelector(".lock__card")) return "ready";
+      if (app.querySelector(".shell")) return "ready";
+      return "booting:" + (app.textContent || "").trim().slice(0, 24);
+    })()`);
+    lastState = state;
+    if (state === "ready") return true;
+    await sleep(200);
+  }
+  throw new Error(`UI 未在 ${timeoutMs}ms 内就绪（最后状态：${lastState}，期望 ${query}）`);
+}
+
 const clickByText = (needle, selector = "button, .nav__item, .row, .segmented__item") => `(() => {
   const wanted = ${JSON.stringify(needle)};
   const nodes = [...document.querySelectorAll(${JSON.stringify(selector)})];
@@ -336,6 +362,9 @@ const VIEWS = [
     needles: [
       "外观",
       "锁定与剪贴板",
+      "SAP GUI 登录",
+      "密码传递方式",
+      "SAP Logon 配置",
       "全局 Knox ID",
       "默认密码规则",
       "文件关键词",
@@ -371,6 +400,9 @@ async function audit(cdp, { includeModals = true } = {}) {
   printReport("账号详情", await cdp.eval(AUDIT));
   await expectContent(cdp, "账号详情", [
     "复制用户名 + 密码",
+    "SAP GUI 登录",
+    "登录 SAP GUI",
+    "导出快捷方式",
     "用户名（全局 Knox ID）",
     "KNOX01",
     "密码规则",
@@ -397,6 +429,10 @@ async function audit(cdp, { includeModals = true } = {}) {
     "编辑条目",
     "基本信息",
     "凭据",
+    "SAP GUI 登录",
+    "SAP Logon 系统",
+    "连接串（GuiParm）",
+    "登录后执行事务码",
     "密码规则",
     "使用规则",
     "不使用规则",
@@ -441,6 +477,8 @@ async function main() {
   await cdp.send("Runtime.enable");
   await cdp.send("Log.enable");
   try {
+    // `eval` stays raw (it is the escape hatch for probing the page itself).
+    if (command !== "eval") await waitForApp(cdp);
     switch (command) {
       case "audit":
         await audit(cdp);

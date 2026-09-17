@@ -34,6 +34,10 @@ export const state = {
   refreshing: false,
   /** True while files are being dragged over the sync view. */
   dragActive: false,
+  /** Parsed SAP Logon configuration (systems we can start). */
+  landscape: null,
+  /** Where sapshcut.exe lives and how the password travels. */
+  guiStatus: null,
 };
 
 const listeners = new Set();
@@ -78,6 +82,38 @@ export async function bootstrap() {
       supportedFormats: info.supportedFormats,
     },
   });
+  // SAP Logon is optional (SAP GUI may not be installed), so a failure here
+  // must never keep the app from starting.
+  await Promise.all([refreshLandscape(), refreshGuiStatus()]).catch(() => {});
+}
+
+// -------------------------------------------------------------------- SAP --
+
+/** Re-reads `SAPUILandscape*.xml` (the user may have added a system meanwhile). */
+export async function refreshLandscape() {
+  const landscape = await api.sapRefreshLandscape();
+  setState({ landscape });
+  return landscape;
+}
+
+export async function refreshGuiStatus() {
+  const guiStatus = await api.sapGuiStatus();
+  setState({ guiStatus });
+  return guiStatus;
+}
+
+/** Starts SAP GUI for one account. */
+export async function launchSap(id) {
+  const outcome = await api.sapLaunch(id);
+  toast(outcome?.message ?? "已启动 SAP GUI", "success");
+  return outcome;
+}
+
+/** Writes a `.sap` shortcut next to wherever the user points the dialog. */
+export async function exportSapShortcut(id, path) {
+  const saved = await api.sapExportShortcut(id, path);
+  toast(`快捷方式已保存到 ${saved}`, "success");
+  return saved;
 }
 
 export async function createVault(mode, password, hint) {

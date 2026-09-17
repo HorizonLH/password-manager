@@ -7,7 +7,7 @@
 - 前端：**零依赖的原生 ES Module + CSS**（无 npm、无打包器）
 - 加密：**AES-256-GCM**；主密码模式用 **Argon2id** 派生密钥，本机账户模式用 **Windows DPAPI** 封装随机密钥
 
-当前版本：**1.0.1**
+当前版本：**1.1.0**
 
 ---
 
@@ -98,6 +98,32 @@ TOML / YAML 用 `#`（引号内的不算），INI / properties 用 `#`、`;`、`
 在 `sapvault.exe` 旁边放一个 `portable.txt`（或直接建一个 `SapVaultData` 文件夹），
 程序就会把所有数据写进同目录的 `SapVaultData\`，不再接触用户目录，适合 U 盘携带。
 
+### 1.6 一键登录 SAP GUI
+
+SAP 账号可以配成「点一下直接打开 SAP GUI」。配置在条目的「SAP GUI 登录」区块里：
+
+1. **从 SAP Logon 选系统**：SapVault 读取 `%APPDATA%\SAP\Common\SAPUILandscape.xml`
+   （以及它 include 进来的 `SAPUILandscapeGlobal.xml`），把你在 SAP Logon 里加过的系统列出来 ——
+   不管是「Custom Application Server」（主机 + 实例号 + 系统 ID）还是
+   「Server Group / 登录组」（选组、其余信息自动带出）都能读出来。
+   同一个系统 ID 配了多次时会标注「（同名）」，选具体那一条即可（会记住连接串，避免打开错的系统）。
+2. **或者手动填写**：系统 ID、客户端、登录语言、连接串（直连 `/H/主机/S/端口`，登录组再加 `/G/组名`）。
+3. 可以顺带填「登录后执行事务码」（例如 `SE80`），以及是否用 `-maxgui` 最大化。
+
+存好之后，账号列表每行、详情页和右键菜单都会出现 **「登录 SAP GUI」**；详情页还能 **「导出快捷方式」**，
+生成一个 `.sap` 文件 —— 那是 SAP GUI 自己的快捷方式格式，双击即用，也可以直接发给同事。
+**`.sap` 文件里不含密码**（它是纯文本），打开时由 SAP GUI 自己询问。
+
+密码怎么交给 SAP GUI 由设置决定（「设置 → SAP GUI 登录 → 密码传递方式」）：
+
+| 方式 | 行为 | 代价 |
+| --- | --- | --- |
+| **剪贴板（默认）** | 打开 SAP GUI 登录界面（用户名留空），同时把「用户名 + 换行 + 密码」放进剪贴板，按一次 `Ctrl+V` 填好两个输入框 | 需要按一次粘贴 |
+| **命令行明文** | 直接把 `-pw=密码` 交给 `sapshcut.exe`，点一下即登录 | 密码会出现在进程命令行里，本机其它程序在启动的一瞬间可能读到 |
+
+同一张设置卡片里可以手动指定 `sapshcut.exe` 的位置（默认自动在
+`C:\Program Files (x86)\SAP\FrontEnd\SAPGUI\` 等位置查找），也可以追加额外的 `SAPUILandscape.xml` 路径。
+
 ---
 
 ## 2. 技术点
@@ -160,6 +186,35 @@ TOML / YAML 用 `#`（引号内的不算），INI / properties 用 `#`、`;`、`
   一旦按下时缩放，按钮会在鼠标抬起前滑出光标，点击就落到行上而不生效。
 - **动效**：只过渡具体属性（不使用 `transition: all`），并尊重系统的「减少动态效果」设置。
 
+### 2.6 SAP GUI 集成
+
+启动 SAP GUI 用的是 SAP 自带的 `sapshcut.exe`（SAP Note 103019 *SAPShortcut: Program parameters*，
+配合 Note 390832 的补充参数），所以既不用我们去改 SAP 的配置，也不用模拟按键：
+
+```
+sapshcut.exe -system=PRD -client=100 -guiparm="/H/prd.example.com/S/3200" \
+             -user=USER01 -language=ZH -maxgui [-type=Transaction -command=SE80]
+```
+
+- 客户端号不足三位会补零（`1` → `001`）；不给 `-user` 时由 SAP GUI 自己弹登录框。
+- `-guiparm` 有两种形态：直连应用服务器 `/H/主机/S/端口`；登录组 `/H/消息服务器/S/端口/G/组名`
+  （SAP 默认组名就是 `SPACE`）。saprouter 场景会拼成 `/H/路由器[/S/端口]/H/…`，端口默认 `3299`；
+  本项目的使用场景里没有 SAProuter，所以只做兼容、不做额外配置。
+- `src-tauri/src/saplogon.rs` 解析登录配置：`Service` 上的 `systemid` / `server` / `msid` / `routerid` / `url`，
+  以及 `Messageservers`、`Routers`、`Includes`（递归读取）和 `Workspaces`（用来显示分组路径）。
+  因为同一个 `systemid` 可能出现多次，内部统一用 `service_uuid` 精确定位一条连接。
+  字段含义以 SAP 官方文档 **SAP UI Landscape → SAP UI Landscape XML Description**
+  （`help.sap.com/saphelp_tm92/.../d5/66efdfdd0c47bab00b5031a4e1b580/content.htm`）为准，其中三点直接照着实现：
+  `server` 是「登录组名**或** `主机:端口`」；保存过的 SAP GUI 快捷方式用 `sapguiid` 指回它所属的连接
+  （这种条目自己没有服务器信息，解析时会继承被指向的连接）；路由串可能是前缀形式
+  `/H/网关/S/端口/H/`，目标主机接在它后面。`<Includes>` 指向 `http(s)://` 时会被跳过并给出提示——
+  SapVault 不发起任何网络请求。
+- `src-tauri/src/sapgui.rs` 负责组装参数、启动进程、生成 `.sap`。`.sap` 是 SAP 自己的 INI 风格
+  （`[System]` / `[User]` / `[Function]` 三段，`GuiParm=` 就是连接串），以 UTF-8 写出，**不含密码**。
+
+启动进程不使用 shell，参数原样交给 `sapshcut.exe`；`-pw=` 只在用户显式选择命令行模式时才出现，
+而且任何回显（例如提示条里的参数预览）都会把它替换成 `-pw=***`。
+
 ---
 
 ## 3. 测试
@@ -172,7 +227,9 @@ cargo test
 ```
 
 覆盖加密与 DPAPI 往返、设置归一化、各格式解析（含注释永不被解析 / 改写）、
-原地改写的字节精度、同步计划、密码规则与历史、绑定归一化等（当前 56 个用例）。
+原地改写的字节精度、同步计划、密码规则与历史、绑定归一化，
+以及 SAP 登录配置解析（直连 / 登录组 / 同名系统 ID / Include 递归 / 子元素版布局）、
+`sapshcut` 参数组装、`.sap` 文件内容与前后端字段契约（当前 76 个用例）。
 
 ### 3.2 界面审计
 
@@ -183,6 +240,7 @@ cargo test
 ```powershell
 pwsh tools/audit-ui.ps1 -WithModals                                     # 含弹窗的完整审计
 pwsh tools/audit-ui.ps1 -Sizes 1000x660,1240x800,1600x900,1920x1080    # 多窗口尺寸
+pwsh tools/audit-ui.ps1 -Sizes 1240x800 -Interactions                  # 审计后再跑交互回归
 pwsh tools/audit-ui.ps1 -Sizes 1240x800 -ShotView 同步文件              # 附带字符画截图
 ```
 
@@ -190,10 +248,16 @@ pwsh tools/audit-ui.ps1 -Sizes 1240x800 -ShotView 同步文件              # �
 字号是否过小、页面是否意外滚动、是否有未捕获的运行时异常，以及每页 / 每个弹窗该出现的内容是否都在。
 `tools/ascii-shot.ps1` 可以把截图渲染成字符画，方便在终端里粗看版式。
 
+脚本会先等到界面真正渲染出来再测量（`inspect-ui.mjs` 的 `waitForApp()`），
+结束时按 `--user-data-dir` 结束整棵 Edge 进程树并删除临时 profile ——
+否则每跑一次都会留下一个锁住 profile 的 headless Edge。
+
 ### 3.3 交互回归
 
 ```powershell
-node tools/serve-ui.mjs        # 一个终端里启动静态服务器
+pwsh tools/audit-ui.ps1 -Interactions        # 一步到位：起服务器 + Edge，审计完再跑交互
+
+node tools/serve-ui.mjs                      # 或者自己起静态服务器
 node tools/check-interactions.mjs
 ```
 
@@ -246,6 +310,8 @@ src-tauri/src/
   store.rs       保险库信封、设置文件、备份轮转、便携模式、数据归一化
   model.rs       Vault / Entry / FileValue / FileBinding / SyncFile / KeyMapping
   sync.rs        同步计划与执行：只改被绑定的键，写入前校验并原子替换
+  saplogon.rs    SAP Logon 配置解析（SAPUILandscape.xml → 可登录的系统列表）
+  sapgui.rs      sapshcut 参数组装与启动、.sap 快捷方式生成
 
   state.rs       解锁状态、设置快照、锁屏检测（OpenInputDesktop）
 ui/
@@ -268,3 +334,11 @@ tools/
   第一个可定位位置。
 - 拖拽上传只在「同步文件」页生效，避免在别的页面误把文件当成同步目标。
 - 便携模式依赖 `portable.txt` 标记，不会自动迁移 `%APPDATA%` 里已有的数据。
+- 一键登录需要机器上装有 **SAP GUI for Windows**：找不到 `sapshcut.exe` 时按钮会禁用并给出提示，
+  可以在设置里手动指定路径。没有 SAP GUI 的机器仍然可以导出 `.sap` 快捷方式。
+- 读不到 `SAPUILandscape.xml`（没装 SAP GUI、或还没在 SAP Logon 里加过系统）时，
+  系统列表是空的，需要手动填写系统 ID 与连接串。
+- `.sap` 以 UTF-8 写出。SAP GUI 7.70+ 直接可用；若某些旧环境只认本地代码页，
+  可以把系统名/描述写成 ASCII 再导出。
+- 「命令行明文」模式的安全性由使用者自行权衡：密码会短暂出现在进程命令行里。
+  默认的剪贴板模式不把密码交给命令行。

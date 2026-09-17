@@ -947,6 +947,24 @@ svg {
   grid-template-columns: 1fr;
 }
 
+/* A control with trailing buttons: the SAP system picker and the launcher path. */
+.inline-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-width: 0;
+}
+
+.inline-row > .input,
+.inline-row > .select {
+  flex: 1;
+  min-width: 0;
+}
+
+.inline-row > .btn {
+  flex: 0 0 auto;
+}
+
 /* --------------------------------------------------------------- cards ---- */
 
 .card {

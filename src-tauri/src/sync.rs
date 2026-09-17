@@ -332,6 +332,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             last_used_at: None,
+            sap: None,
         }
     }
 

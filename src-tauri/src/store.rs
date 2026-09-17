@@ -66,6 +66,14 @@ pub struct Settings {
     /// Remembers the last category filter so the window reopens where the user
     /// left off.
     pub last_category: String,
+    /// How the SAP password reaches SAP GUI: `clipboard` (default — the login
+    /// prompt appears and one paste fills user and password) or `commandLine`
+    /// (`-pw=…`, which exposes the password to other local processes).
+    pub sap_password_mode: String,
+    /// Manual override for `sapshcut.exe` when detection fails.
+    pub sapshcut_path: String,
+    /// Extra `SAPUILandscape*.xml` files merged with the auto-detected ones.
+    pub sap_landscape_paths: Vec<String>,
 }
 
 impl Default for Settings {
@@ -81,6 +89,9 @@ impl Default for Settings {
             key_mapping: KeyMapping::default(),
             default_rule: None,
             last_category: SAP_CATEGORY_ID.to_string(),
+            sap_password_mode: "clipboard".to_string(),
+            sapshcut_path: String::new(),
+            sap_landscape_paths: Vec::new(),
         }
     }
 }
@@ -102,6 +113,17 @@ impl Settings {
         if self.last_category.is_empty() {
             self.last_category = DEFAULT_CATEGORY_ID.to_string();
         }
+        if !matches!(self.sap_password_mode.as_str(), "clipboard" | "commandLine") {
+            self.sap_password_mode = "clipboard".to_string();
+        }
+        self.sapshcut_path = self.sapshcut_path.trim().to_string();
+        self.sap_landscape_paths = self
+            .sap_landscape_paths
+            .iter()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .collect();
+        self.sap_landscape_paths.dedup();
     }
 }
 
@@ -451,6 +473,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             last_used_at: None,
+            sap: None,
         }
     }
 
@@ -574,6 +597,34 @@ mod tests {
 
     #[test]
     fn settings_normalize_clamps_values() {
+        let mut sap = Settings {
+            sap_password_mode: "something else".into(),
+            sapshcut_path: "  C:\\Program Files (x86)\\SAP\\FrontEnd\\SAPGUI\\sapshcut.exe  ".into(),
+            sap_landscape_paths: vec![
+                "  ".into(),
+                "C:\\extra\\SAPUILandscape.xml".into(),
+                "C:\\extra\\SAPUILandscape.xml".into(),
+            ],
+            ..Settings::default()
+        };
+        sap.normalize();
+        // An unknown mode must fall back to the safe one.
+        assert_eq!(sap.sap_password_mode, "clipboard");
+        assert_eq!(
+            sap.sapshcut_path,
+            "C:\\Program Files (x86)\\SAP\\FrontEnd\\SAPGUI\\sapshcut.exe"
+        );
+        assert_eq!(
+            sap.sap_landscape_paths,
+            vec!["C:\\extra\\SAPUILandscape.xml".to_string()]
+        );
+        let mut explicit = Settings {
+            sap_password_mode: "commandLine".into(),
+            ..Settings::default()
+        };
+        explicit.normalize();
+        assert_eq!(explicit.sap_password_mode, "commandLine");
+
         let mut settings = Settings {
             theme: "neon".into(),
             sap_line_separator: "\t".into(),

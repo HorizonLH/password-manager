@@ -7,6 +7,8 @@ mod keys;
 mod model;
 mod patch;
 mod rules;
+mod saplogon;
+mod sapgui;
 mod state;
 mod store;
 mod sync;
@@ -77,6 +79,11 @@ pub fn run() {
             commands::copy_sap_credentials,
             commands::copy_text,
             commands::clipboard_clear,
+            commands::sap_landscape,
+            commands::sap_refresh_landscape,
+            commands::sap_gui_status,
+            commands::sap_launch,
+            commands::sap_export_shortcut,
             commands::file_inspect,
             commands::file_add,
             commands::file_update_keys,

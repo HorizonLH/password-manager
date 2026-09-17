@@ -1,6 +1,6 @@
 [package]
 name = "sapvault"
-version = "1.0.1"
+version = "1.1.0"
 description = "Local-only password manager focused on SAP accounts"
 authors = ["SapVault"]
 edition = "2021"
@@ -11,11 +11,11 @@ name = "sapvault_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Desktop shell
-tauri = "2"
+tauri = { version = "2", features = [] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

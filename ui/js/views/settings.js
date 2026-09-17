@@ -1,7 +1,7 @@
 import { h, guard, mount } from "../dom.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
-import { state, setState, saveSettings } from "../state.js";
+import { state, setState, saveSettings, refreshLandscape, refreshGuiStatus } from "../state.js";
 import { confirmModal, openModal } from "../modal.js";
 import { toast } from "../toast.js";
 
@@ -226,6 +226,192 @@ function changePasswordModal() {
         ),
       ),
   });
+}
+
+/** SAP GUI: the launcher, how the password travels, and where systems come from. */
+function sapCard() {
+  const container = h("div", { class: "stack stack--tight" });
+
+  function paint() {
+    const settings = state.settings;
+    const mode = settings.sapPasswordMode ?? "clipboard";
+    const gui = state.guiStatus;
+    const landscape = state.landscape;
+    const systems = landscape?.systems ?? [];
+    const launchable = systems.filter(
+      (system) =>
+        system.systemId &&
+        (system.kind === "applicationServer" || system.kind === "serverGroup"),
+    );
+
+    const modeOption = (value, label, iconName) =>
+      h(
+        "button",
+        {
+          class: `segmented__item${mode === value ? " is-active" : ""}`,
+          type: "button",
+          onClick: guard(async () => {
+            await saveSettings({ sapPasswordMode: value });
+            paint();
+          }),
+        },
+        icon(iconName, { size: 14 }),
+        label,
+      );
+
+    const pathInput = h("input", {
+      id: "settings-sapshcut",
+      class: "input input--mono",
+      value: settings.sapshcutPath ?? "",
+      placeholder:
+        gui?.executable || "例如 C:\\Program Files (x86)\\SAP\\FrontEnd\\SAPGUI\\sapshcut.exe",
+      onChange: guard(async (event) => {
+        await saveSettings({ sapshcutPath: event.target.value.trim() });
+        await refreshGuiStatus();
+        paint();
+      }),
+    });
+
+    const extraInput = h("input", {
+      id: "settings-sap-landscape",
+      class: "input input--mono",
+      value: (settings.sapLandscapePaths ?? []).join("; "),
+      placeholder: "可选：额外的 SAPUILandscape.xml 路径，用 ; 分隔",
+      onChange: guard(async (event) => {
+        const paths = event.target.value
+          .split(";")
+          .map((path) => path.trim())
+          .filter(Boolean);
+        await saveSettings({ sapLandscapePaths: paths });
+        await refreshLandscape();
+        paint();
+      }),
+    });
+
+    mount(
+      container,
+      h(
+        "div",
+        { class: "form__row" },
+        h("label", { class: "form__label" }, "密码传递方式"),
+        h(
+          "div",
+          { class: "segmented" },
+          modeOption("clipboard", "剪贴板（推荐）", "shield"),
+          modeOption("commandLine", "命令行明文", "key"),
+        ),
+        h(
+          "p",
+          { class: "form__hint" },
+          mode === "commandLine"
+            ? "启动 SAP GUI 时把密码作为 -pw 参数交给它：一次点击就登录，但密码会出现在进程命令行里，本机上其它程序在启动的一瞬间可能读到它。"
+            : "先打开 SAP GUI 的登录界面（不填用户名），同时把「用户名 + 换行 + 密码」放进剪贴板：界面出现后按一次 Ctrl+V 就能填好两个输入框。",
+        ),
+      ),
+      h(
+        "div",
+        { class: "form__row" },
+        h("label", { class: "form__label" }, "SAP GUI 启动器"),
+        h(
+          "div",
+          { class: "inline-row" },
+          pathInput,
+          h(
+            "button",
+            {
+              class: "btn btn--sm",
+              type: "button",
+              onClick: guard(async () => {
+                const picked = await api.pickFiles();
+                if (!picked.length) return;
+                await saveSettings({ sapshcutPath: picked[0] });
+                await refreshGuiStatus();
+                paint();
+              }),
+            },
+            icon("folder", { size: 13 }),
+            "浏览",
+          ),
+          h(
+            "button",
+            {
+              class: "btn btn--sm",
+              type: "button",
+              onClick: guard(async () => {
+                await refreshGuiStatus();
+                const found = state.guiStatus?.executable;
+                toast(
+                  found ? "已找到 sapshcut.exe" : "没有检测到 sapshcut.exe",
+                  found ? "success" : "error",
+                );
+                paint();
+              }),
+            },
+            icon("refresh", { size: 13 }),
+            "重新检测",
+          ),
+        ),
+        h(
+          "p",
+          { class: "form__hint" },
+          gui?.executable
+            ? `当前使用：${gui.executable}`
+            : "没有检测到 sapshcut.exe（未安装 SAP GUI for Windows 时就是这样）。可以手动指定它的完整路径。",
+        ),
+      ),
+      h(
+        "div",
+        { class: "form__row" },
+        h("label", { class: "form__label" }, "SAP Logon 配置"),
+        h(
+          "div",
+          { class: "token-list" },
+          h("span", { class: "tag tag--mono" }, `${systems.length} 个系统`),
+          h("span", { class: "tag tag--mono" }, `${launchable.length} 个可登录`),
+          landscape?.files?.length
+            ? h("span", { class: "tag" }, `${landscape.files.length} 个配置文件`)
+            : null,
+          gui?.duplicateSystemIds?.length
+            ? h(
+                "span",
+                { class: "tag tag--warn" },
+                `${gui.duplicateSystemIds.length} 个重名系统 ID`,
+              )
+            : null,
+        ),
+        extraInput,
+        landscape?.files?.length
+          ? h("p", { class: "form__hint" }, `已读取：${landscape.files.join("；")}`)
+          : h(
+              "p",
+              { class: "form__hint" },
+              "没有找到 SAPUILandscape.xml。在 SAP GUI 里添加过系统之后它才会出现（通常在 %APPDATA%\\SAP\\Common\\SAPUILandscape.xml）。",
+            ),
+        h(
+          "button",
+          {
+            class: "btn btn--sm",
+            type: "button",
+            onClick: guard(async () => {
+              await refreshLandscape();
+              toast("已重新读取 SAP Logon 配置", "success");
+              paint();
+            }),
+          },
+          icon("refresh", { size: 13 }),
+          "重新读取系统列表",
+        ),
+      ),
+    );
+  }
+
+  paint();
+  return card(
+    "SAP GUI 登录",
+    "server",
+    "SapVault 用 SAP 自带的 sapshcut.exe 启动 SAP GUI，并从 SAP Logon 的配置文件里读取系统列表；导出的 .sap 快捷方式不含密码。",
+    container,
+  );
 }
 
 function knoxCard() {
@@ -641,6 +827,7 @@ export function renderSettings(container) {
       { class: "settings-columns" },
       appearanceCard(),
       securityCard(),
+      sapCard(),
       knoxCard(),
       ruleCard(),
       keyMapCard(),

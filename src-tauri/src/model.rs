@@ -372,6 +372,47 @@ impl SyncFile {
 // Accounts
 // ---------------------------------------------------------------------------
 
+/// Everything needed to start SAP GUI for this account with one click.
+///
+/// SAP GUI for Windows resolves a system either from its own logon
+/// configuration (when SAP Logon already knows the system) or from a connection
+/// string handed over as `-guiparm`. Both are represented here: `system_id`
+/// alone is enough when the system exists in SAP Logon exactly once, and
+/// `guiparm` pins the exact connection when the same ID is configured twice.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SapLaunch {
+    /// System ID as SAP Logon knows it (`PRD`, `P20`, …).
+    pub system_id: String,
+    /// Client / mandant, padded to three digits when we build arguments.
+    pub client: String,
+    /// Login language (`ZH`, `EN`, …).
+    pub language: String,
+    /// Connection string, e.g. `/H/sap-prd.example/S/3200`. Filled from the
+    /// landscape when the user picks a system there.
+    pub guiparm: String,
+    /// Landscape entry this account was created from (a system ID may repeat).
+    pub service_uuid: String,
+    /// Optional transaction to run right after login.
+    pub transaction: String,
+    /// Start SAP GUI maximized (`-maxgui`).
+    pub maximize: bool,
+}
+
+impl SapLaunch {
+    /// True when there is nothing worth launching.
+    pub fn is_empty(&self) -> bool {
+        self.system_id.trim().is_empty()
+            && self.guiparm.trim().is_empty()
+            && self.transaction.trim().is_empty()
+    }
+
+    /// A stored launch configuration is only useful with a system to connect to.
+    pub fn is_usable(&self) -> bool {
+        !self.system_id.trim().is_empty() || !self.guiparm.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
@@ -398,6 +439,9 @@ pub struct Entry {
     pub updated_at: String,
     #[serde(default)]
     pub last_used_at: Option<String>,
+    /// SAP GUI launch settings (only meaningful for SAP accounts).
+    #[serde(default)]
+    pub sap: Option<SapLaunch>,
 }
 
 impl Entry {
@@ -544,6 +588,8 @@ pub struct EntrySummary {
     pub history_count: usize,
     pub updated_at: String,
     pub last_used_at: Option<String>,
+    /// Drives the "can be launched" badge in the account list.
+    pub has_sap_login: bool,
 }
 
 impl EntrySummary {
@@ -580,6 +626,11 @@ impl EntrySummary {
             history_count: entry.password_history.len(),
             updated_at: entry.updated_at.clone(),
             last_used_at: entry.last_used_at.clone(),
+            has_sap_login: entry
+                .sap
+                .as_ref()
+                .map(|sap| sap.is_usable())
+                .unwrap_or(false),
         }
     }
 }

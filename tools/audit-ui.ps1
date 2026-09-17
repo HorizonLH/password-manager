@@ -12,6 +12,7 @@ param(
   [string[]]$Sizes = @("1240x800", "1600x900", "1920x1080"),
   [switch]$KeepOpen,
   [switch]$WithModals,
+  [switch]$Interactions,
   [string]$ShotView = "",
   [int]$Port = 9222,
   [int]$UiPort = 5173
@@ -22,8 +23,29 @@ $repo = Split-Path -Parent $PSScriptRoot
 $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 if (-not (Test-Path -LiteralPath $edge)) { throw "Edge not found at $edge" }
 
+# Edge spawns its renderer/GPU children inside the same --user-data-dir. Killing
+# only the process we started leaves those behind: they keep eating memory and
+# hold locks on the temp profile, so the cleanup below silently fails and every
+# run piles up another set. Kill the whole profile's process tree instead.
+function Stop-ProfileBrowsers {
+  param([string]$ProfilePath)
+  for ($round = 0; $round -lt 4; $round++) {
+    $stray = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ProfilePath) })
+    if ($stray.Count -eq 0) { return $true }
+    foreach ($item in $stray) {
+      Stop-Process -Id $item.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 350
+  }
+  return $false
+}
+
 $profile = Join-Path $env:TEMP "sapvault-edge-audit"
-if (Test-Path -LiteralPath $profile) { Remove-Item -LiteralPath $profile -Recurse -Force }
+if (Test-Path -LiteralPath $profile) {
+  $null = Stop-ProfileBrowsers -ProfilePath $profile
+  Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $env:SAPVAULT_CDP_PORT = "$Port"
 $env:SAPVAULT_UI_PORT = "$UiPort"
@@ -73,6 +95,11 @@ try {
     node tools\inspect-ui.mjs sizes ($Sizes -join ",")
   }
 
+  if ($Interactions) {
+    # Runs against the same page, so it needs no second terminal.
+    node tools\check-interactions.mjs
+  }
+
   if ($ShotView) {
     $shot = Join-Path $env:TEMP "sapvault-$($ShotView).png"
     if ($ShotView -eq "编辑") {
@@ -87,9 +114,19 @@ try {
 } finally {
   if ($browser -and -not $browser.HasExited) { $browser.Kill() }
   if ($server -and -not $server.HasExited) { $server.Kill() }
-  Start-Sleep -Milliseconds 400
+  $null = Stop-ProfileBrowsers -ProfilePath $profile
   if (-not $KeepOpen) {
-    Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+      try {
+        Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction Stop
+        break
+      } catch {
+        Start-Sleep -Milliseconds 300
+      }
+    }
+    if (Test-Path -LiteralPath $profile) {
+      Write-Warning "临时 profile 未能删除（可能有残留 Edge 进程）：$profile"
+    }
   }
   Pop-Location -ErrorAction SilentlyContinue
 }

@@ -324,6 +324,68 @@ async function main() {
   );
 
 
+  // --------------------------------------------------- 6. SAP GUI 一键登录 --
+  await cdp.eval(clickByText("账号", ".nav__item"));
+  await sleep(300);
+  await cdp.eval(clickByText("SAP 生产机", ".row"));
+  await sleep(400);
+  const sapDetail = await cdp.eval(
+    `(() => { const d = document.querySelector('.detail'); return d ? d.textContent.replace(/\\s+/g, " ") : ""; })()`,
+  );
+  check(
+    "详情页出现 SAP GUI 登录入口",
+    sapDetail.includes("登录 SAP GUI") && sapDetail.includes("导出快捷方式"),
+    sapDetail.slice(0, 140),
+  );
+
+  const sapRowButton = await cdp.eval(buttonBox("登录 SAP GUI"));
+  check("账号行有 SAP 登录按钮", Array.isArray(sapRowButton), JSON.stringify(sapRowButton));
+
+  await cdp.eval("document.getElementById('toasts').replaceChildren()");
+  await cdp.eval(clickByText("登录 SAP GUI", ".detail button"));
+  await sleep(450);
+  const sapToasts = await cdp.eval(TOAST_TEXTS);
+  check(
+    "点「登录 SAP GUI」会启动并提示",
+    sapToasts.some((text) => text.includes("SAP GUI")),
+    JSON.stringify(sapToasts),
+  );
+
+  const sapRowPoint = await cdp.eval(
+    "(() => { const r = document.querySelector('.row').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()",
+  );
+  await clickPoint(cdp, sapRowPoint[0], sapRowPoint[1], "right");
+  const sapMenu = await cdp.eval(
+    `(() => { const m = document.querySelector('.menu'); return m ? [...m.querySelectorAll('.menu__label')].map((n) => n.textContent) : null; })()`,
+  );
+  check(
+    "右键菜单里有 SAP 登录",
+    Boolean(sapMenu) && sapMenu.includes("登录 SAP GUI"),
+    JSON.stringify(sapMenu),
+  );
+  await cdp.eval('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))');
+  await sleep(250);
+
+  await cdp.eval(clickByText("编辑", ".detail__title button"));
+  await sleep(900);
+  const sapPicker = await cdp.eval(
+    `(() => { const select = document.getElementById("editor-sap-system"); if (!select) return null; return { options: [...select.options].map((option) => option.textContent.trim()), value: select.value }; })()`,
+  );
+  check(
+    "编辑器列出 SAP Logon 里的系统",
+    Boolean(sapPicker) &&
+      sapPicker.options.some((text) => text.includes("PRD")) &&
+      sapPicker.options.some((text) => text.includes("P20")),
+    JSON.stringify(sapPicker?.options),
+  );
+  check(
+    "同名系统 ID 有标记",
+    Boolean(sapPicker) && sapPicker.options.some((text) => text.includes("（同名）")),
+    JSON.stringify(sapPicker?.options),
+  );
+  await cdp.eval(clickByText("取消", ".modal__footer button"));
+  await sleep(300);
+
   // ------------------------------------------------------- 5. 钥匙图标重画 --
   const keyIcon = await cdp.eval(
     `(() => { const svg = document.querySelector('.brand__mark svg'); return svg ? svg.outerHTML : null; })()`,
@@ -351,4 +413,3 @@ main().catch((error) => {
   console.error("interaction check failed:", error.message);
   process.exitCode = 1;
 });
-

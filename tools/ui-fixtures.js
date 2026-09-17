@@ -205,6 +205,15 @@
     createdAt: "2026-01-01T00:00:00+08:00",
     updatedAt: "2026-09-15T10:00:00+08:00",
     lastUsedAt: "2026-09-15T09:30:00+08:00",
+    sap: {
+      systemId: "PRD",
+      client: "100",
+      language: "ZH",
+      guiparm: "/H/sap-prd.example.com/S/3200",
+      serviceUuid: "s-prd",
+      transaction: "SE80",
+      maximize: true,
+    },
   };
 
   const summary = {
@@ -224,6 +233,7 @@
     historyCount: 2,
     updatedAt: "2026-09-15T10:00:00+08:00",
     lastUsedAt: null,
+    hasSapLogin: true,
   };
 
   const testSummary = {
@@ -244,6 +254,7 @@
     historyCount: 0,
     updatedAt: "2026-08-01T10:00:00+08:00",
     lastUsedAt: null,
+    hasSapLogin: false,
   };
 
   const binding = (over) => ({
@@ -353,6 +364,9 @@
       avoidAmbiguous: false,
     },
     lastCategory: "sap",
+    sapPasswordMode: "clipboard",
+    sapshcutPath: "",
+    sapLandscapePaths: [],
   };
 
   const paths = {
@@ -371,6 +385,112 @@
     keys: { ...keys },
     analysis: file.analysis,
   });
+
+  /** Mirrors `SAPUILandscape.xml`: one custom application server, one logon
+   *  group, one repeated system ID and one Fiori entry. */
+  const landscape = {
+    files: ["C:\\Users\\me\\AppData\\Roaming\\SAP\\Common\\SAPUILandscape.xml"],
+    warnings: [],
+    systems: [
+      {
+        serviceUuid: "s-prd",
+        name: "PRD 生产机",
+        systemId: "PRD",
+        entryType: "SAPGUI",
+        kind: "applicationServer",
+        server: "sap-prd.example.com:3200",
+        host: "sap-prd.example.com",
+        port: "3200",
+        instance: "00",
+        messageServer: "",
+        messageServerPort: "",
+        group: "",
+        router: "",
+        url: "",
+        guiparm: "/H/sap-prd.example.com/S/3200",
+        workspace: "生产系统",
+        sourceFile: "C:\\Users\\me\\AppData\\Roaming\\SAP\\Common\\SAPUILandscape.xml",
+        client: "",
+        language: "",
+        user: "",
+      },
+      {
+        serviceUuid: "s-p20",
+        name: "P20 登录组",
+        systemId: "P20",
+        entryType: "SAPGUI",
+        kind: "serverGroup",
+        server: "SPACE",
+        host: "sapms.example.com",
+        port: "3600",
+        instance: "",
+        messageServer: "sapms.example.com",
+        messageServerPort: "3600",
+        group: "SPACE",
+        router: "",
+        url: "",
+        guiparm: "/H/sapms.example.com/S/3600/G/SPACE",
+        workspace: "",
+        sourceFile: "C:\\Users\\me\\AppData\\Roaming\\SAP\\Common\\SAPUILandscape.xml",
+        client: "",
+        language: "",
+        user: "",
+      },
+      {
+        serviceUuid: "s-prd-2",
+        name: "PRD 备用入口",
+        systemId: "PRD",
+        entryType: "SAPGUI",
+        kind: "applicationServer",
+        server: "10.1.101.82:3200",
+        host: "10.1.101.82",
+        port: "3200",
+        instance: "00",
+        messageServer: "",
+        messageServerPort: "",
+        group: "",
+        router: "",
+        url: "",
+        guiparm: "/H/10.1.101.82/S/3200",
+        workspace: "",
+        sourceFile: "C:\\Users\\me\\AppData\\Roaming\\SAP\\Common\\SAPUILandscape.xml",
+        client: "",
+        language: "",
+        user: "",
+      },
+      {
+        serviceUuid: "s-fiori",
+        name: "Fiori 门户",
+        systemId: "",
+        entryType: "FIORI",
+        kind: "web",
+        server: "",
+        host: "fiori.example.com",
+        port: "",
+        instance: "",
+        messageServer: "",
+        messageServerPort: "",
+        group: "",
+        router: "",
+        url: "https://fiori.example.com/sap/bc/ui5_ui5",
+        guiparm: "",
+        workspace: "",
+        sourceFile: "C:\\Users\\me\\AppData\\Roaming\\SAP\\Common\\SAPUILandscape.xml",
+        client: "",
+        language: "",
+        user: "",
+      },
+    ],
+  };
+
+  const guiStatus = {
+    executable: "C:\\Program Files (x86)\\SAP\\FrontEnd\\SAPGUI\\sapshcut.exe",
+    candidates: ["C:\\Program Files (x86)\\SAP\\FrontEnd\\SAPGUI\\sapshcut.exe"],
+    landscapeFiles: landscape.files,
+    systemCount: 3,
+    passwordMode: "clipboard",
+    duplicateSystemIds: ["PRD"],
+  };
 
   const responses = {
     app_bootstrap: {
@@ -424,6 +544,18 @@
     ],
     key_mapping_default: { ...keys },
     rule_default: settings.defaultRule,
+    sap_landscape: landscape,
+    sap_refresh_landscape: landscape,
+    sap_gui_status: guiStatus,
+    sap_launch: {
+      mode: "clipboard",
+      executable: guiStatus.executable,
+      arguments: ["-system=PRD", "-client=100", "-guiparm=/H/sap-prd.example.com/S/3200"],
+      passwordOnCommandLine: false,
+      clipboardSeconds: 30,
+      message: "已启动 SAP GUI，用户名 + 密码已复制，登录界面出现后按 Ctrl+V 即可",
+    },
+    sap_export_shortcut: "C:\\Users\\me\\Desktop\\PRD.sap",
     check_password_strength: { score: 4, label: "强", entropyBits: 96.2, suggestions: [] },
     validate_password: [],
     generate_rule_password: "Abcd1234XyZ",
@@ -518,6 +650,10 @@
             summary.favorite = input.favorite;
           }
           if (input.password) entry.password = input.password;
+          if (input.sap !== undefined) {
+            entry.sap = input.sap;
+            summary.hasSapLogin = Boolean(input.sap?.systemId || input.sap?.guiparm);
+          }
           entry.updatedAt = "2026-09-16T10:00:00+08:00";
           return structuredClone(entry);
         }
@@ -538,6 +674,8 @@
     vaultView,
     settings,
     paths,
+    landscape,
+    guiStatus,
     jsonFile,
     envFile,
     jsonPlan,

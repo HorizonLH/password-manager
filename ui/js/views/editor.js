@@ -12,10 +12,11 @@ import {
   bindingsFor,
   filesForEntry,
   syncFiles,
+  refreshLandscape,
 } from "../state.js";
 import { confirmModal, openModal } from "../modal.js";
 import { toast } from "../toast.js";
-import { formatTime, mask, ruleSummary } from "../format.js";
+import { formatTime, mask, ruleSummary, systemLabel, systemTarget } from "../format.js";
 
 function defaultRule() {
   return {
@@ -497,6 +498,186 @@ function historySection(draft, repaintEditor) {
   return { node, repaint: paint };
 }
 
+/** SAP GUI launch settings.
+ *
+ *  The picker is filled from `SAPUILandscape.xml`, so the normal case is
+ *  "choose the system, keep the defaults". Everything can also be typed by hand
+ *  for machines where SapVault cannot read SAP Logon's configuration. */
+function sapLoginBlock(draft) {
+  const node = h("div", { class: "stack stack--tight" });
+
+  const launchable = () =>
+    (state.landscape?.systems ?? []).filter(
+      (system) =>
+        system.systemId &&
+        (system.kind === "applicationServer" || system.kind === "serverGroup"),
+    );
+
+  function duplicateIds(systems) {
+    const counts = new Map();
+    for (const system of systems) {
+      counts.set(system.systemId, (counts.get(system.systemId) ?? 0) + 1);
+    }
+    return new Set(
+      [...counts.entries()].filter(([, count]) => count > 1).map(([id]) => id),
+    );
+  }
+
+  /** Picking a system pins the exact landscape entry, which matters because a
+   *  system ID may be configured more than once in SAP Logon. */
+  function pickSystem(serviceUuid) {
+    const system = launchable().find((item) => item.serviceUuid === serviceUuid);
+    if (!system) {
+      draft.sap.serviceUuid = "";
+      return;
+    }
+    draft.sap.serviceUuid = system.serviceUuid;
+    draft.sap.systemId = system.systemId;
+    if (system.guiparm) draft.sap.guiparm = system.guiparm;
+    if (!draft.sap.client) draft.sap.client = system.client || "";
+    if (!draft.sap.language) draft.sap.language = system.language || "";
+  }
+
+  function textField(label, key, options = {}) {
+    return field(
+      label,
+      h("input", {
+        id: options.id ?? null,
+        class: options.mono ? "input input--mono" : "input",
+        value: draft.sap[key] ?? "",
+        placeholder: options.placeholder ?? null,
+        onInput: (event) => {
+          draft.sap[key] = event.target.value;
+        },
+      }),
+      options.hint,
+    );
+  }
+
+  function repaint() {
+    if (draft.categoryId !== "sap") {
+      mount(
+        node,
+        h(
+          "p",
+          { class: "form__hint" },
+          "只有「SAP 账号」分类的条目可以配置 SAP GUI 登录。",
+        ),
+      );
+      return;
+    }
+
+    const systems = launchable();
+    const duplicates = duplicateIds(systems);
+    const selected = systems.some((item) => item.serviceUuid === draft.sap.serviceUuid)
+      ? draft.sap.serviceUuid
+      : "";
+    const picker = h(
+      "select",
+      { id: "editor-sap-system", class: "select" },
+      h(
+        "option",
+        { value: "" },
+        systems.length ? "（从 SAP Logon 选择系统）" : "（没有读到 SAP Logon 的系统）",
+      ),
+      systems.map((system) =>
+        h(
+          "option",
+          { value: system.serviceUuid, selected: system.serviceUuid === selected },
+          `${systemLabel(system)}${duplicates.has(system.systemId) ? "（同名）" : ""} · ${systemTarget(system)}`,
+        ),
+      ),
+    );
+    picker.addEventListener("change", () => {
+      pickSystem(picker.value);
+      repaint();
+    });
+
+    const landscape = state.landscape;
+    const landscapeHint = landscape?.files?.length
+      ? `已从 ${landscape.files.length} 个配置文件里读到 ${landscape.systems.length} 个系统；同名系统需要选具体的那一个。`
+      : "没有找到 SAPUILandscape.xml（SAP Logon 的配置文件），可以手动填写系统 ID 与连接串。";
+    const gui = state.guiStatus;
+    const guiHint = gui?.executable
+      ? `启动器：${gui.executable}`
+      : "没有找到 sapshcut.exe —— 可在「设置 → SAP GUI 登录」里手动指定 SAP GUI 的安装位置。";
+
+    mount(
+      node,
+      h(
+        "div",
+        { class: "form__row" },
+        h("label", { class: "form__label" }, "SAP Logon 系统"),
+        h(
+          "div",
+          { class: "inline-row" },
+          picker,
+          h(
+            "button",
+            {
+              class: "btn btn--sm",
+              type: "button",
+              onClick: guard(async () => {
+                await refreshLandscape();
+                toast("已重新读取 SAP Logon 配置", "success");
+                repaint();
+              }),
+            },
+            icon("refresh", { size: 13 }),
+            "重新读取",
+          ),
+        ),
+        h("p", { class: "form__hint" }, landscapeHint),
+      ),
+      h(
+        "div",
+        { class: "form__grid" },
+        textField("系统 ID", "systemId", {
+          id: "editor-sap-system-id",
+          mono: true,
+          placeholder: "例如 PRD",
+        }),
+        textField("客户端", "client", { mono: true, placeholder: "例如 100" }),
+        textField("登录语言", "language", { mono: true, placeholder: "例如 ZH" }),
+      ),
+      textField("连接串（GuiParm）", "guiparm", {
+        mono: true,
+        placeholder: "/H/sap-prd.example/S/3200",
+        hint: "从 SAP Logon 选系统时会自动带出；手动填写时格式为 /H/主机/S/端口，登录组再加 /G/组名。",
+      }),
+      h(
+        "div",
+        { class: "form__grid" },
+        textField("登录后执行事务码", "transaction", {
+          mono: true,
+          placeholder: "可留空，例如 SE80",
+        }),
+        h(
+          "div",
+          { class: "form__row" },
+          h("label", { class: "form__label" }, "启动方式"),
+          h(
+            "label",
+            { class: "checkbox" },
+            h("input", {
+              type: "checkbox",
+              checked: Boolean(draft.sap.maximize),
+              onChange: (event) => {
+                draft.sap.maximize = event.target.checked;
+              },
+            }),
+            h("span", null, "启动后最大化窗口（-maxgui）"),
+          ),
+        ),
+      ),
+      h("p", { class: "form__hint" }, guiHint),
+    );
+  }
+
+  repaint();
+  return { node, repaint };
+}
+
 /** A rotated password leaves every bound file holding the old one, so the user
  *  is told right away and can sync from the same dialog. */
 function notifyBoundFiles(entry) {
@@ -586,6 +767,15 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     rule: entry?.rule ? { ...entry.rule } : null,
     historyCycle: entry?.historyCycle ?? 0,
     history: [...(entry?.passwordHistory ?? [])],
+    sap: {
+      systemId: entry?.sap?.systemId ?? "",
+      client: entry?.sap?.client ?? "",
+      language: entry?.sap?.language ?? "",
+      guiparm: entry?.sap?.guiparm ?? "",
+      serviceUuid: entry?.sap?.serviceUuid ?? "",
+      transaction: entry?.sap?.transaction ?? "",
+      maximize: entry?.sap?.maximize ?? false,
+    },
   };
   const password = { value: "" };
   /** The password as loaded, so "did this save rotate it?" is answerable. */
@@ -648,6 +838,9 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     class: "select",
     onChange: (event) => {
       draft.categoryId = event.target.value;
+      // The SAP block only applies to SAP accounts, and a new entry may be
+      // switched into that category while the editor is open.
+      sapLogin.repaint();
     },
   });
   mount(
@@ -659,6 +852,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
   categorySelect.value = draft.categoryId;
 
   const history = historySection(draft, () => onSaved?.());
+  const sapLogin = sapLoginBlock(draft);
   const rule = ruleSection(draft, (generated) => {
     if (typeof generated === "string") {
       password.value = generated;
@@ -723,6 +917,12 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
       passwordMeter,
     ),
     section(
+      "SAP GUI 登录",
+      "server",
+      "把系统、客户端与语言存进条目后，账号列表和详情页就能一键打开 SAP GUI。",
+      sapLogin.node,
+    ),
+    section(
       "密码规则",
       "sliders",
       "可以选择使用规则，也可以完全不加规则。",
@@ -762,6 +962,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
       rule: draft.rule,
       historyCycle: draft.historyCycle,
       force: Boolean(force),
+      sap: draft.categoryId === "sap" ? { ...draft.sap } : null,
     };
   }
 
@@ -817,6 +1018,15 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
       draft.rule = full.rule ? { ...full.rule } : null;
       draft.historyCycle = full.historyCycle ?? 0;
       draft.history = [...(full.passwordHistory ?? [])];
+      draft.sap = {
+        systemId: full.sap?.systemId ?? "",
+        client: full.sap?.client ?? "",
+        language: full.sap?.language ?? "",
+        guiparm: full.sap?.guiparm ?? "",
+        serviceUuid: full.sap?.serviceUuid ?? "",
+        transaction: full.sap?.transaction ?? "",
+        maximize: full.sap?.maximize ?? false,
+      };
     } else {
       const generated = await api.generatePassword({
         length: 16,
@@ -835,6 +1045,7 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     // The loaded rule / history may differ from what was rendered first.
     rule.repaint();
     history.repaint();
+    sapLogin.repaint();
   }
 
   prepare().catch(() => {});
