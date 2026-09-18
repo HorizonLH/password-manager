@@ -518,7 +518,7 @@ function detailPane(entry) {
             { class: "form__hint" },
             state.settings?.sapPasswordMode === "commandLine"
               ? "当前设置：直接带密码启动（密码会出现在进程命令行里，本机其它程序可能读到）。"
-              : "当前设置：先打开 SAP GUI 登录界面，用户名与密码已放进剪贴板，按 Ctrl+V 即可填入。",
+              : "当前设置：打开 SAP GUI 登录界面（用户名已填好），密码已放进剪贴板，按 Ctrl+V 填入即可。",
           ),
         )
       : null,

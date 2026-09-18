@@ -8,10 +8,9 @@
 //!
 //! The password is the one interesting decision. `-pw=<password>` works, but the
 //! value lands in the process command line where any local process can read it,
-//! so it is opt-in. The default mode starts SAP GUI *without* user and password;
-//! the login screen appears with the first input focused and the account's
-//! "user + newline + password" payload sits in the clipboard, so one paste fills
-//! both fields — the same trick the copy buttons already use.
+//! so it is opt-in. The default mode starts SAP GUI with the user name filled in
+//! and no password: the login screen asks for the password, and the password
+//! alone is waiting in the clipboard.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -81,9 +80,9 @@ pub fn locate(explicit: &str) -> Option<PathBuf> {
 
 /// Builds the `sapshcut.exe` argument list.
 ///
-/// `include_password` is what separates the two password modes; the caller
-/// leaves `username` empty in clipboard mode so SAP GUI shows its login prompt
-/// (a prefilled user field would swallow only the first half of the paste).
+/// `include_password` is what separates the two password modes: the clipboard
+/// mode still passes `-user` (so only the password is left to paste) but never
+/// `-pw`.
 pub fn build_arguments(
     launch: &SapLaunch,
     username: &str,
@@ -92,15 +91,21 @@ pub fn build_arguments(
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
+    let guiparm = launch.guiparm.trim();
+    // A `/R/` (system ID + logon group) or `/M/` (message server + logon group)
+    // connection string already names the target system, and SAP GUI rejects the
+    // combination with `-system` as contradictory. Plain `/H/<host>/S/<port>`
+    // connection strings keep the system ID.
+    let guiparm_names_the_system =
+        guiparm.contains("/R/") || guiparm.contains("/M/");
     let system_id = launch.system_id.trim();
-    if !system_id.is_empty() {
+    if !system_id.is_empty() && !guiparm_names_the_system {
         args.push(format!("-system={system_id}"));
     }
     let client = normalize_client(&launch.client);
     if !client.is_empty() {
         args.push(format!("-client={client}"));
     }
-    let guiparm = launch.guiparm.trim();
     if !guiparm.is_empty() {
         args.push(format!("-guiparm={guiparm}"));
     }
@@ -264,13 +269,37 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_mode_omits_user_and_password() {
-        // The login prompt must be empty, otherwise the two-line paste lands
-        // both values in a single field.
-        let args = build_arguments(&launch(), "", "", false);
+    fn clipboard_mode_keeps_the_user_but_never_the_password() {
+        // The user name is prefilled so only the password has to be pasted;
+        // the password itself must never reach the command line.
+        let args = build_arguments(&launch(), "USER01", "S3cret!", false);
         assert!(!args.iter().any(|arg| arg.starts_with("-pw=")));
-        assert!(!args.iter().any(|arg| arg.starts_with("-user=")));
+        assert!(args.contains(&"-user=USER01".to_string()));
         assert!(args.iter().any(|arg| arg.starts_with("-system=")));
+    }
+
+    #[test]
+    fn logon_group_connection_strings_replace_the_system_id() {
+        // SAP GUI treats `-system` together with `/R/` or `/M/` as contradictory.
+        let group = SapLaunch {
+            system_id: "PRD".to_string(),
+            guiparm: "/R/PRD/G/SPACE".to_string(),
+            client: "100".to_string(),
+            ..Default::default()
+        };
+        let args = build_arguments(&group, "USER01", "", false);
+        assert!(!args.iter().any(|arg| arg.starts_with("-system=")));
+        assert!(args.contains(&"-guiparm=/R/PRD/G/SPACE".to_string()));
+        assert!(args.contains(&"-client=100".to_string()));
+
+        let routed = SapLaunch {
+            system_id: "PRD".to_string(),
+            guiparm: "/H/10.0.0.1/S/3299/M/sapmsgsrv/S/3600/G/SPACE".to_string(),
+            ..Default::default()
+        };
+        let args = build_arguments(&routed, "", "", false);
+        assert!(!args.iter().any(|arg| arg.starts_with("-system=")));
+        assert!(args.contains(&"-guiparm=/H/10.0.0.1/S/3299/M/sapmsgsrv/S/3600/G/SPACE".to_string()));
     }
 
     #[test]

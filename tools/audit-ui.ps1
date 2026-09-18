@@ -14,8 +14,10 @@ param(
   [switch]$WithModals,
   [switch]$Interactions,
   [string]$ShotView = "",
-  [int]$Port = 9222,
-  [int]$UiPort = 5173
+  # 0 = pick a free port, so an already running browser (or another tool) cannot
+  # collide with the audit.
+  [int]$Port = 0,
+  [int]$UiPort = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +42,18 @@ function Stop-ProfileBrowsers {
   }
   return $false
 }
+
+# Binds a throwaway listener to ask Windows for a free port.
+function Get-FreePort {
+  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+  $listener.Start()
+  $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+  $listener.Stop()
+  return $port
+}
+
+if ($Port -le 0) { $Port = Get-FreePort }
+if ($UiPort -le 0) { $UiPort = Get-FreePort }
 
 $profile = Join-Path $env:TEMP "sapvault-edge-audit"
 if (Test-Path -LiteralPath $profile) {
@@ -112,7 +126,11 @@ try {
     & (Join-Path $PSScriptRoot "ascii-shot.ps1") -Path $shot -Cols 100 -Rows 30
   }
 } finally {
-  if ($browser -and -not $browser.HasExited) { $browser.Kill() }
+  if ($browser -and -not $browser.HasExited) {
+    # /T kills the renderer and GPU children too, which is what actually holds
+    # the temp profile open (a plain Kill() leaves them behind).
+    & taskkill /PID $browser.Id /T /F 2>$null | Out-Null
+  }
   if ($server -and -not $server.HasExited) { $server.Kill() }
   $null = Stop-ProfileBrowsers -ProfilePath $profile
   if (-not $KeepOpen) {

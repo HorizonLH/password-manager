@@ -618,7 +618,12 @@ fn resolve(
         .unwrap_or_default();
 
     let (mut host, mut port) = split_host_port(&server);
-    if !msid.is_empty() {
+    if looks_like_address(&server) {
+        // "Group/Server" entries may carry the *address* in `server` instead of a
+        // logon group name; those are plain application servers, so the message
+        // server must not be used to build the connection string.
+        system.kind = "applicationServer".to_string();
+    } else if !msid.is_empty() {
         // Logon group: the `server` attribute is the group name (SAP's default
         // group is literally called SPACE) and the host comes from the message
         // server this entry points at.
@@ -628,12 +633,6 @@ fn resolve(
         } else {
             server.trim().to_string()
         };
-        if let Some(message) = messages.get(&msid) {
-            system.message_server = message.host.clone();
-            system.message_server_port = message.port.clone();
-            host = message.host.clone();
-            port = message.port.clone();
-        }
     } else if !host.is_empty() {
         system.kind = "applicationServer".to_string();
     } else if !url.trim().is_empty() {
@@ -641,6 +640,19 @@ fn resolve(
         host = host_from_url(&url);
     } else {
         system.kind = "other".to_string();
+    }
+
+    // The message server is worth showing even when the connection goes straight
+    // to an application server.
+    if !msid.is_empty() {
+        if let Some(message) = messages.get(&msid) {
+            system.message_server = message.host.clone();
+            system.message_server_port = message.port.clone();
+            if system.kind == "serverGroup" {
+                host = message.host.clone();
+                port = message.port.clone();
+            }
+        }
     }
 
     system.host = host.clone();
@@ -710,6 +722,19 @@ fn split_host_port(value: &str) -> (String, String) {
     }
 }
 
+/// True when the `server` attribute holds an address rather than a logon group
+/// name: `host:port`, an IPv4 address or a fully qualified name.
+///
+/// Logon group names (`SPACE`, `PUBLIC`, `SAP_GROUP_1`, …) never contain a dot or
+/// a colon, which is what makes this distinction safe.
+fn looks_like_address(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.contains(':') || trimmed.contains('.')
+}
+
 /// `3300` → `01`; anything that is not `<3200 + 100n>` yields an empty string.
 fn instance_from_port(port: &str) -> String {
     let Ok(port) = port.trim().parse::<u32>() else {
@@ -739,28 +764,45 @@ fn host_from_url(url: &str) -> String {
     host_port.split(':').next().unwrap_or("").to_string()
 }
 
-/// Builds the `/H/…/S/…` connection string SAP GUI accepts as `-guiparm`.
+/// Builds the connection string SAP GUI accepts as `-guiparm`/`-gui`.
+///
+/// Three shapes are supported, and the first hop marker matters:
 ///
 /// * application server → `/H/<host>/S/<port>`
-/// * logon group → `/H/<message server>/S/<port>/G/<group>`
-/// * with a saprouter the router hop is prepended.
+/// * logon group with a system ID → `/R/<system id>/G/<group>` (SAP GUI resolves
+///   the message server from the system ID and the group itself)
+/// * logon group without a system ID → `/M/<message server>/S/<port>/G/<group>`
+///
+/// A saprouter hop is prepended as `/H/<router>/S/<port>`; SAP's own example for
+/// a routed logon group is `/H/10.0.0.1/S/3299/M/sapmsgsrv/S/3600/G/SPACE`.
 fn connection_string(system: &SapSystem, host: &str, port: &str) -> String {
     let host = host.trim();
     let port = port.trim();
     let mut out = router_prefix(&system.router);
+
+    if system.kind == "serverGroup" {
+        let group = system.group.trim();
+        let system_id = system.system_id.trim();
+        if !system_id.is_empty() && !group.is_empty() {
+            out.push_str(&format!("/R/{system_id}/G/{group}"));
+        } else if !host.is_empty() {
+            out.push_str(&format!("/M/{host}"));
+            if !port.is_empty() {
+                out.push_str(&format!("/S/{port}"));
+            }
+            if !group.is_empty() {
+                out.push_str(&format!("/G/{group}"));
+            }
+        }
+        return out;
+    }
+
     if host.is_empty() {
         return out;
     }
-    if out.is_empty() {
-        out.push_str("/H/");
-    }
-    // `router_prefix` always ends with `/H/`, so the target hop follows directly.
-    out.push_str(host);
+    out.push_str(&format!("/H/{host}"));
     if !port.is_empty() {
         out.push_str(&format!("/S/{port}"));
-    }
-    if system.kind == "serverGroup" && !system.group.trim().is_empty() {
-        out.push_str(&format!("/G/{}", system.group.trim()));
     }
     out
 }
@@ -768,22 +810,21 @@ fn connection_string(system: &SapSystem, host: &str, port: &str) -> String {
 /// `Router@router` comes in three shapes: `/H/gateway.example`,
 /// `/H/gateway.example/S/3456` and the prefix form
 /// `/H/gateway.example/S/3456/H/` (the last one is what SAP's own documentation
-/// shows). All three end up as a prefix the target hop appends to.
+/// shows). All three become the router hop the target address is appended to.
 fn router_prefix(router: &str) -> String {
-    let trimmed = router.trim();
+    // A trailing `/H/` in the landscape is the slot for the target hop we build
+    // ourselves, so it is dropped here instead of being duplicated.
+    let trimmed = router.trim().trim_end_matches("/H/").trim_end_matches('/');
     if trimmed.is_empty() {
         return String::new();
     }
     if !trimmed.starts_with("/H/") {
-        return format!("/H/{trimmed}/S/{DEFAULT_ROUTER_PORT}/H/");
-    }
-    if trimmed.ends_with("/H/") {
-        return trimmed.to_string();
+        return format!("/H/{trimmed}/S/{DEFAULT_ROUTER_PORT}");
     }
     if trimmed.contains("/S/") {
-        return format!("{trimmed}/H/");
+        return trimmed.to_string();
     }
-    format!("{trimmed}/S/{DEFAULT_ROUTER_PORT}/H/")
+    format!("{trimmed}/S/{DEFAULT_ROUTER_PORT}")
 }
 
 #[cfg(test)]
@@ -858,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_logon_group_entry_through_the_message_server() {
+    fn logon_groups_use_the_system_id_and_group_form() {
         let systems = collect(SAMPLE);
         let p20 = system(&systems, "P20");
         assert_eq!(p20.kind, "serverGroup");
@@ -866,7 +907,73 @@ mod tests {
         assert_eq!(p20.message_server, "sapms.example.com");
         assert_eq!(p20.message_server_port, "3600");
         assert_eq!(p20.host, "sapms.example.com");
-        assert_eq!(p20.guiparm, "/H/sapms.example.com/S/3600/G/SPACE");
+        // SAP's recommended form: the GUI resolves the message server from the
+        // system ID and the logon group.
+        assert_eq!(p20.guiparm, "/R/P20/G/SPACE");
+    }
+
+    #[test]
+    fn a_logon_group_without_a_system_id_falls_back_to_the_message_server() {
+        let xml = r#"<Landscape>
+  <Messageservers>
+    <Messageserver uuid="m-1" name="MS" host="sapms.example.com" port="3600"/>
+  </Messageservers>
+  <Services>
+    <Service uuid="s-1" name="组连接" type="SAPGUI" server="PUBLIC" msid="m-1"/>
+  </Services>
+</Landscape>"#;
+        let systems = collect(xml);
+        let group = &systems[0];
+        assert_eq!(group.kind, "serverGroup");
+        assert_eq!(group.group, "PUBLIC");
+        assert_eq!(group.guiparm, "/M/sapms.example.com/S/3600/G/PUBLIC");
+        assert!(!group.is_launchable(), "without a system ID there is nothing to log on to");
+    }
+
+    #[test]
+    fn a_group_entry_whose_server_is_an_address_is_an_application_server() {
+        // Reported from a real landscape: "Group/Server" entries may carry the
+        // address in `server`, and then the address is the connection target.
+        let xml = r#"<Landscape>
+  <Messageservers>
+    <Messageserver uuid="m-1" name="MS" host="sapms.example.com" port="3600"/>
+  </Messageservers>
+  <Services>
+    <Service uuid="s-1" name="组/服务器" type="SAPGUI" systemid="P20"
+             server="10.1.101.82:3201" msid="m-1"/>
+  </Services>
+</Landscape>"#;
+        let systems = collect(xml);
+        let system = &systems[0];
+        assert_eq!(system.kind, "applicationServer");
+        assert_eq!(system.host, "10.1.101.82");
+        assert_eq!(system.port, "3201");
+        // 3201 is not `<3200 + 100n>`, so no instance number can be derived.
+        assert_eq!(system.instance, "");
+        assert_eq!(system.guiparm, "/H/10.1.101.82/S/3201");
+        // The message server is still shown, but it does not drive the address.
+        assert_eq!(system.message_server, "sapms.example.com");
+        assert!(system.is_launchable());
+    }
+
+    #[test]
+    fn a_routed_logon_group_matches_saps_own_example() {
+        let xml = r#"<Landscape>
+  <Routers>
+    <Router uuid="r-1" name="gateway" router="/H/10.0.0.1/S/3299/H/"/>
+  </Routers>
+  <Messageservers>
+    <Messageserver uuid="m-1" name="MS" host="sapmsgsrv" port="3600"/>
+  </Messageservers>
+  <Services>
+    <Service uuid="s-1" name="组连接" type="SAPGUI" server="SPACE" msid="m-1" routerid="r-1"/>
+  </Services>
+</Landscape>"#;
+        let systems = collect(xml);
+        assert_eq!(
+            systems[0].guiparm,
+            "/H/10.0.0.1/S/3299/M/sapmsgsrv/S/3600/G/SPACE"
+        );
     }
 
     #[test]

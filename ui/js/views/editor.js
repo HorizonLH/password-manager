@@ -643,7 +643,10 @@ function sapLoginBlock(draft) {
       textField("连接串（GuiParm）", "guiparm", {
         mono: true,
         placeholder: "/H/sap-prd.example/S/3200",
-        hint: "从 SAP Logon 选系统时会自动带出；手动填写时格式为 /H/主机/S/端口，登录组再加 /G/组名。",
+        hint:
+          "从 SAP Logon 选系统时会自动带出。手动填写：应用服务器用 /H/主机/S/端口；" +
+          "登录组用 /R/系统ID/G/组名，或 /M/消息服务器/S/端口/G/组名。" +
+          "填写了 /R/ 或 /M/ 时会自动去掉 -system，避免两者冲突。",
       }),
       h(
         "div",

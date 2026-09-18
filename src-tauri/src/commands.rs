@@ -811,9 +811,9 @@ fn launch_for(state: &State<'_, AppState>, id: &str) -> AppResult<(Entry, SapLau
 /// Two password paths, decided by `settings.sap_password_mode`:
 /// * `commandLine` — pass `-pw=` to `sapshcut.exe` (one click, but the password
 ///   is visible in the process command line while SAP GUI starts).
-/// * `clipboard` — start SAP GUI with no user/password so the login prompt is
-///   empty, and put `user + separator + password` into the clipboard so a single
-///   paste fills both fields. This is the default.
+/// * `clipboard` — hand `sapshcut.exe` the system, client, user and language but
+///   no password, and put the password alone into the clipboard, so the login
+///   prompt only needs one paste. This is the default.
 #[tauri::command]
 pub fn sap_launch(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<LaunchOutcome> {
     state.touch();
@@ -836,24 +836,25 @@ pub fn sap_launch(app: AppHandle, state: State<'_, AppState>, id: String) -> App
     };
     let command_line_mode = mode == sapgui::PASSWORD_MODE_COMMAND_LINE;
     let include_password = command_line_mode && !entry.password.is_empty();
-    let argument_user = if command_line_mode { username.as_str() } else { "" };
-    let arguments = sapgui::build_arguments(&launch, argument_user, &entry.password, include_password);
+    // The user name is always handed over; only the password depends on the mode.
+    let arguments = sapgui::build_arguments(&launch, &username, &entry.password, include_password);
     sapgui::start(&executable, &arguments)?;
 
     let mut clipboard_seconds = 0;
     let mut message = if command_line_mode {
         "已启动 SAP GUI（密码随命令行传递）".to_string()
     } else {
-        "已启动 SAP GUI，请在登录界面按 Ctrl+V 填入用户名和密码".to_string()
+        "已启动 SAP GUI，请在登录界面按 Ctrl+V 填入密码".to_string()
     };
 
-    if !command_line_mode && !username.is_empty() && !entry.password.is_empty() {
-        let payload =
-            clipboard::sap_credentials_payload(&username, &entry.password, &settings.sap_line_separator);
-        clipboard::set_text(&payload)?;
+    if !command_line_mode && !entry.password.is_empty() {
+        // Only the password: SAP GUI already has the user name, and pasting a
+        // two-line payload into a prefilled login screen would land both values
+        // in the password field.
+        clipboard::set_text(&entry.password)?;
         clipboard_seconds = settings.clipboard_clear_seconds;
         let handle = app.clone();
-        clipboard::schedule_auto_clear(payload, clipboard_seconds as u64, move || {
+        clipboard::schedule_auto_clear(entry.password.clone(), clipboard_seconds as u64, move || {
             let _ = handle.emit(
                 "app:notice",
                 Notice {
@@ -862,7 +863,7 @@ pub fn sap_launch(app: AppHandle, state: State<'_, AppState>, id: String) -> App
                 },
             );
         });
-        message = "已启动 SAP GUI，用户名 + 密码已复制，登录界面出现后按 Ctrl+V 即可".to_string();
+        message = "已启动 SAP GUI（用户名已填好），密码已复制，登录界面出现后按 Ctrl+V 即可".to_string();
     } else if !command_line_mode && entry.password.is_empty() {
         message = "已启动 SAP GUI（该条目没有保存密码）".to_string();
     }
