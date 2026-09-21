@@ -527,6 +527,68 @@ async function main() {
     String(boundLabel),
   );
 
+  // 表格形式的文件（.env / TOML / INI …）里，选择器同样要能打开并选中：
+  // 曾经被 .table / .table__cell 的 overflow:hidden 裁掉，看起来像禁用。
+  await cdp.eval(
+    `(() => { const rows = [...document.querySelectorAll('.pane__scroll--tight .row')]; rows.find((r) => r.textContent.includes('.env'))?.click(); })()`,
+  );
+  await sleep(500);
+  const tablePicker = await cdp.eval(
+    `(() => ({ rows: document.querySelectorAll('.table__row').length, pickers: document.querySelectorAll('.table__row .combo__control').length }))()`,
+  );
+  check(
+    "表格形式的内容里存在账号选择器",
+    tablePicker.pickers > 0,
+    JSON.stringify(tablePicker),
+  );
+  const controlPoint = await cdp.eval(`(() => {
+    const control = document.querySelector('.table__row .combo__control');
+    if (!control) return null;
+    const rect = control.getBoundingClientRect();
+    return [rect.x + rect.width / 2, rect.y + rect.height / 2];
+  })()`);
+  if (controlPoint) await clickPoint(cdp, controlPoint[0], controlPoint[1]);
+  await sleep(350);
+  const panelHit = await cdp.eval(`(() => {
+    const panel = document.querySelector('#combo-root .combo__panel');
+    if (!panel) return null;
+    const rect = panel.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + 18);
+    return {
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      reachable: Boolean(hit && panel.contains(hit)),
+      panels: document.querySelectorAll('#combo-root .combo__panel').length,
+    };
+  })()`);
+  check(
+    "表格里的选择器面板没有被裁剪",
+    Boolean(panelHit) && panelHit.reachable && panelHit.width > 100 && panelHit.height > 20,
+    JSON.stringify(panelHit),
+  );
+  const optionPoint = await cdp.eval(`(() => {
+    const row = [...document.querySelectorAll('#combo-root .combo__option')].find((n) => n.textContent.includes("SAP 测试机"));
+    if (!row) return null;
+    const rect = row.getBoundingClientRect();
+    return [rect.x + rect.width / 2, rect.y + rect.height / 2];
+  })()`);
+  if (optionPoint) await clickPoint(cdp, optionPoint[0], optionPoint[1]);
+  await sleep(800);
+  const tableState = await cdp.eval(`(() => ({
+    rows: document.querySelectorAll('.table__row').length,
+    value: document.querySelector('.table__row .combo__value')?.textContent ?? null,
+    panelOpen: !!document.querySelector('#combo-root .combo__panel'),
+    hasTree: !!document.querySelector('.tree'),
+    selectedFile: (document.querySelector('.pane__scroll--tight .row.is-selected')?.textContent ?? "").trim().slice(0, 24),
+    envBindings: (window.__FIXTURES__?.envFile?.bindings ?? []).map((b) => b.keyPath + "->" + b.entryId),
+    toasts: [...document.querySelectorAll('.toast')].map((t) => t.textContent.trim()),
+  }))()`);
+  check(
+    "表格里选中账号后绑定生效",
+    Boolean(tableState.value) && tableState.value.includes("SAP 测试机"),
+    JSON.stringify({ controlPoint, panelHit, optionPoint, tableState }),
+  );
+
   // ------------------------------------------------------- 5. 钥匙图标重画 --
   const keyIcon = await cdp.eval(
     `(() => { const svg = document.querySelector('.brand__mark svg'); return svg ? svg.outerHTML : null; })()`,

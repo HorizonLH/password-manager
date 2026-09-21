@@ -1051,13 +1051,12 @@ svg {
 }
 
 .combo__panel {
-  position: absolute;
-  z-index: 40;
-  top: calc(100% + 4px);
-  right: 0;
+  /* Positioned from JS by the control's screen rectangle; it lives in #combo-root
+     at the end of <body> so a scrolling table cell cannot clip it. */
+  position: fixed;
+  z-index: 80;
   display: grid;
   gap: var(--s-2);
-  width: max(100%, 260px);
   max-height: 320px;
   padding: var(--s-2);
   border: 1px solid var(--border);

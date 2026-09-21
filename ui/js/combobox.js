@@ -14,6 +14,18 @@ import { icon } from "./icons.js";
 let openInstance = null;
 let globalCloseInstalled = false;
 
+/** The floating panel lives in its own host at the end of <body>: a select inside
+ *  a table cell would otherwise be clipped by `overflow: hidden` on the cell and
+ *  on the table itself, which looks exactly like a disabled control. */
+function panelHost() {
+  let host = document.getElementById("combo-root");
+  if (!host) {
+    host = h("div", { id: "combo-root" });
+    document.body.append(host);
+  }
+  return host;
+}
+
 function installGlobalClose() {
   if (globalCloseInstalled) return;
   globalCloseInstalled = true;
@@ -22,11 +34,22 @@ function installGlobalClose() {
   document.addEventListener(
     "pointerdown",
     (event) => {
-      if (openInstance && !openInstance.root.contains(event.target)) openInstance.close();
+      if (!openInstance) return;
+      // The control can be replaced by a re-render while the panel is open; in
+      // that case the panel is stale and must go.
+      if (!openInstance.root.isConnected) {
+        openInstance.close();
+        return;
+      }
+      const inside =
+        openInstance.root.contains(event.target) ||
+        (openInstance.panel && openInstance.panel.contains(event.target));
+      if (!inside) openInstance.close();
     },
     true,
   );
   document.addEventListener("scroll", () => openInstance?.close(), true);
+  window.addEventListener("resize", () => openInstance?.close());
   window.addEventListener("blur", () => openInstance?.close());
 }
 
@@ -52,6 +75,8 @@ export function searchSelect({
   let open = false;
   let query = "";
   let cursor = 0;
+  /** The floating panel of *this* instance (see `paint`). */
+  let panel = null;
 
   const selected = () => options.find((option) => option.value === value) ?? null;
   const matches = () => {
@@ -63,7 +88,11 @@ export function searchSelect({
   };
 
   function close() {
-    if (openInstance?.root === root) openInstance = null;
+    panel?.remove();
+    panel = null;
+    if (openInstance?.root === root) {
+      openInstance = null;
+    }
     if (!open) return;
     open = false;
     paint();
@@ -73,7 +102,11 @@ export function searchSelect({
     value = next;
     open = false;
     query = "";
-    if (openInstance?.root === root) openInstance = null;
+    panel?.remove();
+    panel = null;
+    if (openInstance?.root === root) {
+      openInstance = null;
+    }
     paint();
     onSelect?.(next);
   }
@@ -88,7 +121,7 @@ export function searchSelect({
       event.preventDefault();
       if (!open) {
         open = true;
-        openInstance = { root, close };
+        openInstance = { root, close, panel: null };
         paint();
         return;
       }
@@ -104,6 +137,12 @@ export function searchSelect({
   }
 
   function paint() {
+    // `paint()` runs on every keystroke and arrow key press; without dropping the
+    // previous panel first they would pile up in the host and clicks would land
+    // on a stale one.
+    panel?.remove();
+    panel = null;
+
     const current = selected();
     const control = h(
       "button",
@@ -117,7 +156,11 @@ export function searchSelect({
           open = !open;
           query = "";
           cursor = 0;
-          openInstance = open ? { root, close } : null;
+          if (!open) {
+            panel?.remove();
+            panel = null;
+            openInstance = null;
+          }
           paint();
         },
         onKeydown: (event) => onKeyDown(event, matches()),
@@ -173,15 +216,27 @@ export function searchSelect({
     mount(
       root,
       control,
-      h(
-        "div",
-        { class: "combo__panel", role: "listbox" },
-        search,
-        query.trim() && !list.length
-          ? h("p", { class: "combo__empty" }, "没有匹配的账号")
-          : h("div", { class: "combo__options" }, rows),
-      ),
     );
+    // The panel is appended to its own host (see panelHost) and positioned with
+    // `position: fixed`, so no ancestor can clip it.
+    panel = h(
+      "div",
+      { class: "combo__panel", role: "listbox" },
+      search,
+      query.trim() && !list.length
+        ? h("p", { class: "combo__empty" }, "没有匹配的账号")
+        : h("div", { class: "combo__options" }, rows),
+    );
+    openInstance = { root, close, panel };
+    panelHost().append(panel);
+    const rect = control.getBoundingClientRect();
+    const width = Math.min(Math.max(rect.width, 260), window.innerWidth - 16);
+    panel.style.width = `${width}px`;
+    const height = panel.offsetHeight;
+    const below = rect.bottom + 4;
+    const above = rect.top - height - 4;
+    panel.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`;
+    panel.style.top = `${below + height <= window.innerHeight - 8 || above < 8 ? below : above}px`;
     setTimeout(() => search.focus(), 0);
   }
 
