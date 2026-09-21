@@ -883,8 +883,11 @@ pub fn sap_launch(app: AppHandle, state: State<'_, AppState>, id: String) -> App
 /// Writes a `.sap` shortcut for this account.
 ///
 /// The file never contains the password — SAP GUI asks for it when the shortcut
-/// is opened. `.sap` is the shortcut format of every SAP GUI above 6.20, and
-/// Windows already knows it once `sapshcut -register` has run once.
+/// is opened — and it carries no connection string either: SAP GUI resolves the
+/// server from SAP Logon using the system ID, so the system has to be configured
+/// there (which is exactly how a shortcut SAP GUI saves itself behaves).
+/// `.sap` is the shortcut format of every SAP GUI above 6.20, and Windows
+/// already knows it once `sapshcut -register` has run once.
 #[tauri::command]
 pub fn sap_export_shortcut(
     state: State<'_, AppState>,
@@ -894,6 +897,26 @@ pub fn sap_export_shortcut(
     state.touch();
     let (entry, launch) = launch_for(&state, &id)?;
     let username = entry.effective_username(&state.knox_id());
+    if launch.system_id.trim().is_empty() {
+        return Err(AppError::Msg(
+            ".sap 快捷方式是靠系统 ID 连接的，请先填写系统 ID（SAP Logon 里要有对应系统）".to_string(),
+        ));
+    }
+    // `Description` is what SAP GUI shows for the connection; the name from SAP
+    // Logon is the closest match we have.
+    let landscape = state.landscape();
+    let description = saplogon::find_system(&landscape.systems, &launch.service_uuid, &launch.system_id)
+        .map(|system| system.name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| launch.system_id.trim().to_string());
+    let work_dir = sapgui::default_work_dir()
+        .map(|dir| {
+            // SAP GUI creates this folder itself on first start; doing it here
+            // keeps the shortcut valid on a freshly installed client.
+            let _ = std::fs::create_dir_all(&dir);
+            dir.to_string_lossy().to_string()
+        })
+        .unwrap_or_default();
     let mut target = PathBuf::from(path.trim());
     if target.as_os_str().is_empty() {
         return Err(AppError::Msg("请选择快捷方式的保存位置".to_string()));
@@ -905,7 +928,10 @@ pub fn sap_export_shortcut(
     {
         target.set_extension("sap");
     }
-    sapgui::write_shortcut(&target, &sapgui::shortcut_text(&launch, &username))
+    sapgui::write_shortcut(
+        &target,
+        &sapgui::shortcut_text(&launch, &username, &description, &work_dir),
+    )
 }
 
 // ---------------------------------------------------------------------------

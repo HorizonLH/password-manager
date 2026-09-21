@@ -646,7 +646,7 @@ function sapLoginBlock(draft) {
         hint:
           "从 SAP Logon 选系统时会自动带出。手动填写：应用服务器用 /H/主机/S/端口；" +
           "登录组用 /R/系统ID/G/组名，或 /M/消息服务器/S/端口/G/组名。" +
-          "填写了 /R/ 或 /M/ 时会自动去掉 -system，避免两者冲突。",
+          "系统 ID 会一并传给 SAP GUI —— 服务组连接缺了它会被判为「缺少系统 ID」。",
       }),
       h(
         "div",
@@ -670,6 +670,12 @@ function sapLoginBlock(draft) {
               },
             }),
             h("span", null, "启动后最大化窗口（-maxgui）"),
+          ),
+          h(
+            "p",
+            { class: "form__hint" },
+            "登录成功却看不到 SAP GUI 窗口时勾上它 —— SAP GUI 会记住窗口位置，" +
+              "偶尔会把新窗口创建到屏幕外；这个参数（SAP 官方参数）会让它最大化显示。",
           ),
         ),
       ),

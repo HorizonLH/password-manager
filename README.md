@@ -113,7 +113,8 @@ SAP 账号可以配成「点一下直接打开 SAP GUI」。配置在条目的�
 
 存好之后，账号列表每行、详情页和右键菜单都会出现 **「登录 SAP GUI」**；详情页还能 **「导出快捷方式」**，
 生成一个 `.sap` 文件 —— 那是 SAP GUI 自己的快捷方式格式，双击即用，也可以直接发给同事。
-**`.sap` 文件里不含密码**（它是纯文本），打开时由 SAP GUI 自己询问。
+**`.sap` 文件里不含密码**（它是纯文本），打开时由 SAP GUI 自己询问；它**也不写连接串**，
+只写系统 ID —— SAP GUI 会去 SAP Logon 里找对应系统，所以那个系统要已经在 SAP Logon 中配置过。
 
 密码怎么交给 SAP GUI 由设置决定（「设置 → SAP GUI 登录 → 密码传递方式」）：
 
@@ -198,7 +199,9 @@ sapshcut.exe -system=PRD -client=100 -guiparm="/H/prd.example.com/S/3200" \
 ```
 
 - 客户端号不足三位会补零（`1` → `001`）；不给 `-user` 时由 SAP GUI 自己弹登录框。
-- `-guiparm` / `-gui` 有三种形态，首跳标记不能混：
+- **系统 ID 始终交给 SAP GUI**（`-system=…`）：服务组连接少了它会被直接判为「缺少系统 ID」
+  （2026-09-21 实测；社区里成熟的登录脚本同样只传 `-system` / `-client` / `-user` / `-pw` / `-language`）。
+- `-guiparm` / `-gui` 只在需要**钉住具体连接**时使用，三种形态的首跳标记不能混：
 
   | 连接方式 | 连接串 |
   | --- | --- |
@@ -207,9 +210,15 @@ sapshcut.exe -system=PRD -client=100 -guiparm="/H/prd.example.com/S/3200" \
   | 登录组（消息服务器已知时） | `/M/消息服务器/S/端口/G/组名` |
 
   登录组一定要用 `/R/` 或 `/M/` 开头——用 `/H/` 拼消息服务器会被 SAP GUI 判为连接串不正确。
-  带了 `/R/` 或 `/M/` 时**不会再传 `-system`**（两者同时出现会被判为冲突）。
   saprouter 场景在整串前面加一跳：`/H/路由器/S/端口/M/消息服务器/S/端口/G/组名`（端口默认 `3299`）；
   本项目的使用场景里没有 SAProuter，所以只做兼容、不做额外配置。
+- **窗口可见性**：SAP GUI 是异步创建窗口的，被别的程序调起时窗口可能被压在调起方后面，
+  表现就是「登录其实成功了，却没有窗口；再点一次还提示已登录」。所以启动前会调用
+  `AllowSetForegroundWindow(ASFW_ANY)` 把前台权限让给 SAP GUI，启动后由后台线程最多等 30 秒，
+  一旦出现新的 `SAP_FRONTEND_*` 会话窗口就还原并置前。
+  仍然看不到时的兜底顺序：① 勾上该条目的「启动后最大化窗口（`-maxgui`）」；
+  ② 关闭 SAP GUI 后删除注册表 `HKCU\Software\SAP\SAPGUI Front\SAP Frontend Server\Window`
+  （SAP GUI 会记住窗口位置，偶尔会把新窗口创建到屏幕外）；③ 用 `Alt+Tab` 确认窗口是不是只是被挡住。
 - `src-tauri/src/saplogon.rs` 解析登录配置：`Service` 上的 `systemid` / `server` / `msid` / `routerid` / `url`，
   以及 `Messageservers`、`Routers`、`Includes`（递归读取）和 `Workspaces`（用来显示分组路径）。
   因为同一个 `systemid` 可能出现多次，内部统一用 `service_uuid` 精确定位一条连接。
@@ -219,8 +228,12 @@ sapshcut.exe -system=PRD -client=100 -guiparm="/H/prd.example.com/S/3200" \
   （这种条目自己没有服务器信息，解析时会继承被指向的连接）；路由串可能是前缀形式
   `/H/网关/S/端口/H/`，目标主机接在它后面。`<Includes>` 指向 `http(s)://` 时会被跳过并给出提示——
   SapVault 不发起任何网络请求。
-- `src-tauri/src/sapgui.rs` 负责组装参数、启动进程、生成 `.sap`。`.sap` 是 SAP 自己的 INI 风格
-  （`[System]` / `[User]` / `[Function]` 三段，`GuiParm=` 就是连接串），以 UTF-8 写出，**不含密码**。
+- `.sap` 导出（`src-tauri/src/sapgui.rs`）：格式与 SAP GUI 自己保存的快捷方式一致
+  （2026-09-21 用实测文件核对）——`[System]` 写 `Description` / `SystemID` / `Client`（**不含连接串**，
+  SAP GUI 靠系统 ID 去 SAP Logon 里找系统），`[User]` 写 `Name` / `Language`，
+  `[Function]` 写 `Title=SAP` / `Command=<事务码，默认 S000>`，
+  再补 `[Configuration] WorkDir=<文档目录>\SAP\SAP GUI` 与 `[Options] Reuse=1`；
+  以 UTF-8 写出，**不含密码**。
 
 启动进程不使用 shell，参数原样交给 `sapshcut.exe`；`-pw=` 只在用户显式选择命令行模式时才出现，
 而且任何回显（例如提示条里的参数预览）都会把它替换成 `-pw=***`。

@@ -18,6 +18,9 @@ use std::process::Command;
 use crate::error::{AppError, AppResult};
 use crate::model::SapLaunch;
 
+/// How long we keep looking for the SAP GUI window a launch creates.
+const WINDOW_WATCH: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `-pw=<password>` on the command line (visible to other local processes).
 pub const PASSWORD_MODE_COMMAND_LINE: &str = "commandLine";
 /// Clipboard payload plus an SAP GUI login prompt (default).
@@ -92,14 +95,11 @@ pub fn build_arguments(
     let mut args: Vec<String> = Vec::new();
 
     let guiparm = launch.guiparm.trim();
-    // A `/R/` (system ID + logon group) or `/M/` (message server + logon group)
-    // connection string already names the target system, and SAP GUI rejects the
-    // combination with `-system` as contradictory. Plain `/H/<host>/S/<port>`
-    // connection strings keep the system ID.
-    let guiparm_names_the_system =
-        guiparm.contains("/R/") || guiparm.contains("/M/");
+    // The system ID is always handed over: for a logon-group connection SAP GUI
+    // reports "system ID missing" when it is omitted, even though the `/R/` or
+    // `/M/` connection string already carries the group (verified on 2026-09-21).
     let system_id = launch.system_id.trim();
-    if !system_id.is_empty() && !guiparm_names_the_system {
+    if !system_id.is_empty() {
         args.push(format!("-system={system_id}"));
     }
     let client = normalize_client(&launch.client);
@@ -145,35 +145,158 @@ fn normalize_client(value: &str) -> String {
 }
 
 /// Starts `sapshcut.exe` without a shell, so the arguments reach SAP verbatim.
+///
+/// SAP GUI builds its window asynchronously and, when it is started by another
+/// application, Windows may keep that window behind the caller — which looks
+/// exactly like "the login happened but no window appeared". Two things are done
+/// about that: SAP GUI is granted the right to take the foreground, and a
+/// watcher then raises the session window that appears after the launch.
 pub fn start(executable: &Path, arguments: &[String]) -> AppResult<()> {
+    #[cfg(windows)]
+    let existing = foreground::session_windows();
+    #[cfg(windows)]
+    foreground::allow_taking_foreground();
+
     Command::new(executable)
         .args(arguments)
         .spawn()
         .map(|_| ())
-        .map_err(|err| {
-            AppError::Msg(format!("无法启动 {}：{err}", executable.to_string_lossy()))
-        })
+        .map_err(|err| AppError::Msg(format!("无法启动 {}：{err}", executable.to_string_lossy())))?;
+
+    #[cfg(windows)]
+    std::thread::spawn(move || {
+        foreground::raise_new_session_window(&existing, WINDOW_WATCH);
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Window handling (Windows only)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod foreground {
+    use std::ffi::c_void;
+    use std::time::{Duration, Instant};
+
+    type Hwnd = *mut c_void;
+
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+    /// `ASFW_ANY`: let the next process that asks take the foreground.
+    const ASFW_ANY: u32 = u32::MAX;
+    /// SAP GUI session windows are `SAP_FRONTEND_SESSION` / `SAP_FRONTEND_*`.
+    const SESSION_CLASS_PREFIX: &str = "SAP_FRONTEND";
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(
+            callback: Option<extern "system" fn(Hwnd, isize) -> i32>,
+            param: isize,
+        ) -> i32;
+        fn GetClassNameW(hwnd: Hwnd, buffer: *mut u16, max_count: i32) -> i32;
+        fn IsIconic(hwnd: Hwnd) -> i32;
+        fn IsWindowVisible(hwnd: Hwnd) -> i32;
+        fn ShowWindow(hwnd: Hwnd, command: i32) -> i32;
+        fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+        fn AllowSetForegroundWindow(process_id: u32) -> i32;
+    }
+
+    fn class_name(hwnd: Hwnd) -> String {
+        let mut buffer = [0u16; 256];
+        let length = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+        if length <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+
+    extern "system" fn collect_sessions(hwnd: Hwnd, param: isize) -> i32 {
+        let found = unsafe { &mut *(param as *mut Vec<isize>) };
+        if class_name(hwnd).starts_with(SESSION_CLASS_PREFIX) {
+            found.push(hwnd as isize);
+        }
+        1
+    }
+
+    /// Handles of every SAP GUI session window that exists right now.
+    pub fn session_windows() -> Vec<isize> {
+        let mut found: Vec<isize> = Vec::new();
+        unsafe {
+            EnumWindows(Some(collect_sessions), &mut found as *mut Vec<isize> as isize);
+        }
+        found
+    }
+
+    /// Lets SAP GUI put its own window in front even though we started it.
+    pub fn allow_taking_foreground() {
+        unsafe {
+            AllowSetForegroundWindow(ASFW_ANY);
+        }
+    }
+
+    /// Waits for a session window that was not there before and raises it.
+    /// Returns `true` when a window was found.
+    pub fn raise_new_session_window(known: &[isize], timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            for handle in session_windows() {
+                if known.contains(&handle) {
+                    continue;
+                }
+                let hwnd = handle as Hwnd;
+                unsafe {
+                    if IsIconic(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    } else if IsWindowVisible(hwnd) == 0 {
+                        ShowWindow(hwnd, SW_SHOW);
+                    }
+                    SetForegroundWindow(hwnd);
+                }
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    }
 }
 
 /// Builds a `.sap` shortcut file.
 ///
-/// The layout is SAP's own INI style (the file SAP NetWeaver Portal hands out
-/// and `sapshcut -edit` writes). The password is deliberately not part of it:
-/// the file is plain text, and SAP GUI asks for the password by itself.
-pub fn shortcut_text(launch: &SapLaunch, username: &str) -> String {
+/// The layout follows a shortcut saved by SAP GUI itself (sample verified on
+/// 2026-09-21): `[System]` describes the connection by **system ID and client**
+/// — there is deliberately no connection string, SAP GUI resolves the server
+/// from SAP Logon — `[User]` carries the user name and language, `[Function]`
+/// the window title and start transaction, followed by `[Configuration]` and
+/// `[Options]`.
+///
+/// The password is deliberately not part of it: the file is plain text, and SAP
+/// GUI asks for the password by itself.
+pub fn shortcut_text(
+    launch: &SapLaunch,
+    username: &str,
+    description: &str,
+    work_dir: &str,
+) -> String {
+    let system_id = launch.system_id.trim();
+    let description = match description.trim() {
+        "" => system_id,
+        value => value,
+    };
     let mut lines: Vec<String> = Vec::new();
+
     lines.push("[System]".to_string());
-    let name = launch.system_id.trim();
-    if !name.is_empty() {
-        lines.push(format!("Name={name}"));
+    if !description.is_empty() {
+        lines.push(format!("Description={description}"));
+    }
+    if !system_id.is_empty() {
+        lines.push(format!("SystemID={system_id}"));
     }
     let client = normalize_client(&launch.client);
     if !client.is_empty() {
         lines.push(format!("Client={client}"));
-    }
-    let guiparm = launch.guiparm.trim();
-    if !guiparm.is_empty() {
-        lines.push(format!("GuiParm={guiparm}"));
     }
 
     let username = username.trim();
@@ -188,16 +311,32 @@ pub fn shortcut_text(launch: &SapLaunch, username: &str) -> String {
         }
     }
 
-    let transaction = launch.transaction.trim();
-    if !transaction.is_empty() {
-        lines.push("[Function]".to_string());
-        lines.push(format!("Command={transaction}"));
-        lines.push("Type=Transaction".to_string());
+    // S000 is SAP's own "SAP Easy Access" start transaction, which is what SAP
+    // GUI writes into a shortcut when no other transaction was chosen.
+    lines.push("[Function]".to_string());
+    lines.push("Title=SAP".to_string());
+    let command = launch.transaction.trim();
+    lines.push(format!(
+        "Command={}",
+        if command.is_empty() { "S000" } else { command }
+    ));
+
+    let work_dir = work_dir.trim();
+    if !work_dir.is_empty() {
+        lines.push("[Configuration]".to_string());
+        lines.push(format!("WorkDir={work_dir}"));
     }
+    lines.push("[Options]".to_string());
+    lines.push("Reuse=1".to_string());
 
     let mut text = lines.join("\r\n");
     text.push_str("\r\n");
     text
+}
+
+/// Where SAP GUI keeps its work files: `<Documents>\SAP\SAP GUI`.
+pub fn default_work_dir() -> Option<PathBuf> {
+    dirs::document_dir().map(|documents| documents.join("SAP").join("SAP GUI"))
 }
 
 /// Writes a shortcut file, creating the parent folder when needed.
@@ -279,8 +418,10 @@ mod tests {
     }
 
     #[test]
-    fn logon_group_connection_strings_replace_the_system_id() {
-        // SAP GUI treats `-system` together with `/R/` or `/M/` as contradictory.
+    fn logon_group_connection_strings_keep_the_system_id() {
+        // Verified on 2026-09-21: a logon-group connection started without
+        // `-system` makes SAP GUI complain that the system ID is missing, even
+        // though `/R/` already carries the group.
         let group = SapLaunch {
             system_id: "PRD".to_string(),
             guiparm: "/R/PRD/G/SPACE".to_string(),
@@ -288,7 +429,7 @@ mod tests {
             ..Default::default()
         };
         let args = build_arguments(&group, "USER01", "", false);
-        assert!(!args.iter().any(|arg| arg.starts_with("-system=")));
+        assert!(args.contains(&"-system=PRD".to_string()));
         assert!(args.contains(&"-guiparm=/R/PRD/G/SPACE".to_string()));
         assert!(args.contains(&"-client=100".to_string()));
 
@@ -298,7 +439,7 @@ mod tests {
             ..Default::default()
         };
         let args = build_arguments(&routed, "", "", false);
-        assert!(!args.iter().any(|arg| arg.starts_with("-system=")));
+        assert!(args.contains(&"-system=PRD".to_string()));
         assert!(args.contains(&"-guiparm=/H/10.0.0.1/S/3299/M/sapmsgsrv/S/3600/G/SPACE".to_string()));
     }
 
@@ -322,30 +463,46 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_file_uses_sap_ini_layout() {
-        let text = shortcut_text(&launch(), "USER01");
+    fn shortcut_file_matches_the_format_sap_gui_writes() {
+        let text = shortcut_text(
+            &launch(),
+            "USER01",
+            "PRD [SPACE]",
+            r"C:\Users\me\Documents\SAP\SAP GUI",
+        );
         assert!(text.starts_with("[System]\r\n"));
-        assert!(text.contains("Name=PRD\r\n"));
+        assert!(text.contains("Description=PRD [SPACE]\r\n"));
+        assert!(text.contains("SystemID=PRD\r\n"));
         assert!(text.contains("Client=001\r\n"));
-        assert!(text.contains("GuiParm=/H/sap-prd.example/S/3200\r\n"));
         assert!(text.contains("[User]\r\nName=USER01\r\nLanguage=ZH\r\n"));
-        assert!(text.contains("[Function]\r\nCommand=se80\r\nType=Transaction\r\n"));
+        assert!(text.contains("[Function]\r\nTitle=SAP\r\nCommand=se80\r\n"));
+        assert!(
+            text.contains("[Configuration]\r\nWorkDir=C:\\Users\\me\\Documents\\SAP\\SAP GUI\r\n")
+        );
+        assert!(text.contains("[Options]\r\nReuse=1\r\n"));
         assert!(text.ends_with("\r\n"));
-        // A shortcut file is plain text on disk — never put the password in it.
+        // SAP GUI looks the server up in SAP Logon by system ID, so the file must
+        // not carry a connection string — and never the password.
+        assert!(!text.contains("GuiParm"));
         assert!(!text.contains("pw="));
     }
 
     #[test]
-    fn shortcut_file_skips_sections_without_values() {
+    fn shortcut_file_defaults_to_the_easy_access_transaction() {
         let bare = SapLaunch {
             system_id: "DEV".to_string(),
             guiparm: "/H/dev.example/S/3200".to_string(),
             ..Default::default()
         };
-        let text = shortcut_text(&bare, "");
+        let text = shortcut_text(&bare, "", "", "");
+        // No description, no user, no work dir passed in → those sections shrink
+        // or fall back instead of writing empty keys.
+        assert!(text.contains("Description=DEV\r\n"));
+        assert!(text.contains("SystemID=DEV\r\n"));
+        assert!(text.contains("[Function]\r\nTitle=SAP\r\nCommand=S000\r\n"));
         assert!(!text.contains("[User]"));
-        assert!(!text.contains("[Function]"));
-        assert!(text.contains("[System]"));
+        assert!(!text.contains("[Configuration]"));
+        assert!(text.contains("[Options]\r\nReuse=1\r\n"));
     }
 
     #[test]
@@ -363,6 +520,15 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|path| path.file_name().and_then(|name| name.to_str()) == Some(EXECUTABLE)));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn session_window_lookup_is_safe_to_call() {
+        // The watcher runs on every launch; on a machine without SAP GUI the list
+        // is simply empty, and it must never panic.
+        let windows = foreground::session_windows();
+        assert!(windows.len() < 10_000);
     }
 
     #[test]
