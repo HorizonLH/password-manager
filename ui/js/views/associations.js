@@ -207,7 +207,7 @@ export function renderAssociations(container) {
       toolbar,
       h(
         "div",
-        { class: "pane__scroll" },
+        { class: "pane__scroll", dataset: { scrollKey: "associations" } },
         h(
           "div",
           { class: "stack" },

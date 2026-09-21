@@ -257,6 +257,62 @@
     hasSapLogin: false,
   };
 
+  /** SAP 账号，但还没配置登录信息 —— 详情页应给出「配置 SAP 登录」入口。 */
+  const testEntry = {
+    id: "e2",
+    title: "SAP 测试机",
+    categoryId: "sap",
+    username: "QTEST",
+    useKnoxId: false,
+    password: "QaPassw0rd",
+    notes: "测试环境专用账号，仅内部使用。",
+    favorite: false,
+    rule: null,
+    historyCycle: 0,
+    passwordHistory: [],
+    createdAt: "2026-02-01T00:00:00+08:00",
+    updatedAt: "2026-08-01T10:00:00+08:00",
+    lastUsedAt: null,
+  };
+
+  /** 非 SAP 分类的账号：详情里不应出现「同步文件」区块。 */
+  const webEntry = {
+    id: "e3",
+    title: "内部系统门户",
+    categoryId: "web",
+    username: "WEBUSER",
+    useKnoxId: false,
+    password: "WebPassw0rd!",
+    notes: "公司内网的统一入口。",
+    favorite: false,
+    rule: null,
+    historyCycle: 0,
+    passwordHistory: [],
+    createdAt: "2026-03-01T00:00:00+08:00",
+    updatedAt: "2026-08-02T10:00:00+08:00",
+    lastUsedAt: null,
+  };
+
+  const webSummary = {
+    id: "e3",
+    title: "内部系统门户",
+    categoryId: "web",
+    username: "WEBUSER",
+    notes: "公司内网的统一入口。",
+    useKnoxId: false,
+    hasPassword: true,
+    favorite: false,
+    fileCount: 0,
+    keyCount: 0,
+    hasRule: false,
+    ruleSummary: "未设置规则",
+    historyCycle: 0,
+    historyCount: 0,
+    updatedAt: "2026-08-02T10:00:00+08:00",
+    lastUsedAt: null,
+    hasSapLogin: false,
+  };
+
   const binding = (over) => ({
     bindingId: "",
     fileId: "",
@@ -277,7 +333,7 @@
       { id: "general", name: "通用账号", builtin: true, sort: 1 },
       { id: "web", name: "内部系统", builtin: false, sort: 2 },
     ],
-    entries: [summary, testSummary],
+    entries: [summary, testSummary, webSummary],
     files: [jsonFile, envFile],
     associations: [
       {
@@ -639,6 +695,12 @@
           target.favorite = !target.favorite;
           return structuredClone(vaultView);
         }
+        if (command === "entry_get") {
+          const wanted = args?.id;
+          const found =
+            [entry, testEntry, webEntry].find((item) => item.id === wanted) ?? entry;
+          return structuredClone(found);
+        }
         if (command === "entry_save") {
           const input = args?.input ?? {};
           if (input.title) {
@@ -671,6 +733,8 @@
 
   window.__FIXTURES__ = {
     entry,
+    testEntry,
+    webEntry,
     vaultView,
     settings,
     paths,

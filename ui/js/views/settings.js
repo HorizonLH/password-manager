@@ -108,6 +108,35 @@ function securityCard() {
         onChange: guard((value) => saveSettings({ autoLockMinutes: value })),
       }),
     ),
+    h(
+      "div",
+      { class: "form__row" },
+      h("label", { class: "form__label" }, "「复制用户名 + 密码」的换行符"),
+      h(
+        "div",
+        { class: "segmented" },
+        ...[
+          ["\r\n", "CRLF"],
+          ["\n", "LF"],
+          [" ", "空格"],
+        ].map(([value, label]) =>
+          h(
+            "button",
+            {
+              class: `segmented__item${settings.sapLineSeparator === value ? " is-active" : ""}`,
+              type: "button",
+              onClick: guard(() => saveSettings({ sapLineSeparator: value })),
+            },
+            label,
+          ),
+        ),
+      ),
+      h(
+        "p",
+        { class: "form__hint" },
+        "SAP GUI 会把多行文本依次填进连续的输入框：选 CRLF 或 LF 时，粘贴后用户名进第一格、密码进第二格。",
+      ),
+    ),
     checkboxField(
       "系统锁屏（Win+L）时立即锁定",
       settings.lockOnSessionLock,

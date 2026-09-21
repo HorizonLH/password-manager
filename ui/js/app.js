@@ -71,8 +71,29 @@ function restoreFocus(snapshot) {
   }
 }
 
+/** 滚动位置快照。
+ *
+ *  `render()` 每次都会重建整个外壳（`mount(root, …)`），新建的滚动容器
+ *  `scrollTop` 归零，表现就是「点一下按钮列表/设置页跳回顶部」。视图里的滚动容器
+ *  都带 `data-scroll-key`，这里在重建前记下偏移、重建后写回去。 */
+function captureScroll() {
+  const snapshot = {};
+  for (const node of root.querySelectorAll("[data-scroll-key]")) {
+    snapshot[node.dataset.scrollKey] = node.scrollTop;
+  }
+  return snapshot;
+}
+
+function restoreScroll(snapshot) {
+  for (const node of root.querySelectorAll("[data-scroll-key]")) {
+    const offset = snapshot[node.dataset.scrollKey];
+    if (offset) node.scrollTop = offset;
+  }
+}
+
 function render() {
   const snapshot = captureFocus();
+  const scroll = captureScroll();
   root.setAttribute("aria-busy", "false");
 
   if (!state.ready) {
@@ -95,6 +116,7 @@ function render() {
 
   mount(root, h("div", { class: "shell" }, sidebar(), main(), dropOverlay()));
   restoreFocus(snapshot);
+  restoreScroll(scroll);
 }
 
 /** Shown while files are dragged over the window in the sync view. */
@@ -550,8 +572,11 @@ function subtitle() {
 
 function viewContent() {
   if (state.view === "accounts") {
-    const listHost = h("div", { class: "pane__scroll" });
-    const detailHost = h("div", { class: "pane__scroll" });
+    const listHost = h("div", { class: "pane__scroll", dataset: { scrollKey: "accounts-list" } });
+    const detailHost = h("div", {
+      class: "pane__scroll",
+      dataset: { scrollKey: "accounts-detail" },
+    });
     const node = h("div", { class: "content content--split" }, listHost, detailHost);
     renderAccounts(listHost, detailHost);
     return node;
@@ -560,7 +585,10 @@ function viewContent() {
   if (state.view === "sync") renderSync(host);
   else if (state.view === "associations") renderAssociations(host);
   else if (state.view === "settings") {
-    const scroll = h("div", { class: "content content--scroll" });
+    const scroll = h("div", {
+      class: "content content--scroll",
+      dataset: { scrollKey: "settings" },
+    });
     renderSettings(scroll);
     return scroll;
   }

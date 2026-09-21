@@ -1743,6 +1743,9 @@ svg {
   background: var(--surface);
   box-shadow: var(--shadow-3);
   font-size: var(--fs-sm);
+  /* `.toasts` is click-through so it never blocks the page; each toast opts back
+     in, otherwise the click-to-dismiss handler could never fire. */
+  pointer-events: auto;
   animation: toast-in var(--dur-base) var(--ease-out);
 }
 

@@ -469,8 +469,9 @@ function detailPane(entry) {
             "复制用户名",
           ),
     ),
-    entry.sap?.systemId || entry.sap?.guiparm
-      ? h(
+    entry.categoryId === "sap"
+      ? entry.sap?.systemId || entry.sap?.guiparm
+        ? h(
           "div",
           { class: "detail__section" },
           h(
@@ -521,6 +522,30 @@ function detailPane(entry) {
               : "当前设置：打开 SAP GUI 登录界面（用户名已填好），密码已放进剪贴板，按 Ctrl+V 填入即可。",
           ),
         )
+        : h(
+            "div",
+            { class: "detail__section" },
+            h(
+              "div",
+              { class: "detail__section-head" },
+              h("div", { class: "section-title" }, icon("server", { size: 12 }), "SAP GUI 登录"),
+            ),
+            h(
+              "p",
+              { class: "form__hint" },
+              "这个账号还没有配置 SAP 登录信息（系统 ID 或连接串），所以没有一键登录和快捷方式导出。",
+            ),
+            h(
+              "button",
+              {
+                class: "btn btn--sm",
+                type: "button",
+                onClick: () => openEntryEditor({ entry }),
+              },
+              icon("sliders", { size: 13 }),
+              "配置 SAP 登录",
+            ),
+          )
       : null,
     h(
       "div",
@@ -611,45 +636,48 @@ function detailPane(entry) {
           h("p", { style: { margin: "0", whiteSpace: "pre-wrap" } }, entry.notes),
         )
       : null,
-    h(
-      "div",
-      { class: "detail__section" },
-      h(
-        "div",
-        { class: "detail__section-head" },
-        h(
+    // 同步文件是 SAP 账号专属：非 SAP 分类不显示这一块，避免让人以为通用账号也能绑定文件。
+    entry.categoryId === "sap"
+      ? h(
           "div",
-          { class: "section-title" },
-          icon("link", { size: 12 }),
-          `同步文件（${files.length}）`,
-        ),
-        h(
-          "button",
-          {
-            class: "btn btn--ghost btn--sm",
-            type: "button",
-            onClick: guard(async () => {
-              const picked = await api.pickFiles();
-              if (!picked.length) return;
-              openFileDialog({ paths: picked, entryIds: [entry.id] });
-            }),
-          },
-          icon("plus", { size: 13 }),
-          "添加文件",
-        ),
-      ),
-      files.length
-        ? h(
+          { class: "detail__section" },
+          h(
             "div",
-            { class: "stack stack--tight" },
-            files.map((file) => fileCard(entry, file)),
-          )
-        : h(
-            "p",
-            { class: "form__hint" },
-            "还没有绑定文件。点击「添加文件」选择 JSON、.env、TOML/INI、YAML 或 XML 文件，再在「同步文件」页点选密码对应的键；同步只会改写这些键的值。",
+            { class: "detail__section-head" },
+            h(
+              "div",
+              { class: "section-title" },
+              icon("link", { size: 12 }),
+              `同步文件（${files.length}）`,
+            ),
+            h(
+              "button",
+              {
+                class: "btn btn--ghost btn--sm",
+                type: "button",
+                onClick: guard(async () => {
+                  const picked = await api.pickFiles();
+                  if (!picked.length) return;
+                  openFileDialog({ paths: picked, entryIds: [entry.id] });
+                }),
+              },
+              icon("plus", { size: 13 }),
+              "添加文件",
+            ),
           ),
-    ),
+          files.length
+            ? h(
+                "div",
+                { class: "stack stack--tight" },
+                files.map((file) => fileCard(entry, file)),
+              )
+            : h(
+                "p",
+                { class: "form__hint" },
+                "还没有绑定文件。点击「添加文件」选择 JSON、.env、TOML/INI、YAML 或 XML 文件，再在「同步文件」页点选密码对应的键；同步只会改写这些键的值。",
+              ),
+        )
+      : null,
     h(
       "div",
       { class: "detail__section" },
@@ -679,6 +707,12 @@ function detailPane(entry) {
 export function renderAccounts(listHost, detailHost) {
   if (!state.vault) return;
   const entries = filterEntries();
+  // The detail pane must never describe an account that is not in the list that
+  // is currently on screen (switching category or typing a search used to leave
+  // the previous account's details behind).
+  const visibleIds = new Set(entries.map((entry) => entry.id));
+  const selected =
+    state.selectedEntry && visibleIds.has(state.selectedEntry.id) ? state.selectedEntry : null;
 
   mount(
     listHost,
@@ -703,8 +737,8 @@ export function renderAccounts(listHost, detailHost) {
         ),
   );
 
-  if (state.selectedEntry) {
-    mount(detailHost, detailPane(state.selectedEntry));
+  if (selected) {
+    mount(detailHost, detailPane(selected));
   } else {
     mount(
       detailHost,

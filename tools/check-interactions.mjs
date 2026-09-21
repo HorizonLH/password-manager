@@ -386,6 +386,79 @@ async function main() {
   await cdp.eval(clickByText("取消", ".modal__footer button"));
   await sleep(300);
 
+  // ------------------------------- 7. 分类切换 / 非 SAP 账号 / 未配置登录 --
+  await cdp.eval(clickByText("账号", ".nav__item"));
+  await sleep(300);
+  await cdp.eval(clickByText("SAP 生产机", ".row"));
+  await sleep(400);
+  const detailBefore = await cdp.eval(
+    `document.querySelector('.detail__name')?.textContent ?? ""`,
+  );
+  await cdp.eval(clickByText("通用账号", ".nav__item"));
+  await sleep(450);
+  const afterSwitch = await cdp.eval(
+    `(() => ({ name: document.querySelector('.detail__name')?.textContent ?? "", empty: !!document.querySelector('.empty__title') }))()`,
+  );
+  check(
+    "切换分类后详情不再残留上一个账号",
+    Boolean(detailBefore) && !afterSwitch.name && afterSwitch.empty,
+    `${detailBefore} -> ${JSON.stringify(afterSwitch)}`,
+  );
+
+  await cdp.eval(clickByText("内部系统", ".nav__item"));
+  await sleep(400);
+  await cdp.eval(clickByText("内部系统门户", ".row"));
+  await sleep(450);
+  const webDetail = await cdp.eval(
+    `document.querySelector('.detail')?.textContent.replace(/\\s+/g, " ") ?? ""`,
+  );
+  check(
+    "非 SAP 账号详情不显示同步文件",
+    Boolean(webDetail) &&
+      !webDetail.includes("同步文件（") &&
+      webDetail.includes("内部系统门户"),
+    webDetail.slice(0, 160),
+  );
+  check(
+    "非 SAP 账号详情不显示 SAP 登录区块",
+    !webDetail.includes("SAP GUI 登录"),
+    webDetail.slice(0, 160),
+  );
+
+  await cdp.eval(clickByText("SAP 账号", ".nav__item"));
+  await sleep(400);
+  await cdp.eval(clickByText("SAP 测试机", ".row"));
+  await sleep(450);
+  const unconfigured = await cdp.eval(
+    `document.querySelector('.detail')?.textContent.replace(/\\s+/g, " ") ?? ""`,
+  );
+  check(
+    "未配置登录的 SAP 账号给出配置入口",
+    unconfigured.includes("SAP GUI 登录") && unconfigured.includes("配置 SAP 登录"),
+    unconfigured.slice(0, 200),
+  );
+  check(
+    "未配置登录的 SAP 账号不显示登录按钮",
+    !unconfigured.includes("导出快捷方式"),
+    unconfigured.slice(0, 160),
+  );
+
+  // ---------------------------------------------- 8. 滚动位置在重绘后保留 --
+  const scroller = `document.querySelector('[data-scroll-key="accounts-detail"]')`;
+  await cdp.eval(`${scroller}.scrollTop = 240`);
+  await sleep(150);
+  const scrolledTo = await cdp.eval(`${scroller}.scrollTop`);
+  await cdp.eval(
+    `document.querySelector('.row__actions button[title$="收藏"]')?.click()`,
+  );
+  await sleep(500);
+  const keptScroll = await cdp.eval(`${scroller}.scrollTop`);
+  check(
+    "详情面板滚动位置在重渲染后保留",
+    scrolledTo > 100 && Math.abs(keptScroll - scrolledTo) <= 2,
+    `${scrolledTo} -> ${keptScroll}`,
+  );
+
   // ------------------------------------------------------- 5. 钥匙图标重画 --
   const keyIcon = await cdp.eval(
     `(() => { const svg = document.querySelector('.brand__mark svg'); return svg ? svg.outerHTML : null; })()`,

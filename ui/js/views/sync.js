@@ -65,6 +65,20 @@ function planFor(fileId) {
   return state.filePlans?.[fileId];
 }
 
+/** Which file list we already asked plans for, so the request happens once per
+ *  change instead of on every render. */
+let plannedSignature = "";
+
+/** Loads the sync plan of every uploaded file, so the list shows the real status
+ *  right away instead of "—" until the user presses 重新检测. */
+function requestMissingPlans(files) {
+  const signature = files.map((file) => file.id).join("|");
+  if (signature === plannedSignature) return;
+  if (files.every((file) => planFor(file.id))) return;
+  plannedSignature = signature;
+  loadFilePlans().catch(() => {});
+}
+
 /** Password values are masked unless masking is off in settings, or the user
  *  pressed the per-file 「显示密码值」 toggle. */
 function revealValues() {
@@ -227,7 +241,7 @@ function fileList(files) {
     ),
     h(
       "div",
-      { class: "pane__scroll pane__scroll--tight" },
+      { class: "pane__scroll pane__scroll--tight", dataset: { scrollKey: "sync-list" } },
       files.length
         ? h(
             "div",
@@ -331,7 +345,7 @@ function detailPane(file) {
     ),
     h(
       "div",
-      { class: "pane__scroll" },
+      { class: "pane__scroll", dataset: { scrollKey: "sync-detail" } },
       h(
         "div",
         { class: "stack" },
@@ -393,13 +407,8 @@ export function renderSync(container) {
   const files = vault.files ?? [];
   if (!state.syncSelection && files.length) {
     state.syncSelection = files[0].id;
-    if (!planFor(files[0].id)) {
-      api
-        .filePlan(files[0].id)
-        .then((plan) => setState({ filePlans: { ...state.filePlans, [plan.fileId]: plan } }))
-        .catch(() => {});
-    }
   }
+  requestMissingPlans(files);
   const selected = files.find((file) => file.id === state.syncSelection) ?? files[0];
   mount(
     container,
