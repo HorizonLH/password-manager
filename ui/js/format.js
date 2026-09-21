@@ -121,5 +121,31 @@ export const PASSWORD_MODE_LABELS = {
   commandLine: "命令行明文",
 };
 
+/** 备注里的链接。只认 http / https / mailto，其它一律当普通文本。 */
+const LINK_PATTERN = /\b(?:https?:\/\/|mailto:)[^\s<>"'）)】]+/gi;
+/** 结尾常见的中英文标点不属于链接本身。 */
+const LINK_TRAILING = /[.,;:!?、。；：！？）)】\]]+$/;
+
+/** Splits text into `{ text }` / `{ url }` parts so links can be rendered as
+ *  real anchors while everything else stays plain text. */
+export function splitLinks(value) {
+  const text = String(value ?? "");
+  const parts = [];
+  let cursor = 0;
+  for (const match of text.matchAll(LINK_PATTERN)) {
+    const start = match.index ?? 0;
+    const raw = match[0];
+    const url = raw.replace(LINK_TRAILING, "");
+    if (url.length <= 8) continue;
+    if (start > cursor) parts.push({ text: text.slice(cursor, start) });
+    parts.push({ url });
+    const trailing = raw.slice(url.length);
+    if (trailing) parts.push({ text: trailing });
+    cursor = start + raw.length;
+  }
+  if (cursor < text.length) parts.push({ text: text.slice(cursor) });
+  return parts;
+}
+
 /** Key names that get flagged as 「疑似密码」 when a file is parsed. */
 export const PASSWORD_KEY_HINT = "password / passwd / pwd / secret / passwort / kennwort / token";

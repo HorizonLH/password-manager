@@ -169,7 +169,9 @@
     username: "JDOE",
     useKnoxId: true,
     password: "NewPassw0rd!",
-    notes: "每季度轮换，注意不要与最近 5 次重复。",
+    notes:
+      "每季度轮换，注意不要与最近 5 次重复。\n" +
+      "口令策略见 https://wiki.example.com/sap/password-policy ，工单模板在 https://wiki.example.com/sap/ticket 。",
     favorite: true,
     rule: {
       enabled: true,
@@ -644,6 +646,8 @@
 
   /** Minimal event bus, so the audit can replay window events (drag & drop,
    *  vault:locked) exactly the way the Tauri backend emits them. */
+  /** Links the UI asked the backend to open, so tests can assert on them. */
+  const openedLinks = [];
   const listeners = new Map();
   const listen = (event, handler) => {
     const set = listeners.get(event) ?? new Set();
@@ -721,6 +725,22 @@
         }
         if (command.startsWith("copy_")) return "已复制";
 
+        if (command === "open_link") {
+          openedLinks.push(args?.url ?? "");
+          return null;
+        }
+        if (command === "file_bind") {
+          const file = [jsonFile, envFile].find((item) => item.id === args?.fileId);
+          if (file) {
+            file.bindings = (args?.bindings ?? []).map((binding, index) => ({
+              id: `${file.id}-b${index}`,
+              keyPath: binding.keyPath,
+              entryId: binding.entryId,
+            }));
+          }
+          return structuredClone(vaultView);
+        }
+
         if (command === "pick_files") return [];
         if (command === "pick_folder" || command === "pick_save_file") return "";
         if (command === "open_in_explorer" || command === "open_path") return null;
@@ -744,6 +764,7 @@
     envFile,
     jsonPlan,
     envPlan,
+    openedLinks,
     emit,
   };
 })();

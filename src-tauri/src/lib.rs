@@ -93,6 +93,7 @@ pub fn run() {
             commands::file_preview,
             commands::open_in_explorer,
             commands::open_path,
+            commands::open_link,
             commands::file_plan,
             commands::file_plans,
             commands::file_sync,

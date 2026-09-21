@@ -15,6 +15,7 @@ import { confirmModal, openModal } from "../modal.js";
 import { toast } from "../toast.js";
 import { formatBytes, formatLabel, formatTime, mask } from "../format.js";
 import { openFileDialog, openFileKeys } from "./filedialog.js";
+import { searchSelect } from "../combobox.js";
 
 const ACTIONS = {
   update: ["将更新", "tag--accent"],
@@ -87,28 +88,28 @@ function revealValues() {
 
 function accountOptions(file, keyPath) {
   const current = file.bindings.find((binding) => binding.keyPath === keyPath)?.entryId ?? "";
-  const options = [h("option", { value: "", selected: current === "" }, "未绑定")];
-  for (const entry of state.vault?.entries ?? []) {
-    if (entry.categoryId !== "sap") continue;
-    options.push(
-      h("option", { value: entry.id, selected: entry.id === current }, entry.title),
-    );
-  }
-  return h(
-    "select",
-    {
-      class: "select select--sm",
-      onChange: guard(async (event) => {
-        const next = file.bindings.filter((binding) => binding.keyPath !== keyPath);
-        if (event.target.value) {
-          next.push({ keyPath, entryId: event.target.value });
-        }
-        await bindFile(file.id, next);
-        selectFile(file.id);
-      }),
-    },
+  // SAP accounts can number in the hundreds, so this is a searchable picker
+  // instead of a native select (see ui/js/combobox.js).
+  const options = (state.vault?.entries ?? [])
+    .filter((entry) => entry.categoryId === "sap")
+    .map((entry) => ({
+      value: entry.id,
+      label: entry.title,
+      hint: entry.username || "",
+    }));
+  return searchSelect({
     options,
-  );
+    value: current,
+    emptyLabel: "未绑定",
+    searchPlaceholder: `搜索账号（共 ${options.length} 个）`,
+    small: true,
+    onSelect: guard(async (next) => {
+      const bindings = file.bindings.filter((binding) => binding.keyPath !== keyPath);
+      if (next) bindings.push({ keyPath, entryId: next });
+      await bindFile(file.id, bindings);
+      selectFile(file.id);
+    }),
+  });
 }
 
 function valueRow(file, value, label, planRow) {

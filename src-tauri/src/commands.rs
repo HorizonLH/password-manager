@@ -1203,6 +1203,40 @@ pub fn open_path(path: String) -> AppResult<()> {
     }
 }
 
+/// Opens a link from a note with the system's default handler.
+///
+/// Only `http`, `https` and `mailto` are accepted: a note is user text, and it
+/// must never be able to launch an arbitrary command through the shell. The
+/// value is passed as a single argument to `rundll32 url.dll,FileProtocolHandler`
+/// (no shell), which is the documented way to reach the default browser.
+#[tauri::command]
+pub fn open_link(url: String) -> AppResult<()> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let allowed = lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:");
+    if !allowed || trimmed.chars().any(|ch| ch.is_control()) {
+        return Err(AppError::Msg(
+            "只支持 http / https / mailto 链接".to_string(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| AppError::Msg(format!("无法打开链接：{err}")))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = trimmed;
+        Err(AppError::Msg("仅支持 Windows".to_string()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sync targets
 // ---------------------------------------------------------------------------

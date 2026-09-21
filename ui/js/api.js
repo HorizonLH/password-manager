@@ -75,6 +75,7 @@ export const api = {
   filePreview: (path, limit) => invoke("file_preview", { path, limit }),
   openInExplorer: (path) => invoke("open_in_explorer", { path }),
   openPath: (path) => invoke("open_path", { path }),
+  openLink: (url) => invoke("open_link", { url }),
 
   filePlan: (fileId) => invoke("file_plan", { fileId }),
   filePlans: () => invoke("file_plans"),

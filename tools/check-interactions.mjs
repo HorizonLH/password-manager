@@ -459,6 +459,74 @@ async function main() {
     `${scrolledTo} -> ${keptScroll}`,
   );
 
+  // ------------------------------------------------- 9. 备注链接 / 绑定下拉 --
+  await cdp.eval(clickByText("账号", ".nav__item"));
+  await sleep(400);
+  await cdp.eval(clickByText("SAP 生产机", ".row"));
+  await sleep(450);
+  const noteLink = await cdp.eval(
+    `(() => { const a = document.querySelector('.notes__link'); return a ? { text: a.textContent, href: a.getAttribute('href'), tag: a.tagName } : null; })()`,
+  );
+  check(
+    "备注里的链接渲染成可点元素且不带 href",
+    Boolean(noteLink) &&
+      noteLink.text.startsWith("https://wiki.example.com/") &&
+      noteLink.href === null &&
+      noteLink.tag === "A",
+    JSON.stringify(noteLink),
+  );
+  await cdp.eval(
+    `window.__FIXTURES__.openedLinks.length = 0; document.querySelector('.notes__link')?.click()`,
+  );
+  await sleep(400);
+  const opened = await cdp.eval(`window.__FIXTURES__.openedLinks`);
+  check(
+    "点备注链接会交给系统浏览器打开",
+    Array.isArray(opened) && opened.length === 1 && opened[0].startsWith("https://wiki.example.com/"),
+    JSON.stringify(opened),
+  );
+
+  await cdp.eval(clickByText("同步文件", ".nav__item"));
+  await sleep(500);
+  await cdp.eval(
+    `document.querySelectorAll('.combo__control')[0]?.click()`,
+  );
+  await sleep(300);
+  const comboOpen = await cdp.eval(
+    `(() => { const panel = document.querySelector('.combo__panel'); return panel ? { options: panel.querySelectorAll('.combo__option').length, hasSearch: !!panel.querySelector('.combo__search') } : null; })()`,
+  );
+  check(
+    "绑定账号的下拉可搜索",
+    Boolean(comboOpen) && comboOpen.hasSearch && comboOpen.options >= 2,
+    JSON.stringify(comboOpen),
+  );
+  await cdp.eval(
+    `(() => { const input = document.querySelector('.combo__search'); input.value = "测试"; input.dispatchEvent(new Event('input', { bubbles: true })); })()`,
+  );
+  await sleep(300);
+  const filtered = await cdp.eval(
+    `(() => { const rows = [...document.querySelectorAll('.combo__option')].map((n) => n.textContent.trim()); return rows; })()`,
+  );
+  check(
+    "输入关键字后只留下匹配的账号",
+    Array.isArray(filtered) &&
+      filtered.some((text) => text.includes("SAP 测试机")) &&
+      !filtered.some((text) => text.includes("内部系统门户")),
+    JSON.stringify(filtered),
+  );
+  await cdp.eval(
+    `(() => { const row = [...document.querySelectorAll('.combo__option')].find((n) => n.textContent.includes("SAP 测试机")); row?.click(); })()`,
+  );
+  await sleep(600);
+  const boundLabel = await cdp.eval(
+    `document.querySelector('.combo__value')?.textContent ?? ""`,
+  );
+  check(
+    "选中后绑定生效并回显账号名",
+    boundLabel.includes("SAP 测试机"),
+    String(boundLabel),
+  );
+
   // ------------------------------------------------------- 5. 钥匙图标重画 --
   const keyIcon = await cdp.eval(
     `(() => { const svg = document.querySelector('.brand__mark svg'); return svg ? svg.outerHTML : null; })()`,

@@ -29,6 +29,7 @@ import {
   launchSummary,
   mask,
   ruleSummary,
+  splitLinks,
 } from "../format.js";
 import { openEntryEditor } from "./editor.js";
 import { openFileDialog, openFileKeys } from "./filedialog.js";
@@ -633,7 +634,35 @@ function detailPane(entry) {
           "div",
           { class: "detail__section" },
           h("div", { class: "section-title" }, icon("file", { size: 12 }), "备注"),
-          h("p", { style: { margin: "0", whiteSpace: "pre-wrap" } }, entry.notes),
+          // 备注里的链接直接可点：用不带 href 的 <a>，点击交给后端用系统默认浏览器打开，
+          // 避免 WebView 自己导航离开应用。
+          h(
+            "p",
+            { class: "notes" },
+            splitLinks(entry.notes).map((part) =>
+              part.url
+                ? h(
+                    "a",
+                    {
+                      class: "notes__link",
+                      role: "link",
+                      tabindex: "0",
+                      title: `用默认浏览器打开：${part.url}`,
+                      onClick: (event) => {
+                        event.preventDefault();
+                        guard(() => api.openLink(part.url))();
+                      },
+                      onKeydown: (event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        guard(() => api.openLink(part.url))();
+                      },
+                    },
+                    part.url,
+                  )
+                : part.text,
+            ),
+          ),
         )
       : null,
     // 同步文件是 SAP 账号专属：非 SAP 分类不显示这一块，避免让人以为通用账号也能绑定文件。
