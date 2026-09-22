@@ -589,6 +589,23 @@ async function main() {
     JSON.stringify({ controlPoint, panelHit, optionPoint, tableState }),
   );
 
+  // 面板内部的滚动不能把下拉框关掉（选项多的时候要能滚），页面滚动才关。
+  await cdp.eval(`document.querySelector('.combo__control')?.click()`);
+  await sleep(350);
+  const scrollInside = await cdp.eval(`(() => {
+    const options = document.querySelector('#combo-root .combo__options');
+    if (!options) return null;
+    options.scrollTop = 8;
+    options.dispatchEvent(new Event("scroll", { bubbles: true }));
+    return !!document.querySelector('#combo-root .combo__panel');
+  })()`);
+  check("滚动下拉框内容不会把它关掉", scrollInside === true, String(scrollInside));
+  const scrollOutside = await cdp.eval(`(() => {
+    document.querySelector('.pane__scroll')?.dispatchEvent(new Event("scroll", { bubbles: true }));
+    return !document.querySelector('#combo-root .combo__panel');
+  })()`);
+  check("滚动页面会关掉下拉框", scrollOutside === true, String(scrollOutside));
+
   // ------------------------------------------------------- 5. 钥匙图标重画 --
   const keyIcon = await cdp.eval(
     `(() => { const svg = document.querySelector('.brand__mark svg'); return svg ? svg.outerHTML : null; })()`,

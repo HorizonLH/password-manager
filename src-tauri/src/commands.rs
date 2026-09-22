@@ -1161,24 +1161,61 @@ pub fn open_in_explorer(path: String) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        if target.is_dir() {
-            std::process::Command::new("explorer")
-                .arg(target.as_os_str())
-                .spawn()
-                .map_err(|err| AppError::Msg(format!("无法打开资源管理器：{err}")))?;
-        } else {
-            let argument = format!("/select,{}", target.to_string_lossy());
-            std::process::Command::new("explorer")
-                .arg(argument)
-                .spawn()
-                .map_err(|err| AppError::Msg(format!("无法打开资源管理器：{err}")))?;
-        }
+        use std::os::windows::process::CommandExt;
+
+        // The argument is passed verbatim: Explorer only understands
+        // `/select,"<path>"`, and Rust's automatic quoting would otherwise wrap
+        // the whole `/select,…` switch in quotes — Explorer then ignores it and
+        // opens the default folder (Documents) instead of the file.
+        std::process::Command::new("explorer")
+            .raw_arg(explorer_argument(&target))
+            .spawn()
+            .map_err(|err| AppError::Msg(format!("无法打开资源管理器：{err}")))?;
         Ok(())
     }
     #[cfg(not(windows))]
     {
         let _ = target;
         Err(AppError::Msg("仅支持 Windows".to_string()))
+    }
+}
+
+/// The single argument Explorer needs: the folder itself, or `/select,` plus the
+/// quoted file path (quotes are part of the argument, not of the shell).
+#[cfg(windows)]
+fn explorer_argument(target: &Path) -> String {
+    if target.is_dir() {
+        format!("\"{}\"", target.to_string_lossy())
+    } else {
+        format!("/select,\"{}\"", target.to_string_lossy())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod explorer_tests {
+    use super::explorer_argument;
+    use std::path::Path;
+
+    #[test]
+    fn a_file_is_selected_with_a_quoted_path() {
+        // Explorer ignores `/select,` when the whole switch ends up quoted (which
+        // is what Rust's automatic quoting does for paths with spaces) and then
+        // opens Documents instead of the file — the bug this guards against.
+        let argument = explorer_argument(Path::new(r"C:\Users\me\My Config\sap.json"));
+        assert_eq!(argument, "/select,\"C:\\Users\\me\\My Config\\sap.json\"");
+        assert!(
+            !argument.starts_with('"'),
+            "the switch must stay outside the quotes: {argument}"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_opened_without_the_select_switch() {
+        let directory = std::env::temp_dir();
+        assert_eq!(
+            explorer_argument(&directory),
+            format!("\"{}\"", directory.to_string_lossy())
+        );
     }
 }
 

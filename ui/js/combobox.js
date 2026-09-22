@@ -48,7 +48,17 @@ function installGlobalClose() {
     },
     true,
   );
-  document.addEventListener("scroll", () => openInstance?.close(), true);
+  // Scrolling *inside* the panel (its option list is scrollable) must not close
+  // it; only a scroll of the page behind it means the anchor moved away.
+  document.addEventListener(
+    "scroll",
+    (event) => {
+      if (!openInstance) return;
+      if (openInstance.panel && openInstance.panel.contains(event.target)) return;
+      openInstance.close();
+    },
+    true,
+  );
   window.addEventListener("resize", () => openInstance?.close());
   window.addEventListener("blur", () => openInstance?.close());
 }
