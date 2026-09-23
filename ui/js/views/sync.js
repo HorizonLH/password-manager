@@ -227,7 +227,11 @@ function structureView(file, plan) {
   }
   const format = file.analysis?.format ?? "";
   const counter = term
-    ? h("span", { class: "tag tag--accent" }, `${values.length} / ${all.length} 个键匹配`)
+    ? h(
+        "div",
+        { class: "token-list" },
+        h("span", { class: "tag tag--accent" }, `${values.length} / ${all.length} 个键匹配`),
+      )
     : null;
   if (TREE_FORMATS.has(format)) {
     return h(
