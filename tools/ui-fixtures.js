@@ -648,6 +648,10 @@
    *  vault:locked) exactly the way the Tauri backend emits them. */
   /** Links the UI asked the backend to open, so tests can assert on them. */
   const openedLinks = [];
+  /** Paths handed back by `pick_files`; empty unless a check asks for one. */
+  let pickFiles = [];
+  /** Result of the last `vault_import` call (see the handler above). */
+  let imported = null;
   const listeners = new Map();
   const listen = (event, handler) => {
     const set = listeners.get(event) ?? new Set();
@@ -716,6 +720,9 @@
             summary.favorite = input.favorite;
           }
           if (input.password) entry.password = input.password;
+          // Notes are the field the editor used to drop: keep them so the
+          // interaction check can prove the round trip survives a save.
+          if (typeof input.notes === "string") entry.notes = input.notes;
           if (input.sap !== undefined) {
             entry.sap = input.sap;
             summary.hasSapLogin = Boolean(input.sap?.systemId || input.sap?.guiparm);
@@ -741,7 +748,18 @@
           return structuredClone(vaultView);
         }
 
-        if (command === "pick_files") return [];
+        // Importing an encrypted vault is the one flow that needs a real path
+        // back from the file picker; the interaction check sets it explicitly
+        // through `__FIXTURES__.setPickFiles`.
+        if (command === "vault_import") {
+          const password = args?.password ?? null;
+          if (!password) throw new Error("该保险库需要主密码");
+          if (password !== "Import#2026") throw new Error("主密码不正确");
+          imported = { path: args?.path ?? "", password };
+          return null;
+        }
+
+        if (command === "pick_files") return [...pickFiles];
         if (command === "pick_folder" || command === "pick_save_file") return "";
         if (command === "open_in_explorer" || command === "open_path") return null;
         if (command in responses) return structuredClone(responses[command]);
@@ -765,6 +783,12 @@
     jsonPlan,
     envPlan,
     openedLinks,
+    get imported() {
+      return imported;
+    },
+    setPickFiles(paths) {
+      pickFiles = Array.isArray(paths) ? [...paths] : [];
+    },
     emit,
   };
 })();

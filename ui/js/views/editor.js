@@ -15,6 +15,7 @@ import {
   refreshLandscape,
 } from "../state.js";
 import { confirmModal, openModal } from "../modal.js";
+import { selectMenu } from "../combobox.js";
 import { toast } from "../toast.js";
 import { formatTime, mask, ruleSummary, systemLabel, systemTarget } from "../format.js";
 
@@ -49,22 +50,49 @@ function field(label, control, hint) {
   );
 }
 
+/** Sections the editor opens with; everything else starts collapsed, so the
+ *  common case (change the title or the password) needs no scrolling. */
+const FOLD_OPEN_BY_DEFAULT = new Set(["基本信息", "凭据"]);
+
+/** Expansion state lives outside the render functions: keeping it in a local
+ *  variable would be reset by the next re-render, and reopening the editor
+ *  should not forget what was left open either. */
+const foldState = new Map();
+
+/** A collapsible card. The body stays in the DOM (`hidden`) so the async
+ *  repaints inside it keep working while the section is closed. */
 function section(title, iconName, hint, ...children) {
-  return h(
-    "section",
-    { class: "card card--flat" },
+  const body = h("div", { class: "fold__body" }, ...children);
+  let open = foldState.get(title) ?? FOLD_OPEN_BY_DEFAULT.has(title);
+  const head = h(
+    "button",
+    {
+      class: "fold__head",
+      type: "button",
+      "aria-expanded": open ? "true" : "false",
+      onClick: () => setOpen(!open),
+    },
+    h("span", { class: "fold__chevron" }, icon("chevronRight", { size: 13 })),
     h(
-      "div",
-      { class: "card__head" },
-      h(
-        "div",
-        null,
-        h("h3", { class: "card__title" }, icon(iconName, { size: 15 }), title),
-        hint ? h("p", { class: "card__hint" }, hint) : null,
-      ),
+      "span",
+      { class: "fold__heading" },
+      h("span", { class: "fold__title" }, icon(iconName, { size: 15 }), title),
+      hint ? h("span", { class: "fold__hint" }, hint) : null,
     ),
-    ...children,
   );
+  const node = h("section", { class: `card card--flat fold${open ? " is-open" : ""}` });
+
+  function setOpen(next) {
+    open = next;
+    foldState.set(title, next);
+    head.setAttribute("aria-expanded", next ? "true" : "false");
+    node.classList.toggle("is-open", next);
+    body.hidden = !next;
+  }
+
+  body.hidden = !open;
+  mount(node, head, body);
+  return node;
 }
 
 function strengthMeter() {
@@ -442,7 +470,7 @@ function historySection(draft, repaintEditor) {
       entryId
         ? h(
             "div",
-            { class: "form__grid" },
+            { class: "form__grid form__grid--action" },
             field(
               "手动补录",
               h("input", {
@@ -466,11 +494,13 @@ function historySection(draft, repaintEditor) {
             h(
               "div",
               { class: "form__row" },
-              h("label", { class: "form__label" }, " "),
+              // Empty label: keeps the button on the same baseline as the two
+              // inputs next to it instead of dropping it to the bottom.
+              h("span", { class: "form__label", "aria-hidden": "true" }, "\u00a0"),
               h(
                 "button",
                 {
-                  class: "btn btn--sm",
+                  class: "btn",
                   type: "button",
                   onClick: guard(async () => {
                     if (!newPassword.value) {
@@ -572,25 +602,20 @@ function sapLoginBlock(draft) {
     const selected = systems.some((item) => item.serviceUuid === draft.sap.serviceUuid)
       ? draft.sap.serviceUuid
       : "";
-    const picker = h(
-      "select",
-      { id: "editor-sap-system", class: "select" },
-      h(
-        "option",
-        { value: "" },
-        systems.length ? "（从 SAP Logon 选择系统）" : "（没有读到 SAP Logon 的系统）",
-      ),
-      systems.map((system) =>
-        h(
-          "option",
-          { value: system.serviceUuid, selected: system.serviceUuid === selected },
-          `${systemLabel(system)}${duplicates.has(system.systemId) ? "（同名）" : ""} · ${systemTarget(system)}`,
-        ),
-      ),
-    );
-    picker.addEventListener("change", () => {
-      pickSystem(picker.value);
-      repaint();
+    const picker = selectMenu({
+      id: "editor-sap-system",
+      options: systems.map((system) => ({
+        value: system.serviceUuid,
+        label: `${systemLabel(system)}${duplicates.has(system.systemId) ? "（同名）" : ""}`,
+        hint: systemTarget(system),
+      })),
+      value: selected,
+      emptyLabel: systems.length ? "（从 SAP Logon 选择系统）" : "（没有读到 SAP Logon 的系统）",
+      searchPlaceholder: "搜索系统…",
+      onSelect: (next) => {
+        pickSystem(next);
+        repaint();
+      },
     });
 
     const landscape = state.landscape;
@@ -843,22 +868,25 @@ export function openEntryEditor({ entry, defaultCategory, onSaved }) {
     },
   });
 
-  const categorySelect = h("select", {
-    class: "select",
-    onChange: (event) => {
-      draft.categoryId = event.target.value;
+  // Categories are a short fixed list, so this is the same control as the
+  // searchable account picker minus the filter box (see ui/js/combobox.js).
+  const categorySelect = selectMenu({
+    id: "editor-category",
+    options: (state.vault?.categories ?? []).map((category) => ({
+      value: category.id,
+      label: category.name,
+    })),
+    value: draft.categoryId,
+    empty: false,
+    emptyLabel: "选择分类",
+    searchPlaceholder: "搜索分类…",
+    onSelect: (next) => {
+      draft.categoryId = next;
       // The SAP block only applies to SAP accounts, and a new entry may be
       // switched into that category while the editor is open.
       sapLogin.repaint();
     },
   });
-  mount(
-    categorySelect,
-    (state.vault?.categories ?? []).map((category) =>
-      h("option", { value: category.id }, category.name),
-    ),
-  );
-  categorySelect.value = draft.categoryId;
 
   const history = historySection(draft, () => onSaved?.());
   const sapLogin = sapLoginBlock(draft);

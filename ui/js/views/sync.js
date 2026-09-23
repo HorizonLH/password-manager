@@ -152,7 +152,7 @@ function buildTree(values) {
   return root;
 }
 
-function treeNode(file, node, planRows, depth) {
+function treeNode(file, node, planRows, depth, forceOpen = false) {
   return h(
     "div",
     { class: "tree__branch" },
@@ -164,7 +164,9 @@ function treeNode(file, node, planRows, depth) {
         "details",
         {
           class: "tree__details",
-          open: branchOpen(file.id, child.path, depth),
+          // While filtering, every branch is expanded: the matching keys are
+          // what the user is after, not the shape of the document.
+          open: forceOpen || branchOpen(file.id, child.path, depth),
           onToggle: (event) => rememberBranch(file.id, child.path, event.target.open),
         },
         h(
@@ -173,49 +175,96 @@ function treeNode(file, node, planRows, depth) {
           icon("chevronRight", { size: 12, class: "tree__chevron" }),
           h("span", { class: "tree__name" }, child.name),
         ),
-        treeNode(file, child, planRows, depth + 1),
+        treeNode(file, child, planRows, depth + 1, forceOpen),
       ),
     ),
   );
 }
 
+/** The keys of one file, narrowed down by the filter box. Dozens of keys is the
+ *  normal case for a .env or a landscape fragment, and scrolling a tree to find
+ *  one key does not scale. */
+function keyFilterTerm() {
+  return (state.syncKeyFilter ?? "").trim().toLowerCase();
+}
+
+function matchingValues(values) {
+  const term = keyFilterTerm();
+  if (!term) return values;
+  return values.filter((value) =>
+    `${value.path} ${value.value}`.toLowerCase().includes(term),
+  );
+}
+
 function structureView(file, plan) {
-  const values = file.analysis?.values ?? [];
-  if (!values.length) {
+  const all = file.analysis?.values ?? [];
+  if (!all.length) {
     return h(
       "p",
       { class: "form__hint" },
       file.analysis?.error ?? "没有解析到键值对。",
     );
   }
+  const term = keyFilterTerm();
+  const values = matchingValues(all);
   const planRows = new Map((plan?.rows ?? []).map((row) => [row.keyPath, row]));
+  if (!values.length) {
+    return h(
+      "div",
+      { class: "stack stack--tight" },
+      h(
+        "p",
+        { class: "form__hint" },
+        `没有匹配「${state.syncKeyFilter}」的键（共 ${all.length} 个键）。`,
+      ),
+      h(
+        "button",
+        { class: "btn btn--sm", type: "button", onClick: () => setState({ syncKeyFilter: "" }) },
+        icon("x", { size: 13 }),
+        "清除筛选",
+      ),
+    );
+  }
   const format = file.analysis?.format ?? "";
+  const counter = term
+    ? h("span", { class: "tag tag--accent" }, `${values.length} / ${all.length} 个键匹配`)
+    : null;
   if (TREE_FORMATS.has(format)) {
-    return h("div", { class: "tree" }, treeNode(file, buildTree(values), planRows, 0));
+    return h(
+      "div",
+      { class: "stack stack--tight" },
+      counter,
+      h("div", { class: "tree" }, treeNode(file, buildTree(values), planRows, 0, Boolean(term))),
+    );
   }
   return h(
     "div",
-    { class: "table" },
+    { class: "stack stack--tight" },
+    counter,
     h(
       "div",
-      { class: "table__row table__head", style: { "--table-cols": "1.3fr 1.4fr 80px 150px" } },
-      h("span", { class: "table__cell" }, "键"),
-      h("span", { class: "table__cell" }, "值"),
-      h("span", { class: "table__cell" }, "行"),
-      h("span", { class: "table__cell" }, "绑定账号"),
-    ),
-    values.map((value) =>
+      { class: "table" },
       h(
         "div",
-        { class: "table__row", style: { "--table-cols": "1.3fr 1.4fr 80px 150px" } },
-        h("span", { class: "table__cell table__cell--mono", title: value.path }, value.path),
+        { class: "table__row table__head", style: { "--table-cols": "1.3fr 1.4fr 80px 150px" } },
+        h("span", { class: "table__cell" }, "键"),
+        h("span", { class: "table__cell" }, "值"),
+        h("span", { class: "table__cell" }, "行"),
+        h("span", { class: "table__cell" }, "绑定账号"),
+      ),
+      values.map((value) =>
         h(
-          "span",
-          { class: "table__cell table__cell--mono" },
-          value.passwordCandidate ? mask(value.value, revealValues()) : value.value,
+          "div",
+          { class: "table__row", style: { "--table-cols": "1.3fr 1.4fr 80px 150px" } },
+          h("span", { class: "table__cell table__cell--mono", title: value.path }, value.path),
+          h(
+            "span",
+            { class: "table__cell table__cell--mono" },
+            value.passwordCandidate ? mask(value.value, revealValues()) : value.value,
+          ),
+          h("span", { class: "table__cell subtle" }, String(value.line)),
+          h("span", { class: "table__cell" }, accountOptions(file, value.path)),
         ),
-        h("span", { class: "table__cell subtle" }, String(value.line)),
-        h("span", { class: "table__cell" }, accountOptions(file, value.path)),
       ),
     ),
   );
@@ -394,6 +443,20 @@ function detailPane(file) {
                   `${bindings.length} 个键。`,
               ),
             ),
+          ),
+          // Filters the key list below; `Ctrl+K` focuses it (see bindShortcuts).
+          h(
+            "div",
+            { class: "search" },
+            h("span", { class: "search__icon" }, icon("search", { size: 14 })),
+            h("input", {
+              id: "sync-key-filter",
+              class: "search__input",
+              placeholder: "筛选键：按键路径或值匹配（Ctrl+K）",
+              title: "按键路径或值筛选",
+              value: state.syncKeyFilter ?? "",
+              onInput: (event) => setState({ syncKeyFilter: event.target.value }),
+            }),
           ),
           structureView(file, plan),
         ),

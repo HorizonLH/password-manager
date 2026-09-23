@@ -2,7 +2,7 @@ import { h, guard, mount } from "../dom.js";
 import { icon } from "../icons.js";
 import { api } from "../api.js";
 import { state, setState, saveSettings, refreshLandscape, refreshGuiStatus } from "../state.js";
-import { confirmModal, openModal } from "../modal.js";
+import { confirmModal, openModal, promptModal } from "../modal.js";
 import { toast } from "../toast.js";
 
 function card(title, iconName, hint, ...children) {
@@ -804,15 +804,27 @@ function dataCard() {
               onConfirm: guard(async () => {
                 const files = await api.pickFiles();
                 if (!files.length) return;
-                let password = null;
                 try {
                   await api.vaultImport(files[0], null);
+                  window.location.reload();
+                  return;
                 } catch {
-                  password = window.prompt("该保险库需要主密码，请输入：");
-                  if (password === null) return;
-                  await api.vaultImport(files[0], password);
+                  // Needs the vault's own master password: ask with the app's
+                  // modal and let it show a wrong-password message, so the user
+                  // retries in the same dialog instead of starting over.
                 }
-                window.location.reload();
+                promptModal({
+                  title: "导入加密保险库",
+                  label: "该保险库的主密码",
+                  type: "password",
+                  trim: false,
+                  submitLabel: "导入",
+                  hint: "只有本机账户模式的保险库不需要密码。",
+                  onSubmit: async (password) => {
+                    await api.vaultImport(files[0], password);
+                    window.location.reload();
+                  },
+                });
               }),
             }),
         },

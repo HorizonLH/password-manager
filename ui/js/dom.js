@@ -13,6 +13,10 @@ export function h(tag, props = null, ...children) {
       else if (key.startsWith("on") && typeof value === "function") {
         el.addEventListener(key.slice(2).toLowerCase(), value);
       } else if (value === true) el.setAttribute(key, "");
+      // `<textarea>` has no `value` content attribute: `setAttribute("value", …)`
+      // leaves the box empty (and the next save then wipes what was there, which
+      // is how the notes field lost its text). Assign the property instead.
+      else if (key === "value" && "value" in el) el.value = String(value);
       else el.setAttribute(key, String(value));
     }
   }

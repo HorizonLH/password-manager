@@ -229,6 +229,53 @@ const AUDIT = `(() => {
     if (gap > 120 && selector !== ".sidebar") report.emptySpace.push({ who: selector, gap });
   }
 
+  // -- form control alignment ------------------------------------------------
+  // Every 1.1.0 alignment report came down to two things: a column with an
+  // extra line (checkbox, hint) pushed its neighbour down, and the controls
+  // themselves were not the same height. Both only show up geometrically, so
+  // this is the assertion that keeps them from creeping back.
+  const CONTROL_SELECTOR = ".input, .select, .textarea, .combo, .input-group, .search";
+  const controlOf = (column) => {
+    for (const child of column.children) {
+      if (child.matches(CONTROL_SELECTOR) || child.matches(".btn")) return child;
+      const nested = child.querySelector(CONTROL_SELECTOR);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  report.formGrids = [];
+  for (const root of roots) {
+    for (const grid of root.querySelectorAll(".form__grid")) {
+      // Used track sizes ("472px 472px"), so no parentheses to worry about.
+      const tracks = getComputedStyle(grid).gridTemplateColumns
+        .split(/\\s+(?![^(]*\\))/)
+        .filter(Boolean);
+      const columns = Math.max(1, tracks.length);
+      const cells = [...grid.children].map((column) => {
+        const control = controlOf(column);
+        if (!control) return null;
+        const box = control.getBoundingClientRect();
+        if (!box.width || !box.height) return null;
+        return {
+          who: describe(column),
+          top: Math.round(box.top),
+          height: Math.round(box.height),
+        };
+      });
+      for (let index = 0; index < cells.length; index += columns) {
+        const line = cells.slice(index, index + columns).filter(Boolean);
+        if (line.length < 2) continue;
+        const offTop = line.filter((cell) => Math.abs(cell.top - line[0].top) > 1);
+        const offHeight = line.filter((cell) => Math.abs(cell.height - line[0].height) > 1);
+        if (offTop.length || offHeight.length) {
+          report.formGrids.push({
+            line: line.map((cell) => cell.who + "@" + cell.top + "h" + cell.height),
+          });
+        }
+      }
+    }
+  }
+
   const uniq = (list) => {
     const seen = new Set();
     return list.filter((item) => {
@@ -281,6 +328,7 @@ function printReport(label, report) {
   list("文字被裁切", report.clipped, (i) => `${i.who}  ${i.clientWidth}/${i.scrollWidth}`);
   list("字号过小", report.smallText, (i) => `${i.who}  ${i.fontSize}px`);
   list("大片空白", report.emptySpace, (i) => `${i.who}  bottom gap ${i.gap}px`);
+  list("表单控件未对齐", report.formGrids ?? [], (i) => i.line.join("  |  "));
   list("省略号截断（预期行为）", report.ellipsis ?? [], (i) => `${i.who}`);
 
   check(`${label}：无横向溢出`, report.overflowX.length === 0, JSON.stringify(report.overflowX));
@@ -291,6 +339,13 @@ function printReport(label, report) {
     report.document.scrollHeight <= report.viewport.height + 2 &&
       report.document.scrollWidth <= report.viewport.width + 2,
     `${report.document.scrollWidth}x${report.document.scrollHeight} vs ${report.viewport.width}x${report.viewport.height}`,
+  );
+  // Same line of a `.form__grid`: every control must share the top and height
+  // (≤1px), which is what "标签在上、控件在下、同一行顶对齐" means in practice.
+  check(
+    `${label}：表单控件对齐（同行 top / height 差 ≤1px）`,
+    (report.formGrids ?? []).length === 0,
+    JSON.stringify((report.formGrids ?? []).slice(0, 3)),
   );
   const shell = report.boxes[".shell"];
   if (shell) {
@@ -390,6 +445,28 @@ async function audit(cdp, { includeModals = true } = {}) {
     await expectContent(cdp, view.label, view.needles);
   }
 
+  // 1.2.3: the key list of the sync page has its own filter box (Ctrl+K).
+  await cdp.eval(clickByText("同步文件", ".nav__item"));
+  await sleep(450);
+  const keyFilter = await cdp.eval(`(() => {
+    const input = document.getElementById("sync-key-filter");
+    if (!input) return null;
+    const count = () => document.querySelectorAll(".tree__row, .table__row:not(.table__head)").length;
+    const before = count();
+    input.value = "password";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const after = count();
+    const label = input.closest(".search")?.textContent.trim() ?? "";
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return { before, after, restored: count(), hasSearchIcon: label.length > 0 };
+  })()`);
+  check(
+    "同步文件：键列表有过滤框并能筛掉不匹配的键",
+    Boolean(keyFilter) && keyFilter.before > keyFilter.after && keyFilter.after > 0,
+    JSON.stringify(keyFilter),
+  );
+
   if (!includeModals) return;
 
   // Detail pane of the first entry, then the editor modal.
@@ -424,6 +501,29 @@ async function audit(cdp, { includeModals = true } = {}) {
     return;
   }
   printReport("编辑条目弹窗", await cdp.eval(AUDIT));
+  // 1.2.3: the six blocks became collapsible panels so the common edit (title
+  // or password) does not require scrolling; only these two start open.
+  const folds = await cdp.eval(
+    `[...document.querySelectorAll('.modal .fold')].map((fold) => ({ title: fold.querySelector('.fold__title')?.textContent.trim() ?? "", open: fold.classList.contains('is-open') }))`,
+  );
+  check(
+    "编辑弹窗：默认只展开「基本信息」「凭据」",
+    folds.filter((fold) => fold.open).map((fold) => fold.title).join(",") === "基本信息,凭据",
+    JSON.stringify(folds),
+  );
+  check(
+    "编辑弹窗：六个区块都是可折叠面板",
+    folds.length === 6,
+    JSON.stringify(folds.map((fold) => fold.title)),
+  );
+  // Open everything before asserting the contents / geometry below.
+  await cdp.eval(`(() => {
+    for (const fold of document.querySelectorAll('.modal .fold')) {
+      if (!fold.classList.contains('is-open')) fold.querySelector('.fold__head')?.click();
+    }
+  })()`);
+  await sleep(300);
+  printReport("编辑条目弹窗（全部展开）", await cdp.eval(AUDIT));
   const editorText = await cdp.eval(modalText);
   for (const needle of [
     "编辑条目",

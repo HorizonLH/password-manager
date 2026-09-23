@@ -28,6 +28,8 @@ export const state = {
   assocOnlyLinked: false,
   assocMode: "cards",
   syncSelection: null,
+  /** Filter for the key list of the selected sync file (Ctrl+K). */
+  syncKeyFilter: "",
   filePlans: {},
   /** Which tree branches are open, per file id and key path. */
   treeOpen: {},

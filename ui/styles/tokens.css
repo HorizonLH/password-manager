@@ -55,6 +55,12 @@
   --r-xl: 20px;
   --r-full: 999px;
 
+  /* Interactive control height. Every text field, dropdown, combo box and
+     button uses this, so label/control pairs in a form grid line up no matter
+     what sits under them (a hint line, a checkbox, nothing). */
+  --control-h: 32px;
+  --control-h-sm: 28px;
+
   /* Spacing */
   --s-1: 4px;
   --s-2: 6px;

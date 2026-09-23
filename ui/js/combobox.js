@@ -67,24 +67,34 @@ function installGlobalClose() {
  * @param {object}   config
  * @param {Array}    config.options        `{ value, label, hint }`
  * @param {string}   config.value          currently selected value ("" = none)
- * @param {string}   config.emptyLabel     label of the "no selection" entry
+ * @param {string}   config.emptyLabel     label of the "no selection" entry;
+ *                                         pass `empty: false` to leave it out
+ * @param {boolean}  config.empty          whether the "no selection" entry exists
  * @param {string}   config.searchPlaceholder
+ * @param {boolean}  config.search         whether the panel offers a filter box
  * @param {boolean}  config.small          compact variant for tree/table rows
  * @param {Function} config.onSelect       called with the new value
  */
-export function searchSelect({
+function createSelect({
+  id = null,
   options = [],
   value = "",
   emptyLabel = "未绑定",
+  empty = true,
   searchPlaceholder = "搜索账号…",
+  search = true,
   small = false,
   onSelect,
 } = {}) {
   installGlobalClose();
-  const root = h("div", { class: `combo${small ? " combo--sm" : ""}` });
+  const root = h("div", { id, class: `combo${small ? " combo--sm" : ""}` });
   let open = false;
   let query = "";
   let cursor = 0;
+  /** Type-ahead buffer for the non-searchable variant (a native select jumps to
+   *  the first entry matching what you type; keep that muscle memory working). */
+  let typed = "";
+  let typedAt = 0;
   /** The floating panel of *this* instance (see `paint`). */
   let panel = null;
 
@@ -95,6 +105,16 @@ export function searchSelect({
     return options.filter((option) =>
       `${option.label} ${option.hint ?? ""}`.toLowerCase().includes(term),
     );
+  };
+  /** Panel rows: the optional "no selection" entry first, then the matches. */
+  const entries = () => {
+    const list = matches();
+    return empty ? [{ value: "", label: emptyLabel, isEmpty: true }, ...list] : list;
+  };
+  /** Where the keyboard cursor should start: on the current value. */
+  const cursorForValue = () => {
+    const index = entries().findIndex((entry) => entry.value === value);
+    return index < 0 ? 0 : index;
   };
 
   function close() {
@@ -131,6 +151,7 @@ export function searchSelect({
       event.preventDefault();
       if (!open) {
         open = true;
+        cursor = cursorForValue();
         openInstance = { root, close, panel: null };
         paint();
         return;
@@ -140,9 +161,34 @@ export function searchSelect({
       paint();
       return;
     }
+    if (event.key === "Home" || event.key === "End") {
+      if (!open) return;
+      event.preventDefault();
+      cursor = event.key === "Home" ? 0 : list.length - 1;
+      paint();
+      return;
+    }
     if (event.key === "Enter" && open) {
       event.preventDefault();
       choose(list[cursor]?.value ?? "");
+      return;
+    }
+    // Without a search box, typing is type-ahead (like a native `<select>`).
+    if (!search && !event.ctrlKey && !event.metaKey && !event.altKey && event.key.length === 1) {
+      const now = Date.now();
+      typed = now - typedAt > 700 ? event.key : typed + event.key;
+      typedAt = now;
+      const term = typed.toLowerCase();
+      const index = entries().findIndex((entry) =>
+        `${entry.label}`.toLowerCase().startsWith(term),
+      );
+      if (index >= 0) {
+        event.preventDefault();
+        cursor = index;
+        open = true;
+        openInstance = { root, close, panel: null };
+        paint();
+      }
     }
   }
 
@@ -165,7 +211,8 @@ export function searchSelect({
         onClick: () => {
           open = !open;
           query = "";
-          cursor = 0;
+          typed = "";
+          cursor = cursorForValue();
           if (!open) {
             panel?.remove();
             panel = null;
@@ -173,7 +220,7 @@ export function searchSelect({
           }
           paint();
         },
-        onKeydown: (event) => onKeyDown(event, matches()),
+        onKeydown: (event) => onKeyDown(event, entries()),
       },
       h(
         "span",
@@ -188,39 +235,50 @@ export function searchSelect({
       return;
     }
 
-    const search = h("input", {
-      class: "input combo__search",
-      placeholder: searchPlaceholder,
-      value: query,
-      onInput: (event) => {
-        query = event.target.value;
-        cursor = 0;
-        paint();
-      },
-      onKeydown: (event) => onKeyDown(event, matches()),
-    });
+    const searchInput = search
+      ? h("input", {
+          class: "input combo__search",
+          placeholder: searchPlaceholder,
+          value: query,
+          onInput: (event) => {
+            query = event.target.value;
+            cursor = 0;
+            paint();
+          },
+          onKeydown: (event) => onKeyDown(event, entries()),
+        })
+      : null;
 
     const list = matches();
     const rows = [
-      h(
-        "button",
-        { class: "combo__option", type: "button", onClick: () => choose("") },
-        h("span", { class: "combo__option-label is-empty" }, emptyLabel),
-      ),
-      ...list.map((option, index) =>
-        h(
+      ...(empty
+        ? [
+            h(
+              "button",
+              {
+                class: `combo__option${cursor === 0 ? " is-cursor" : ""}`,
+                type: "button",
+                onClick: () => choose(""),
+              },
+              h("span", { class: "combo__option-label is-empty" }, emptyLabel),
+            ),
+          ]
+        : []),
+      ...list.map((option, index) => {
+        const row = empty ? index + 1 : index;
+        return h(
           "button",
           {
             class: `combo__option${option.value === value ? " is-selected" : ""}${
-              index === cursor ? " is-cursor" : ""
+              row === cursor ? " is-cursor" : ""
             }`,
             type: "button",
             onClick: () => choose(option.value),
           },
           h("span", { class: "combo__option-label" }, option.label),
           option.hint ? h("span", { class: "combo__option-hint" }, option.hint) : null,
-        ),
-      ),
+        );
+      }),
     ];
 
     mount(
@@ -232,7 +290,7 @@ export function searchSelect({
     panel = h(
       "div",
       { class: "combo__panel", role: "listbox" },
-      search,
+      searchInput,
       query.trim() && !list.length
         ? h("p", { class: "combo__empty" }, "没有匹配的账号")
         : h("div", { class: "combo__options" }, rows),
@@ -247,9 +305,22 @@ export function searchSelect({
     const above = rect.top - height - 4;
     panel.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`;
     panel.style.top = `${below + height <= window.innerHeight - 8 || above < 8 ? below : above}px`;
-    setTimeout(() => search.focus(), 0);
+    // The searchable variant puts the caret in the filter box; the plain one
+    // keeps focus on the control so ↑/↓/Enter never leave it.
+    setTimeout(() => (searchInput ? searchInput.focus() : control.focus()), 0);
   }
 
   paint();
   return root;
+}
+
+/** Searchable single-select — the account pickers (see the module comment). */
+export function searchSelect(config = {}) {
+  return createSelect({ ...config, search: true });
+}
+
+/** Same control and panel, without the filter box: used for short, fixed lists
+ *  that used to be native `<select>`s (category, SAP Logon system). */
+export function selectMenu(config = {}) {
+  return createSelect({ ...config, search: false });
 }

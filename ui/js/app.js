@@ -630,10 +630,16 @@ function bindShortcuts() {
       guard(() => lock())();
     } else if (event.key === "k") {
       event.preventDefault();
-      const input = document.getElementById(
-        state.view === "accounts" ? "global-search" : "sap-filter",
-      );
+      // Each view has its own filter box; `#sap-filter` never existed, so this
+      // key did nothing outside the account list.
+      const FOCUS_TARGETS = {
+        accounts: "global-search",
+        sync: "sync-key-filter",
+        associations: "assoc-filter",
+      };
+      const input = document.getElementById(FOCUS_TARGETS[state.view] ?? "");
       input?.focus();
+      input?.select?.();
     } else if (event.key === "n" && state.view === "accounts") {
       event.preventDefault();
       openEntryEditor({

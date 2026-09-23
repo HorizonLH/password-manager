@@ -131,6 +131,16 @@ async function main() {
   const page = await findPage();
   const cdp = await Cdp.connect(page.webSocketDebuggerUrl);
   await cdp.send("Runtime.enable");
+  // The size audit may leave the window at whatever it measured last; pin it to
+  // the size these checks were written for, so geometry-dependent cases (for
+  // example "the detail pane can actually scroll") stay meaningful.
+  await cdp.send("Emulation.setDeviceMetricsOverride", {
+    width: 1240,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await sleep(500);
 
   if (await cdp.eval("!!document.querySelector('.lock__card')")) {
     await cdp.eval(clickByText("解锁", ".lock__card button"));
@@ -139,6 +149,27 @@ async function main() {
   await cdp.eval(clickByText("账号", ".nav__item"));
   await sleep(400);
   check("进入账号列表", await cdp.eval("!!document.querySelector('.row')"));
+
+  // ------------------------------------------------------- 0. Ctrl+K 落点 --
+  // `Ctrl+K` used to focus `#sap-filter`, an id that never existed, so the key
+  // did nothing on any page except the account list.
+  const pressCtrlK = `document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }))`;
+  const activeId = `(document.activeElement && document.activeElement.id) || ""`;
+  const focusTargets = [
+    ["账号", null, "global-search"],
+    ["同步文件", null, "sync-key-filter"],
+    ["关联关系", null, "assoc-filter"],
+  ];
+  for (const [nav, , expected] of focusTargets) {
+    await cdp.eval(clickByText(nav, ".nav__item"));
+    await sleep(420);
+    await cdp.eval(pressCtrlK);
+    await sleep(200);
+    const focused = await cdp.eval(activeId);
+    check(`Ctrl+K 在「${nav}」页聚焦 ${expected}`, focused === expected, `focused=${focused}`);
+  }
+  await cdp.eval(clickByText("账号", ".nav__item"));
+  await sleep(400);
 
   // ------------------------------------------------------- 1. 行内按钮点击 --
   // Press geometry was the original bug: clicking the right or the top edge of
@@ -298,12 +329,30 @@ async function main() {
   await sleep(400);
   await cdp.eval(clickByText("编辑", ".detail__title button"));
   await sleep(900);
+  // Regression: the notes box is a <textarea>, and `h()` used to set its value
+  // as an attribute — the box rendered empty and saving then wiped the notes.
+  const notesField = await cdp.eval(
+    `(() => { const area = document.querySelector('.modal textarea.textarea'); return area ? area.value : null; })()`,
+  );
+  check(
+    "编辑条目：备注内容会带进弹窗",
+    typeof notesField === "string" && notesField.includes("每季度轮换"),
+    JSON.stringify(notesField),
+  );
   await cdp.eval(
     `(() => { const input = document.getElementById("editor-password"); input.value = "BrandNew#2026"; input.dispatchEvent(new Event("input", { bubbles: true })); return input.value; })()`,
   );
   await cdp.eval(clickByText("保存", ".modal__footer button"));
   await sleep(900);
   const rotated = await cdp.eval(MODAL);
+  const savedNotes = await cdp.eval(`window.__FIXTURES__.entry.notes`);
+  check(
+    "保存后备注没有被清空",
+    typeof savedNotes === "string" &&
+      savedNotes.includes("每季度轮换") &&
+      savedNotes.includes("wiki.example.com"),
+    String(savedNotes).slice(0, 80),
+  );
   check(
     "改密码后提示文件需要同步",
     Boolean(rotated) &&
@@ -366,10 +415,61 @@ async function main() {
   await cdp.eval('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))');
   await sleep(250);
 
-  await cdp.eval(clickByText("编辑", ".detail__title button"));
+  // Focus the trigger first: closing the dialog has to give focus back to it.
+  await cdp.eval(`(() => {
+    const label = (node) => ((node.textContent || "") + " " + (node.getAttribute("title") || "") + " " + (node.getAttribute("aria-label") || "")).trim();
+    const button = [...document.querySelectorAll('.detail__title button')].find((node) => label(node).includes('编辑'));
+    button?.focus();
+    button?.click();
+  })()`);
   await sleep(900);
+  const trap = await cdp.eval(`(() => {
+    const modal = document.querySelector('.modal');
+    if (!modal) return null;
+    const selector = 'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const list = [...modal.querySelectorAll(selector)].filter((node) => node.getClientRects().length > 0);
+    if (list.length < 2) return { list: list.length };
+    const first = list[0];
+    const last = list[list.length - 1];
+    last.focus();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }));
+    const forward = document.activeElement === first;
+    first.focus();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true }));
+    const backward = document.activeElement === last;
+    // A control that lives behind the dialog must never keep the focus.
+    const stray = document.createElement('button');
+    document.body.append(stray);
+    stray.focus();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }));
+    const pulledBack = modal.contains(document.activeElement);
+    stray.remove();
+    return { list: list.length, forward, backward, pulledBack };
+  })()`);
+  check(
+    "弹窗焦点陷阱：Tab 在弹窗内循环",
+    Boolean(trap) && trap.forward === true && trap.backward === true,
+    JSON.stringify(trap),
+  );
+  check(
+    "弹窗焦点陷阱：焦点跑到弹窗外会被拉回",
+    Boolean(trap) && trap.pulledBack === true,
+    JSON.stringify(trap),
+  );
   const sapPicker = await cdp.eval(
-    `(() => { const select = document.getElementById("editor-sap-system"); if (!select) return null; return { options: [...select.options].map((option) => option.textContent.trim()), value: select.value }; })()`,
+    `(() => {
+      const combo = document.getElementById("editor-sap-system");
+      if (!combo) return null;
+      combo.querySelector(".combo__control")?.click();
+      const panel = document.querySelector("#combo-root .combo__panel");
+      const result = {
+        options: panel ? [...panel.querySelectorAll(".combo__option")].map((node) => node.textContent.trim()) : [],
+        hasSearch: Boolean(panel?.querySelector(".combo__search")),
+        value: combo.querySelector(".combo__value")?.textContent ?? "",
+      };
+      combo.querySelector(".combo__control")?.click();
+      return result;
+    })()`,
   );
   check(
     "编辑器列出 SAP Logon 里的系统",
@@ -383,8 +483,61 @@ async function main() {
     Boolean(sapPicker) && sapPicker.options.some((text) => text.includes("（同名）")),
     JSON.stringify(sapPicker?.options),
   );
+  // 1.2.3: native <select> replaced by the combo box the sync page uses, minus
+  // the search box (the list here is short and typed-ahead instead).
+  check(
+    "SAP Logon 系统下拉与账号选择器同款、且不带搜索框",
+    Boolean(sapPicker) && sapPicker.hasSearch === false && sapPicker.options.length >= 3,
+    JSON.stringify(sapPicker),
+  );
+  // The category picker was the other native <select>.
+  const categoryPicker = await cdp.eval(
+    `(() => {
+      const combo = document.getElementById("editor-category");
+      if (!combo) return null;
+      combo.querySelector(".combo__control")?.click();
+      const panel = document.querySelector("#combo-root .combo__panel");
+      const options = panel ? [...panel.querySelectorAll(".combo__option")].map((node) => node.textContent.trim()) : [];
+      const hasSearch = Boolean(panel?.querySelector(".combo__search"));
+      const row = panel ? [...panel.querySelectorAll(".combo__option")].find((node) => node.textContent.includes("内部系统")) : null;
+      row?.click();
+      const after = {
+        label: combo.querySelector(".combo__value")?.textContent ?? "",
+        sapBlock: (document.querySelector(".modal")?.textContent ?? "").includes("只有「SAP 账号」分类"),
+      };
+      return { options, hasSearch, ...after };
+    })()`,
+  );
+  check(
+    "分类下拉与账号选择器同款、且不带搜索框",
+    Boolean(categoryPicker) &&
+      categoryPicker.hasSearch === false &&
+      categoryPicker.options.some((text) => text.includes("SAP 账号")),
+    JSON.stringify(categoryPicker),
+  );
+  check(
+    "分类改选后回显并联动 SAP 区块",
+    Boolean(categoryPicker) &&
+      categoryPicker.label.includes("内部系统") &&
+      categoryPicker.sapBlock === true,
+    JSON.stringify(categoryPicker),
+  );
+  await cdp.eval(`(() => {
+    const combo = document.getElementById("editor-category");
+    combo?.querySelector(".combo__control")?.click();
+    const row = [...document.querySelectorAll("#combo-root .combo__option")].find((node) => node.textContent.includes("SAP 账号"));
+    row?.click();
+  })()`);
+  await sleep(300);
   await cdp.eval(clickByText("取消", ".modal__footer button"));
   await sleep(300);
+  check(
+    "关闭弹窗后焦点回到触发按钮",
+    await cdp.eval(
+      `(() => { const el = document.activeElement; if (!el) return false; return ((el.textContent || "") + " " + (el.getAttribute("title") || "") + " " + (el.getAttribute("aria-label") || "")).includes("编辑"); })()`,
+    ),
+    await cdp.eval(`document.activeElement?.outerHTML?.slice(0, 80) ?? ""`),
+  );
 
   // ------------------------------- 7. 分类切换 / 非 SAP 账号 / 未配置登录 --
   await cdp.eval(clickByText("账号", ".nav__item"));
@@ -615,6 +768,43 @@ async function main() {
     Boolean(keyIcon) && keyIcon.includes("M6.6 8.6a3.4") && !keyIcon.includes("M15.5 3.5a5 5"),
     String(keyIcon).slice(0, 160),
   );
+
+  // ------------------------------------------------ 10. 导入保险库弹窗 --
+  // 1.2.3: importing used `window.prompt` (a system dialog that ignores the app
+  // theme and cannot show "wrong password"); it is now the app's own prompt,
+  // and a rejected password keeps the dialog open for another try.
+  await cdp.eval(clickByText("设置", ".nav__item"));
+  await sleep(450);
+  await cdp.eval(`window.__FIXTURES__.setPickFiles(["C:\\\\Users\\\\me\\\\backup.sapvault"])`);
+  await cdp.eval(clickByText("导入"));
+  await sleep(400);
+  const importConfirm = await cdp.eval(MODAL);
+  check("导入保险库先确认", importConfirm?.title === "导入保险库", JSON.stringify(importConfirm));
+  await cdp.eval(clickByText("选择文件", ".modal__footer button"));
+  await sleep(1000);
+  const importPrompt = await cdp.eval(
+    `(() => { const m = document.querySelector('.modal'); if (!m) return null; return { title: m.querySelector('.modal__title')?.textContent ?? "", passwordField: !!m.querySelector('input[type="password"]'), text: m.textContent.replace(/\\s+/g, " ").trim().slice(0, 120) }; })()`,
+  );
+  check(
+    "导入改用应用自己的密码弹窗",
+    Boolean(importPrompt) && importPrompt.title === "导入加密保险库" && importPrompt.passwordField,
+    JSON.stringify(importPrompt),
+  );
+  await cdp.eval(
+    `(() => { const input = document.querySelector('.modal input.input'); input.value = "nope"; input.dispatchEvent(new Event("input", { bubbles: true })); })()`,
+  );
+  await cdp.eval(clickByText("导入", ".modal__footer button"));
+  await sleep(700);
+  const retry = await cdp.eval(
+    `(() => { const m = document.querySelector('.modal'); return { open: !!m, text: m?.textContent.replace(/\\s+/g, " ").trim().slice(0, 120) ?? "" }; })()`,
+  );
+  check(
+    "主密码错误时弹窗不关闭并给出提示",
+    retry.open && retry.text.includes("主密码不正确"),
+    JSON.stringify(retry),
+  );
+  await cdp.eval(clickByText("取消", ".modal__footer button"));
+  await sleep(300);
 
   cdp.close();
 
