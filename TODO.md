@@ -15,6 +15,7 @@
 | **1.2.4** | 数据安全 | 单实例运行（原 19）、`with_vault_mut` 事务性（原 16） |
 | **1.2.5** | 自定义标题栏 | 与应用风格统一，并承载锁定 / 剪贴板倒计时等（原 18） |
 | **1.2.6** | 清理与细节 | 死代码与无用状态（原 13）、新建保险库页面的无关设置（原 14）、账号列表键盘导航（原 15）、界面文案统一（原 17） |
+| **2.0.0** | 前端 TypeScript 化 | 类型化的 IPC 契约 / 状态 / DOM 工厂，把「字段名写错、漏处理分支、属性写错」挡在编译期 —— 见下方 2.0.0 段 |
 
 编号里的「原 N」指的是本次重构之前的条目号，提交信息里引用过这些号，保留以便回溯。
 
@@ -124,6 +125,55 @@
 
 - 「复制用户名 + 密码」在两个页面有三处不同长度的手写说明，
   可以统一成一句带链接的说明（SAP 登录相关的文案在 1.1.1 已经重写过一轮，剩下这几处）。
+
+---
+
+## 2.0.0 前端 TypeScript 化（规划）
+
+**现状**：前端是零依赖的原生 ES Module，没有类型、没有构建步骤 —— 12 个 `ui/js/*.js`（2276 行）
+加 7 个 `ui/js/views/*.js`（4102 行），靠 `tools/` 的排版审计与交互回归兜底。
+这个仓库**不打算改**「运行期零依赖」这条（见 AGENTS.md 铁律 2）：TypeScript 只进构建期。
+
+**为什么值得做**（下面每一条都是真出过的 bug，不是假想）：
+
+1. `h()` 的 props 没有类型 → `<textarea value="…">` 这种「写了个不存在的属性」只能等用户发现
+   —— 1.2.3 的「编辑条目备注丢失」正是它。
+2. `state` 没有类型 → `state.presets` 从 `info.presets` 取值，但后端 `Bootstrap` 里从来没有这个字段，
+   永远是 `undefined`，一直没人发现（1.2.6 原 13）。
+3. 视图与快捷键靠字符串约定 → `Ctrl+K` 聚焦 `#sap-filter`，而整个前端没有这个 id（1.2.3 原 3）。
+4. 前后端字段契约只能靠 Rust 侧的手写断言 + 前端自觉 → 详情面板读顶层 `entry.systemId`（只有列表摘要才有）
+   那次就是这样漏的。
+
+**分三步做，每一步都能单独发布**：
+
+1. **先开类型检查，不动文件后缀**：加 `tsconfig.json`（`allowJs` + `checkJs` + `strict` +
+   `noUncheckedIndexedAccess`），TypeScript 只作为 `devDependencies`；
+   按需在文件顶加 `// @ts-check` 并用 JSDoc 补注解。这一步不需要重写就能抓到上面第 1、2 类问题。
+   （不想引 npm 的话，等价方案是 `deno check`；但仓库里已经有 Node，一个 dev 依赖更省事。）
+2. **逐文件 `.js` → `.ts`**，顺序按依赖走：`format/icons/dom` → `api/state/modal/combobox` → `views/*`。
+   源码放 `ui/src/`，`tsc` 输出到 `ui/js/`（ESM，一进一出，**不上打包器**），
+   `index.html` 与 `tools/serve-ui.mjs` 继续加载构建产物；`cargo tauri build` 挂
+   `beforeBuildCommand` 先跑一次编译。审计脚本与交互用例同时改成 `.ts`，直接复用前端的类型与选择器常量。
+3. **补上契约这块拼图**：给 `commands.rs` / `model.rs` 加类型导出（`ts-rs` 或手写生成器），
+   产出 `ui/src/types/ipc.ts`；现有那个「前后端字段契约」单测改成校验生成结果 ——
+   以后字段名写错，`cargo test` 就会红。
+
+**类型化之后顺手能加的功能**（按价值排序，都依赖第 1–3 步）：
+
+1. **IPC 契约自动化**：命令签名或结构体一改就重新生成类型，前端调用点与 Rust 端不可能再对不上。
+2. **视图与快捷键自洽**：`view` 用联合类型 + `Record<View, string>` 的筛选框注册表，
+   新增视图忘了配 `Ctrl+K` 落点会直接编译失败。
+3. **`h()` 的类型化重载**：`h("textarea", { value })`、`h("input", { type: "checkbox", checked })`
+   走正确的属性路径，属性名写错编译期就报（备注丢失那类 bug 从此不会复现）。
+4. **错误分类穷尽处理**：`describeError()` 的 `kind`（password-rule / password-cycle / …）用联合类型，
+   新增一类错误却忘了处理分支会报错（目前是静默落到通用 toast）。
+5. **持久化格式版本化**：`vault.sapvault` 与 `settings.json` 加 `schema_version` + 迁移函数，
+   老文件自动升级、导入不兼容文件时给明确原因（适合和 2.0.0 一起发，与前端无关但同批交付）。
+6. **审计断言复用类型**：几何断言与交互用例引用视图导出的选择器常量（如 `VIEW_SELECTORS`），
+   改类名时审计不会静默失效（现在审计里的选择器全是手写字符串）。
+
+**验收**：`tsc --noEmit` 零错误、`cargo test` 全绿、`pwsh tools/audit-ui.ps1 -WithModals -Interactions` 全绿，
+并且 `cargo tauri build` 产出的 exe 体积不因类型化变大（类型只存在于构建期）。
 
 ---
 
